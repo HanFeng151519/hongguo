@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>红果短剧检索</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/style.css?v=6" />
+</head>
+<body>
+  <div class="page">
+    <header class="header">
+      <div class="brand">
+        <span class="brand-icon">🍅</span>
+        <div>
+          <h1>红果短剧检索</h1>
+          <p>输入剧名模糊搜索，点击结果跳转红果短剧官网观看</p>
+        </div>
+      </div>
+    </header>
+
+    <section class="hot-section" id="hot-section">
+      <div class="hot-head">
+        <h2 class="hot-title">今日漫剧最热 TOP10</h2>
+        <span id="hot-date" class="hot-date"></span>
+      </div>
+      <div id="hot-status" class="hot-status">正在加载热门漫剧…</div>
+      <ol id="hot-list" class="hot-list"></ol>
+    </section>
+
+    <section class="search-section">
+      <form id="search-form" class="search-box" autocomplete="off">
+        <svg class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="11" cy="11" r="7"></circle>
+          <path d="M20 20L16 16"></path>
+        </svg>
+        <input
+          id="search-input"
+          type="search"
+          placeholder="输入短剧名称，例如：闪婚、霸道总裁、重生..."
+          autofocus
+        />
+        <button type="submit" id="search-btn">搜索</button>
+      </form>
+    </section>
+
+    <main>
+      <div id="status" class="status hidden"></div>
+      <div id="results" class="results"></div>
+    </main>
+
+    <footer class="footer">
+      <span>数据来源：红果短剧公开搜索接口</span>
+    </footer>
+  </div>
+  <script src="/app.js?v=6"></script>
+</body>
+</html>

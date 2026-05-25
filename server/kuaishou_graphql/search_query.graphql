@@ -1,0 +1,38 @@
+fragment photoContent on PhotoEntity {
+  __typename
+  id
+  duration
+  caption
+  coverUrl
+  photoUrl
+  manifest
+  videoResource
+}
+
+fragment feedContent on Feed {
+  type
+  author {
+    id
+    name
+    headerUrl
+    __typename
+  }
+  photo {
+    ...photoContent
+    __typename
+  }
+  __typename
+}
+
+query visionSearchPhoto($keyword: String, $pcursor: String, $searchSessionId: String, $page: String, $webPageArea: String) {
+  visionSearchPhoto(keyword: $keyword, pcursor: $pcursor, searchSessionId: $searchSessionId, page: $page, webPageArea: $webPageArea) {
+    result
+    feeds {
+      ...feedContent
+      __typename
+    }
+    searchSessionId
+    pcursor
+    __typename
+  }
+}

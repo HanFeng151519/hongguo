@@ -1,0 +1,28 @@
+query visionVideoDetail($photoId: String, $type: String, $page: String, $webPageArea: String) {
+  visionVideoDetail(photoId: $photoId, type: $type, page: $page, webPageArea: $webPageArea) {
+    status
+    photo {
+      id
+      duration
+      caption
+      coverUrl
+      photoUrl
+      manifest {
+        adaptationSet {
+          representation {
+            url
+            backupUrl
+            height
+            width
+            qualityLabel
+            __typename
+          }
+          __typename
+        }
+        __typename
+      }
+      __typename
+    }
+    __typename
+  }
+}

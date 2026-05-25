@@ -1,0 +1,9 @@
+.env
+.env.local
+__pycache__/
+*.pyc
+.DS_Store
+public/materials/
+public/downloads/*.mp4
+!public/downloads/.gitkeep
+public copy/
