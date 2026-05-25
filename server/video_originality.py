@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import random
 import re
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
+
+logger = logging.getLogger(__name__)
 
 
 def originality_enabled() -> bool:
@@ -21,6 +24,63 @@ def originality_outro_enabled() -> bool:
     return originality_enabled() and v not in ("0", "false", "no", "off")
 
 
+def authentic_preservation_enabled() -> bool:
+    """尽量保留正片原声原画面；去重主要靠轻度像素特征 + 元数据清理。"""
+    v = os.getenv("HONGGUO_AUTHENTIC", "1").strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
+def originality_light_visual() -> bool:
+    """轻度去重：微缩放/调色，不画进度条，观感更接近原片。"""
+    if not originality_enabled():
+        return False
+    if not authentic_preservation_enabled():
+        return False
+    v = os.getenv("HONGGUO_ORIGINALITY_LIGHT", "1").strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
+DEFAULT_BODY_PLAYBACK_SPEED = 1.618
+
+
+def body_playback_speed() -> float:
+    """正片倍速：原味模式固定 1x（保留对白音色）；非原味可读 HONGGUO_BODY_PLAYBACK_SPEED。"""
+    raw = os.getenv("HONGGUO_BODY_PLAYBACK_SPEED", "").strip()
+    fallback = 1.0 if authentic_preservation_enabled() else DEFAULT_BODY_PLAYBACK_SPEED
+    if not raw:
+        v = fallback
+    else:
+        try:
+            v = float(raw)
+        except ValueError:
+            v = fallback
+    if v <= 0:
+        v = fallback
+    v = max(0.5, min(4.0, v))
+    if authentic_preservation_enabled() and abs(v - 1.0) > 0.02:
+        allow = os.getenv("HONGGUO_AUTHENTIC_ALLOW_SPEED", "").strip().lower()
+        if allow not in ("1", "true", "yes", "on"):
+            logger.info(
+                "原味模式正片强制 1x（忽略 HONGGUO_BODY_PLAYBACK_SPEED=%.3g，"
+                "倍速会明显变调）；若确需加速请设 HONGGUO_AUTHENTIC_ALLOW_SPEED=1",
+                v,
+            )
+            return 1.0
+    return v
+
+
+def body_burn_subtitles() -> bool:
+    """正片是否烧录底部解说条（原味模式默认关）。"""
+    if not originality_enabled():
+        return False
+    v = os.getenv("HONGGUO_BODY_BURN_SUBTITLES", "").strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return True
+    if v in ("0", "false", "no", "off"):
+        return False
+    return not authentic_preservation_enabled()
+
+
 def _seed_int(seed_str: str) -> int:
     digest = hashlib.md5(seed_str.encode("utf-8")).hexdigest()
     return int(digest[:8], 16)
@@ -28,6 +88,8 @@ def _seed_int(seed_str: str) -> int:
 
 def trim_jitter_seconds(seed_str: str) -> float:
     rng = random.Random(_seed_int(seed_str))
+    if authentic_preservation_enabled():
+        return rng.uniform(-1.0, 2.5)
     return rng.uniform(-2.0, 5.0)
 
 
@@ -76,9 +138,28 @@ def render_subtitle_overlay_png(
     img.save(path)
 
 
-def build_visual_filters(seed_str: str, *, width: int, height: int) -> list[str]:
-    """微缩放 + 调色 + 锐化 + 顶部进度条，改变帧特征且观感自然。"""
+def build_visual_filters(
+    seed_str: str, *, width: int, height: int, light: bool = False
+) -> list[str]:
+    """微缩放 + 调色 + 锐化；light 模式更贴近原片，仍改变帧哈希过判重。"""
     rng = random.Random(_seed_int(seed_str))
+    if light:
+        zoom = 1.008 + rng.uniform(0, 0.012)
+        x_j = int(rng.uniform(-8, 8))
+        y_j = int(rng.uniform(-6, 6))
+        bright = rng.uniform(-0.01, 0.02)
+        contrast = rng.uniform(1.01, 1.04)
+        sat = rng.uniform(1.01, 1.05)
+        hue = rng.uniform(-1.5, 1.5)
+        filters = [
+            f"scale=ceil(iw*{zoom:.4f}/2)*2:ceil(ih*{zoom:.4f}/2)*2",
+            f"crop={width}:{height}:{x_j}+(iw-{width})/2:{y_j}+(ih-{height})/2",
+            f"eq=brightness={bright:.3f}:contrast={contrast:.3f}:saturation={sat:.3f}",
+            f"hue=h={hue:.1f}",
+            "unsharp=3:3:0.2:3:3:0.0",
+        ]
+        return filters
+
     zoom = 1.02 + rng.uniform(0, 0.03)
     x_j = int(rng.uniform(-18, 18))
     y_j = int(rng.uniform(-12, 12))
@@ -108,7 +189,14 @@ def build_body_video_filters(
 ) -> str:
     parts: list[str] = [base_fit_filter]
     if originality_enabled():
-        parts.extend(build_visual_filters(seed_str, width=width, height=height))
+        parts.extend(
+            build_visual_filters(
+                seed_str,
+                width=width,
+                height=height,
+                light=originality_light_visual(),
+            )
+        )
     if abs(speed - 1.0) >= 0.01:
         parts.append(f"setpts=PTS/{speed}")
     parts.append(f"fps={fps}")
@@ -147,36 +235,45 @@ def pick_commentary_lines(
     subtitle_hint: str,
     hook_summary: str,
     drama_title: str,
+    max_lines: int = 3,
+    meme_mode: bool = False,
 ) -> list[str]:
-    """合并 AI 解说句，去重并保证至少 2 条。"""
+    """合并 AI 解说句；meme 模式仅保留短句供 TTS，避免与大字幕重复冗长。"""
     out: list[str] = []
     seen: set[str] = set()
+    max_len = 14 if meme_mode else 36
 
     def add(raw: str) -> None:
         for piece in re.split(r"[\n；;。！？!?]+", raw or ""):
             line = _clean_line(piece)
+            if meme_mode and len(line) > max_len:
+                line = line[: max_len - 1] + "…"
             if line and line not in seen:
                 seen.add(line)
                 out.append(line)
 
     for line in plan_lines:
         add(line)
-    add(subtitle_hint)
-    add(opening_text)
-    add(hook_summary)
+    if not meme_mode:
+        add(subtitle_hint)
+        add(opening_text)
 
     short = (drama_title or "短剧").strip()[:10]
-    fallbacks = [
-        f"《{short}》这段太炸了",
-        "注意看男主这个眼神",
-        "反转来得猝不及防",
-        f"红果搜「{short}」看全集",
-    ]
+    fallbacks = (
+        ["前方高能", "这反转绝了", f"红果搜{short}"]
+        if meme_mode
+        else [
+            f"《{short}》这段太炸了",
+            "注意看男主这个眼神",
+            "反转来得猝不及防",
+            f"红果搜「{short}」看全集",
+        ]
+    )
     for fb in fallbacks:
-        if len(out) >= 4:
+        if len(out) >= max_lines:
             break
         add(fb)
-    return out[:5]
+    return out[:max_lines]
 
 
 def ffmpeg_metadata_strip_args() -> list[str]:

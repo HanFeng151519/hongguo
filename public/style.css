@@ -235,6 +235,28 @@ body::before {
   filter: brightness(1.08);
 }
 
+.btn-voice-hint {
+  font-size: 0.78rem;
+  padding: 0.35rem 0.65rem;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.btn-voice-hint:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.card-voice {
+  display: block;
+  width: calc(100% - 2.2rem);
+  margin: 0 1.1rem 0.5rem;
+}
+
 .search-section {
   margin-bottom: 2rem;
 }

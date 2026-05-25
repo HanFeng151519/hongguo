@@ -27,14 +27,41 @@ from fq_koc_material import (
 )
 from video_drm import audio_is_audible, video_decodes
 from video_originality import (
+    authentic_preservation_enabled,
+    body_burn_subtitles,
+    body_playback_speed,
     build_body_video_filters,
     build_subtitle_overlay_filter_complex,
     ffmpeg_metadata_strip_args,
     originality_enabled,
+    originality_light_visual,
     originality_outro_enabled,
     pick_commentary_lines,
     render_subtitle_overlay_png,
     trim_jitter_seconds,
+)
+from edge_tts_narration import (
+    edge_tts_available,
+    pick_voice_for_episode,
+    tts_enabled,
+    tts_on_body_enabled,
+)
+from hook_duration_budget import budget_summary, hook_budget_enabled
+from meme_edit import meme_edit_enabled, meme_on_body_enabled
+from multi_clip import (
+    clip_crossfade_sec,
+    clip_summary_for_log,
+    clip_tail_pad_sec,
+    multi_clip_enabled,
+)
+from watermark import burn_corner_watermark, watermark_enabled, watermark_text
+from moviepy_editor import (
+    image_to_video as mpy_image_to_video,
+    merge_video_files as mpy_merge_video_files,
+    moviepy_available,
+    normalize_video_file as mpy_normalize_video_file,
+    process_body_clip as mpy_process_body_clip,
+    video_backend,
 )
 
 logger = logging.getLogger(__name__)
@@ -45,6 +72,15 @@ KEYWORD_SPLASH_SECONDS = 1.0
 COMMENTARY_CARD_SECONDS = 1.2
 OUTRO_SEARCH_SECONDS = 2.0
 SPLASH_SUBTITLE = "——  红果短剧搜索看全集  ——"
+HONGGUO_BRAND_NAME = "红果短剧"
+# 片头渐变四角色（取自品牌 logo：橙红 → 蜜桃 → 薄荷青）
+_SPLASH_GRAD_TL = (255, 209, 148)
+_SPLASH_GRAD_TR = (128, 216, 200)
+_SPLASH_GRAD_BL = (242, 101, 34)
+_SPLASH_GRAD_BR = (255, 140, 66)
+_SPLASH_LOGO_MARGIN_X = 48
+_SPLASH_LOGO_MARGIN_Y = 40
+_SPLASH_LOGO_ICON_H = 108
 # 片头标题卡字号：关键词起始字号、最小字号、每「号」像素差（副标题比关键词小两号）
 SPLASH_TITLE_FONT_START = 160
 SPLASH_TITLE_FONT_MIN = 72
@@ -67,7 +103,10 @@ OUTPUT_FPS = 30
 OUTPUT_CRF = 20
 ENCODE_PRESET = "fast"
 BODY_ENCODE_PRESET = "veryfast"  # 正片去重重编码，加快多集成片
-DEFAULT_BODY_PLAYBACK_SPEED = 2.0
+def _use_moviepy() -> bool:
+    return video_backend() == "moviepy" and moviepy_available()
+
+
 DOWNLOAD_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -335,6 +374,79 @@ def render_opening_card(path: Path, cover_path: Optional[Path], opening: str) ->
     img.save(path)
 
 
+def _hongguo_brand_asset_path() -> Path:
+    return Path(__file__).resolve().parent.parent / "public" / "assets" / "hongguo_brand.png"
+
+
+def _hongguo_splash_gradient(width: int, height: int) -> Image.Image:
+    """品牌色对角混搭渐变（左下橙红、右上薄荷青）。"""
+    tiny = Image.new("RGB", (2, 2))
+    tiny.putpixel((0, 0), _SPLASH_GRAD_TL)
+    tiny.putpixel((1, 0), _SPLASH_GRAD_TR)
+    tiny.putpixel((0, 1), _SPLASH_GRAD_BL)
+    tiny.putpixel((1, 1), _SPLASH_GRAD_BR)
+    return tiny.resize((width, height), Image.Resampling.LANCZOS)
+
+
+def _strip_logo_corner_padding(icon: Image.Image) -> Image.Image:
+    """方形 logo：四角白底转透明，再收紧到实际内容边界。"""
+    icon = icon.convert("RGBA")
+    w, h = icon.size
+    px = icon.load()
+    for y in range(h):
+        for x in range(w):
+            r, g, b, a = px[x, y]
+            if a < 8:
+                continue
+            if r >= 238 and g >= 238 and b >= 238 and max(r, g, b) - min(r, g, b) < 22:
+                px[x, y] = (0, 0, 0, 0)
+    bbox = icon.getbbox()
+    if bbox:
+        icon = icon.crop(bbox)
+    return icon
+
+
+def _hongguo_brand_icon_rgba() -> Optional[Image.Image]:
+    """加载品牌圆角图标（去四角留白，透明底）。"""
+    path = _hongguo_brand_asset_path()
+    if not path.is_file():
+        return None
+    with Image.open(path) as im:
+        return _strip_logo_corner_padding(im)
+
+
+def _draw_hongguo_brand_corner(img: Image.Image) -> Image.Image:
+    """左上角：品牌圆角图标 + 白色「红果短剧」。"""
+    icon = _hongguo_brand_icon_rgba()
+    if icon is None:
+        return img
+
+    target_h = _SPLASH_LOGO_ICON_H
+    scale = target_h / icon.size[1]
+    target_w = max(1, int(icon.size[0] * scale))
+    icon = icon.resize((target_w, target_h), Image.Resampling.LANCZOS)
+
+    base = img.convert("RGBA")
+    mx, my = _SPLASH_LOGO_MARGIN_X, _SPLASH_LOGO_MARGIN_Y
+    base.paste(icon, (mx, my), icon)
+
+    draw = ImageDraw.Draw(base)
+    brand_font = _load_font(44, bold=True)
+    bbox = draw.textbbox((0, 0), HONGGUO_BRAND_NAME, font=brand_font)
+    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    tx = mx + target_w + 18 - bbox[0]
+    ty = my + (target_h - th) // 2 - bbox[1]
+    draw.text(
+        (tx, ty),
+        HONGGUO_BRAND_NAME,
+        fill=(255, 255, 255, 255),
+        font=brand_font,
+        stroke_width=2,
+        stroke_fill=(30, 30, 30),
+    )
+    return base.convert("RGB")
+
+
 def _format_splash_title(keyword: str) -> str:
     text = keyword.strip() or "短剧"
     if text.startswith("《") and text.endswith("》"):
@@ -397,10 +509,11 @@ def render_keyword_splash_card(
     subtitle_font_px: Optional[int] = None,
     badge_text: str = "",
 ) -> None:
-    """1 秒片头：黑底 + 《关键词》+ 红果短剧搜索看全集 + 可选角标（如 1-5）。"""
+    """1 秒片头：品牌渐变底 + 左上 logo + 白字《关键词》+ 副标题 + 可选角标。"""
     title = _format_splash_title(keyword)
     badge = (badge_text or "").strip()[:24]
-    img = Image.new("RGB", (WORK_WIDTH, WORK_HEIGHT), (0, 0, 0))
+    img = _hongguo_splash_gradient(WORK_WIDTH, WORK_HEIGHT)
+    img = _draw_hongguo_brand_corner(img)
     draw = ImageDraw.Draw(img)
 
     if title_font_px is None and subtitle_font_px is None:
@@ -443,16 +556,37 @@ def render_keyword_splash_card(
     y0 = (WORK_HEIGHT - block_h) // 2
 
     tx = (WORK_WIDTH - tw) // 2 - tbox[0]
-    draw.text((tx, y0 - tbox[1]), title, fill=(255, 255, 255), font=title_font)
+    draw.text(
+        (tx, y0 - tbox[1]),
+        title,
+        fill=(255, 255, 255),
+        font=title_font,
+        stroke_width=3,
+        stroke_fill=(30, 30, 30),
+    )
 
     sx = (WORK_WIDTH - sw) // 2 - sbox[0]
     sy = y0 + th + title_sub_gap - sbox[1]
-    draw.text((sx, sy), SPLASH_SUBTITLE, fill=(255, 255, 255), font=sub_font)
+    draw.text(
+        (sx, sy),
+        SPLASH_SUBTITLE,
+        fill=(255, 255, 255),
+        font=sub_font,
+        stroke_width=2,
+        stroke_fill=(40, 40, 40),
+    )
 
     if badge and badge_font:
         bx = (WORK_WIDTH - bw) // 2 - bbox[0]
         by = sy + sh + badge_gap - bbox[1]
-        draw.text((bx, by), badge, fill=(255, 255, 255), font=badge_font)
+        draw.text(
+            (bx, by),
+            badge,
+            fill=(255, 255, 255),
+            font=badge_font,
+            stroke_width=2,
+            stroke_fill=(40, 40, 40),
+        )
 
     img.save(path)
 
@@ -526,16 +660,22 @@ def render_outro_card(path: Path, keyword: str) -> None:
     img.save(path)
 
 
-def body_playback_speed() -> float:
-    """正片成片播放倍速（默认 2x）；可用 HONGGUO_BODY_PLAYBACK_SPEED 覆盖，1=原速。"""
-    raw = os.getenv("HONGGUO_BODY_PLAYBACK_SPEED", str(DEFAULT_BODY_PLAYBACK_SPEED))
-    try:
-        v = float(raw)
-    except ValueError:
-        v = DEFAULT_BODY_PLAYBACK_SPEED
-    if v <= 0:
-        v = DEFAULT_BODY_PLAYBACK_SPEED
-    return max(0.5, min(4.0, v))
+def _body_effects_for_clip(
+    commentary_lines: Optional[list[str]],
+    meme_captions: Optional[list],
+    meme_beats: Optional[list],
+) -> tuple[list[str], list, list]:
+    """原味模式：正片不叠 meme/解说条/TTS，仅保留裁剪与轻度像素去重。"""
+    caps = list(meme_captions or [])
+    beats = list(meme_beats or [])
+    lines = list(commentary_lines or [])
+    if not meme_on_body_enabled():
+        caps, beats = [], []
+    if not body_burn_subtitles() and not tts_on_body_enabled():
+        lines = []
+    elif not body_burn_subtitles():
+        lines = []
+    return lines, caps, beats
 
 
 def _video_output_fit_filter() -> str:
@@ -592,6 +732,12 @@ def _body_vf_with_speed(
 
 def _normalize_segment(src: Path, dest: Path, *, seconds: float = 0) -> None:
     """统一帧率/分辨率/音轨，避免拼接后卡顿。"""
+    if _use_moviepy():
+        try:
+            mpy_normalize_video_file(src, dest, seconds=seconds)
+            return
+        except Exception as exc:
+            logger.warning("MoviePy 规范化失败，回退 FFmpeg: %s", exc)
     dest.unlink(missing_ok=True)
     dur_hint = seconds or _probe_duration(src) or 120.0
     _run_ffmpeg(
@@ -642,25 +788,90 @@ def _clip_with_plan(
     originality_seed: str = "",
     work_dir: Optional[Path] = None,
 ) -> None:
-    trim = segment_plan.trim_start_sec if segment_plan else 0.0
-    if originality_enabled():
-        trim = max(
-            0.0,
-            trim + trim_jitter_seconds(f"{originality_seed}:{label}:{trim:.1f}"),
-        )
-    max_d = segment_plan.duration_sec if segment_plan else None
-    _process_body_clip(
-        raw,
-        dest,
-        label,
-        fallback_seconds,
-        trim_start_sec=trim,
-        max_duration_sec=max_d,
-        prefer_stream_copy=prefer_stream_copy,
-        commentary_lines=commentary_lines or [],
-        originality_seed=originality_seed,
-        work_dir=work_dir,
+    meme_caps = segment_plan.meme_captions if segment_plan else []
+    meme_beats = segment_plan.meme_beats if segment_plan else []
+    body_lines, meme_caps, meme_beats = _body_effects_for_clip(
+        commentary_lines, meme_caps, meme_beats
     )
+    clips = segment_plan.resolved_clips() if segment_plan else []
+    use_multi = multi_clip_enabled() and len(clips) > 1
+
+    if not use_multi:
+        trim = segment_plan.trim_start_sec if segment_plan else 0.0
+        if originality_enabled():
+            trim = max(
+                0.0,
+                trim + trim_jitter_seconds(f"{originality_seed}:{label}:{trim:.1f}"),
+            )
+        max_d = segment_plan.duration_sec if segment_plan else None
+        _process_body_clip(
+            raw,
+            dest,
+            label,
+            fallback_seconds,
+            trim_start_sec=trim,
+            max_duration_sec=max_d,
+            prefer_stream_copy=prefer_stream_copy,
+            commentary_lines=body_lines,
+            originality_seed=originality_seed,
+            work_dir=work_dir,
+            meme_captions=meme_caps,
+            meme_beats=meme_beats,
+        )
+        return
+
+    work = work_dir or dest.parent
+    parts: list[Path] = []
+    try:
+        for i, frag in enumerate(clips):
+            part = work / f"{dest.stem}_f{i:02d}.mp4"
+            trim = frag.trim_start_sec
+            if originality_enabled():
+                trim = max(
+                    0.0,
+                    trim
+                    + trim_jitter_seconds(
+                        f"{originality_seed}:{label}:f{i}:{trim:.1f}"
+                    )
+                    * 0.35,
+                )
+            _process_body_clip(
+                raw,
+                part,
+                f"{label}·段{i + 1}",
+                fallback_seconds,
+                trim_start_sec=trim,
+                max_duration_sec=frag.duration_sec,
+                prefer_stream_copy=False,
+                commentary_lines=[],
+                originality_seed=f"{originality_seed}:f{i}",
+                work_dir=work,
+                meme_captions=[],
+                meme_beats=[],
+                clip_tail_pad=clip_tail_pad_sec(),
+                soft_audio_fade_out=True,
+            )
+            parts.append(part)
+        if _use_moviepy():
+            try:
+                mpy_merge_video_files(
+                    parts, dest, crossfade_sec=clip_crossfade_sec()
+                )
+            except Exception as exc:
+                logger.warning("%s 快切交叉淡化失败，直拼: %s", label, exc)
+                _merge_segments(parts, dest, body_seconds=0.0, intro_seconds=0.0)
+        else:
+            _merge_segments(parts, dest, body_seconds=0.0, intro_seconds=0.0)
+        logger.info(
+            "%s 本集高能快切 %d 段 → %.1fs [%s]",
+            label,
+            len(parts),
+            _probe_duration(dest) or 0.0,
+            clip_summary_for_log(clips),
+        )
+    finally:
+        for p in parts:
+            p.unlink(missing_ok=True)
 
 
 def _ensure_output_aspect(segment: Path, label: str = "") -> None:
@@ -719,9 +930,80 @@ def _process_body_clip(
     commentary_lines: Optional[list[str]] = None,
     originality_seed: str = "",
     work_dir: Optional[Path] = None,
+    meme_captions: Optional[list] = None,
+    meme_beats: Optional[list] = None,
+    clip_tail_pad: Optional[float] = None,
+    soft_audio_fade_out: bool = False,
 ) -> None:
     """裁剪正片；开启去重增强时强制重编码并烧录解说字幕。"""
     trim_start = max(0.0, float(trim_start_sec or 0))
+    speed = body_playback_speed()
+    need_originality = originality_enabled()
+    logger.info(
+        "%s 正片倍速配置: %.3gx（HONGGUO_BODY_PLAYBACK_SPEED=%s, AUTHENTIC=%s）",
+        label,
+        speed,
+        os.getenv("HONGGUO_BODY_PLAYBACK_SPEED", "(未设)"),
+        os.getenv("HONGGUO_AUTHENTIC", "(未设)"),
+    )
+    body_lines, meme_captions, meme_beats = _body_effects_for_clip(
+        commentary_lines, meme_captions, meme_beats
+    )
+    if meme_edit_enabled() and (meme_captions or meme_beats) and not _use_moviepy():
+        logger.warning("%s Meme 特效需 HONGGUO_VIDEO_BACKEND=moviepy，已跳过梗字幕/卡点", label)
+    if _use_moviepy():
+        try:
+            mpy_process_body_clip(
+                raw,
+                dest,
+                label,
+                seconds,
+                trim_start_sec=trim_start,
+                max_duration_sec=max_duration_sec,
+                speed=speed,
+                commentary_lines=body_lines,
+                originality_seed=originality_seed,
+                work_dir=work_dir,
+                need_originality=need_originality,
+                meme_captions=meme_captions,
+                meme_beats=meme_beats,
+                clip_tail_pad=clip_tail_pad,
+                soft_audio_fade_out=soft_audio_fade_out,
+            )
+            dur = _probe_duration(dest)
+            if dur < 0.5:
+                raise RuntimeError(f"{label} 正片时长异常（{dur:.1f}s）")
+            use_speed = abs(speed - 1.0) >= 0.01
+            output_clip_len = (
+                float(max_duration_sec) if max_duration_sec and max_duration_sec > 0 else 0.0
+            )
+            source_clip_len = (
+                output_clip_len * speed if use_speed and output_clip_len > 0.01 else output_clip_len
+            )
+            clip_note = ""
+            if trim_start > 0.01 or output_clip_len > 0.01:
+                target = output_clip_len or dur
+                clip_note = f"（起点 {trim_start:.1f}s，成片 {target:.1f}s"
+                if use_speed:
+                    clip_note += f"，{speed:g}x，源片约 {source_clip_len:.1f}s"
+                clip_note += "）"
+            elif use_speed:
+                clip_note = f"（{speed:g}x 倍速）"
+            meme_tag = ""
+            if meme_captions or meme_beats:
+                meme_tag = f"，Meme字幕{len(meme_captions)}条/卡点{len(meme_beats)}个"
+            logger.info(
+                "%s 正片 %.1fs%s（MoviePy%s，原声: %s）",
+                label,
+                dur,
+                clip_note,
+                meme_tag,
+                "是" if audio_is_audible(dest) else "否",
+            )
+            return
+        except Exception as exc:
+            logger.warning("%s MoviePy 正片失败，回退 FFmpeg: %s", label, exc)
+
     output_clip_len = (
         float(max_duration_sec) if max_duration_sec and max_duration_sec > 0 else 0.0
     )
@@ -732,7 +1014,7 @@ def _process_body_clip(
     )
     src_codec = _video_codec(raw)
     need_originality = originality_enabled()
-    # 2x 倍速必须重编码；去重增强同样必须重编码
+    # 非 1x 倍速必须重编码；去重增强同样必须重编码
     use_copy_first = (
         not need_originality
         and not use_speed
@@ -741,8 +1023,14 @@ def _process_body_clip(
 
     overlay_pngs: list[Path] = []
     sub_lines: list[str] = []
-    if need_originality and commentary_lines and work_dir and output_clip_len > 0.5:
-        sub_lines = [str(x).strip() for x in commentary_lines if str(x).strip()][:5]
+    if (
+        need_originality
+        and body_burn_subtitles()
+        and body_lines
+        and work_dir
+        and output_clip_len > 0.5
+    ):
+        sub_lines = [str(x).strip() for x in body_lines if str(x).strip()][:5]
         for i, line in enumerate(sub_lines):
             png = work_dir / f"{dest.stem}_ov_{i}.png"
             render_subtitle_overlay_png(
@@ -832,7 +1120,7 @@ def _process_body_clip(
         af_parts: list[str] = []
         if atempo:
             af_parts.append(atempo)
-        if need_originality:
+        if need_originality and not authentic_preservation_enabled():
             af_parts.append("highpass=f=80,lowpass=f=12000,volume=0.98")
         if af_parts:
             ffmpeg_args.extend(["-af", ",".join(af_parts)])
@@ -931,7 +1219,12 @@ async def _download_episode_segment_from_fq_koc(
     )
     _ensure_segment_h264(dest, label)
     src = "本地缓存" if from_local else "达人中心"
-    extra = "，去重增强" if originality_enabled() else ""
+    extras: list[str] = []
+    if originality_enabled():
+        extras.append("去重增强")
+    if tts_enabled() and edge_tts_available():
+        extras.append("TTS解说")
+    extra = ("，" + "、".join(extras)) if extras else ""
     return f"{src}明文（{label}，含原声{extra}）"
 
 
@@ -975,8 +1268,31 @@ async def _download_episode_segment_from_external(
     return f"{platform}素材（{cap}，含原声）"
 
 
-def _card_to_video(image: Path, dest: Path, duration: float, *, ken_burns: bool = False) -> None:
+def _card_to_video(
+    image: Path,
+    dest: Path,
+    duration: float,
+    *,
+    ken_burns: bool = False,
+    narration_text: str = "",
+    work_dir: Optional[Path] = None,
+    narration_voice: Optional[str] = None,
+) -> None:
     """片头/片尾：直接输出 H.264，浏览器可预览。"""
+    if _use_moviepy() and not ken_burns:
+        try:
+            mpy_image_to_video(
+                image,
+                dest,
+                duration,
+                fps=OUTPUT_FPS,
+                narration_text=narration_text,
+                work_dir=work_dir,
+                narration_voice=narration_voice,
+            )
+            return
+        except Exception as exc:
+            logger.warning("MoviePy 卡片转视频失败，回退 FFmpeg: %s", exc)
     if ken_burns:
         frames = int(duration * OUTPUT_FPS)
         vf = (
@@ -1171,6 +1487,27 @@ def _merge_segments(
     parts_total = sum(max(0.0, _probe_duration(p) or 0.0) for p in parts)
     # 以各片段实测时长为准校验（AI 计划时长常大于实际裁切结果）
     expected_min = max(2.5, parts_total * 0.82)
+
+    if _use_moviepy():
+        try:
+            mpy_merge_video_files(parts, dest)
+            dur = _probe_duration(dest)
+            if not dest.is_file() or dest.stat().st_size < MIN_OUTPUT_BYTES:
+                raise RuntimeError("MoviePy 合成文件过小")
+            if dur < expected_min:
+                raise RuntimeError(
+                    f"合成视频时长异常（成片 {dur:.1f}s，片段合计约 {parts_total:.1f}s）"
+                )
+            logger.info(
+                "拼接成功 %.1fs，%.1f MB（MoviePy）",
+                dur,
+                dest.stat().st_size / 1024 / 1024,
+            )
+            return
+        except Exception as exc:
+            logger.warning("MoviePy 拼接失败，回退 FFmpeg: %s", exc)
+            dest.unlink(missing_ok=True)
+
     codecs = {_video_codec(p) for p in parts}
     mixed = len({c for c in codecs if c}) > 1
 
@@ -1266,6 +1603,9 @@ async def generate_hook_video(
         raise ValueError(f"最多选择 {MAX_EPISODES} 集")
 
     work = Path(tempfile.mkdtemp(prefix="hongguo_hook_"))
+    tts_note = ""
+    if tts_enabled() and edge_tts_available():
+        tts_note = f"，TTS={pick_voice_for_episode(series_id)}"
     body_seconds_total = 0.0
     episode_labels_pre: list[str] = []
     episode_durations_pre: list[float] = []
@@ -1295,6 +1635,15 @@ async def generate_hook_video(
             episode_durations=episode_durations_pre,
         )
 
+    logger.info(
+        "成片：%s | %s | 风格=%s | %s%s",
+        video_backend(),
+        "AI 剪辑大师" if use_ai_edit else "规则剪辑",
+        edit_plan.edit_style,
+        (edit_plan.hook_summary or "")[:80],
+        tts_note,
+    )
+
     splash_keyword = (keyword or "").strip() or drama_title.strip()
     promo_keyword = splash_keyword or edit_plan.outro_keyword
     commentary_lines = pick_commentary_lines(
@@ -1303,7 +1652,19 @@ async def generate_hook_video(
         subtitle_hint=edit_plan.subtitle_hint,
         hook_summary=edit_plan.hook_summary,
         drama_title=drama_title,
+        max_lines=3,
+        meme_mode=meme_edit_enabled(),
     )
+    ep_count = len(episode_item_ids)
+    if hook_budget_enabled(ep_count):
+        budget_note = budget_summary(
+            ep_count,
+            with_commentary=bool(
+                originality_enabled() and edit_plan.opening_text.strip()
+            ),
+        )
+        if budget_note:
+            logger.info(budget_note)
     originality_seed = f"{series_id}:{splash_keyword}:{promo_keyword}"
 
     try:
@@ -1345,7 +1706,13 @@ async def generate_hook_video(
                 drama_title=drama_title,
             )
             _card_to_video(
-                comm_img, comm_mp4, COMMENTARY_CARD_SECONDS, ken_burns=False
+                comm_img,
+                comm_mp4,
+                COMMENTARY_CARD_SECONDS,
+                ken_burns=False,
+                narration_text=edit_plan.opening_text.strip(),
+                work_dir=work,
+                narration_voice=pick_voice_for_episode(originality_seed),
             )
             comm_norm = work / "00b_commentary_norm.mp4"
             _normalize_segment(
@@ -1488,6 +1855,12 @@ async def generate_hook_video(
         if not video_decodes(output):
             raise RuntimeError("成片无法解码播放，请重试或换一集")
 
+        if watermark_enabled():
+            wm_path = work / "hook_watermarked.mp4"
+            if burn_corner_watermark(output, wm_path):
+                output.unlink(missing_ok=True)
+                wm_path.rename(output)
+
         if not _has_audio(output):
             logger.warning("成片未检测到音轨")
         elif not audio_is_audible(output):
@@ -1496,10 +1869,44 @@ async def generate_hook_video(
         final_name = f"{_safe_filename(drama_title)}_钩子.mp4"
         warning = ""
         if body_notes and all("明文" in n for n in body_notes):
-            if originality_enabled():
+            tts_tip = (
+                "Edge TTS 解说音轨（晓晓/晓伊/云阳）；"
+                if tts_enabled() and edge_tts_available()
+                else ""
+            )
+            if authentic_preservation_enabled():
+                light = "轻度" if originality_light_visual() else ""
+                budget_tip = ""
+                if hook_budget_enabled(ep_count):
+                    mc = "多段快切" if multi_clip_enabled() else "连续裁剪"
+                    budget_tip = f"{ep_count}集≈3分钟（{mc}）；"
+                wm_tip = (
+                    f"角落水印「{watermark_text()}」；"
+                    if watermark_enabled()
+                    else ""
+                )
                 warning = (
                     f"横屏 {WORK_WIDTH}×{WORK_HEIGHT}（{ASPECT_LABEL}），"
+                    f"{budget_tip}{wm_tip}"
+                    f"正片原味（{body_playback_speed():g}x、原声对白、无正片解说条/meme），"
+                    f"{light}像素去重+片头片尾引导。"
+                )
+            elif meme_edit_enabled() and edit_plan.edit_style == "meme":
+                warning = (
+                    f"横屏 {WORK_WIDTH}×{WORK_HEIGHT}（{ASPECT_LABEL}），"
+                    f"{tts_tip}"
+                    "Meme 风剪辑（AI 梗字幕+卡点缩放+1.618倍速+去重解说）。"
+                )
+            elif originality_enabled():
+                warning = (
+                    f"横屏 {WORK_WIDTH}×{WORK_HEIGHT}（{ASPECT_LABEL}），"
+                    f"{tts_tip}"
                     "已启用抖音去重增强（解说字幕+微调色+片头片尾引导）。"
+                )
+            elif tts_enabled() and edge_tts_available():
+                warning = (
+                    f"横屏 {WORK_WIDTH}×{WORK_HEIGHT}（{ASPECT_LABEL}），"
+                    f"{tts_tip}正片含 AI 解说配音。"
                 )
             else:
                 warning = (

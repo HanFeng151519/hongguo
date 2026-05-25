@@ -25,7 +25,7 @@
     <section class="generate-panel">
       <h2 class="panel-title">AI 推广剪辑</h2>
       <label class="field">
-        <span>片头关键词（1 秒黑底标题卡，显示《关键词》+ 红果短剧搜索看全集）</span>
+        <span>片头关键词（1 秒品牌渐变封面，左上红果 logo + 白字《关键词》+ 搜索引导）</span>
         <input id="keyword" type="text" placeholder="例：这次可摊上事了" />
       </label>
       <div class="splash-font-row">
@@ -47,10 +47,10 @@
           <input id="splash-badge" type="text" maxlength="24" placeholder="例如：1-5、6-30" />
         </label>
       </div>
-      <p class="episode-status">正片 AI 裁剪后默认 2 倍速；片头 1 秒 + 解说过渡 + 烧录字幕（抖音去重）。</p>
+      <p class="episode-status"><strong>AI 剪辑大师</strong>：从每集正片里只留最精彩片段，快切成约 3 分钟钩子（冲突→打脸→反转→悬念），原声 1x + 丰丰漫剧推荐水印。</p>
       <label class="field field-checkbox">
         <input id="use-ai-edit" type="checkbox" checked />
-        <span>AI 流量剪辑（LM Studio / gemma-4-e4b-it：自动写钩子文案 + 裁正片；需本机 LM Studio 已启动）</span>
+        <span>AI 剪辑大师（LM Studio：自动挑最精彩镜头 + 快切；需本机已启动）</span>
       </label>
       <label class="field field-checkbox">
         <input id="use-fq-koc" type="checkbox" checked />
@@ -107,7 +107,7 @@
 
     <section class="generate-actions">
       <button type="button" id="btn-generate" class="btn-primary" disabled>生成钩子视频</button>
-      <p id="generate-hint" class="generate-hint">输出横屏 16:9（1920×1080）：片头 → 解说卡 → AI 正片（字幕+去重）→ 搜索引导片尾</p>
+      <p id="generate-hint" class="generate-hint">AI 只留最精彩：片头 → 解说卡 → 多集快切正片（约3分钟）→ 片尾</p>
     </section>
 
     <section id="result-panel" class="result-panel hidden">
@@ -122,6 +122,6 @@
       <a id="download-link" class="btn-download hidden" href="#" download="hook_video.mp4">下载推广视频（MP4）</a>
     </section>
   </div>
-  <script src="/generate.js?v=34"></script>
+  <script src="/generate.js?v=35"></script>
 </body>
 </html>

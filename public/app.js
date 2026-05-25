@@ -10,6 +10,22 @@ const hotDateEl = document.getElementById("hot-date");
 let debounceTimer = null;
 let currentQuery = "";
 let lastSearchItems = [];
+let hintAudio = null;
+
+function searchHintAudioUrl(title) {
+  return `/api/tts/search-hint.mp3?title=${encodeURIComponent((title || "").trim())}`;
+}
+
+function playSearchHint(title) {
+  const t = (title || "").trim();
+  if (!t) return;
+  if (hintAudio) {
+    hintAudio.pause();
+    hintAudio = null;
+  }
+  hintAudio = new Audio(searchHintAudioUrl(t));
+  hintAudio.play().catch(() => {});
+}
 
 function formatCopyText(item) {
   const title = item.title || "";
@@ -146,6 +162,7 @@ function renderHotItem(item, rank) {
             ? `<a class="btn-watch" href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer">观看</a>`
             : ""
         }
+        <button type="button" class="btn-voice-hint" data-title="${escapeHtml(item.title || "")}" title="播放搜索提示">🔊</button>
         <a class="btn-gen" href="${escapeHtml(buildGenerateUrl(item))}">生成视频</a>
       </div>
     </li>
@@ -175,6 +192,7 @@ async function loadTodayHot() {
     hotListEl.innerHTML = data.items
       .map((item, i) => renderHotItem(item, i + 1))
       .join("");
+    bindVoiceHintButtons(hotListEl);
 
     if (hotDateEl && data.date) {
       const label = data.kind_label || "漫剧";
@@ -230,9 +248,21 @@ function renderCard(item, query, index) {
         <textarea class="copy-source" readonly tabindex="-1" aria-hidden="true">${textareaContent(copyText)}</textarea>
         <button type="button" class="copy-btn">复制</button>
       </div>
+      <button type="button" class="btn-voice-hint card-voice" data-title="${escapeHtml(item.title || "")}" title="请搜索《剧名》在红果短剧观看原片">🔊 语音</button>
       <a class="btn-generate" href="${escapeHtml(buildGenerateUrl(item))}">一键生成钩子视频</a>
     </article>
   `;
+}
+
+function bindVoiceHintButtons(root) {
+  if (!root) return;
+  root.querySelectorAll(".btn-voice-hint").forEach((el) => {
+    el.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      playSearchHint(el.dataset.title || "");
+    });
+  });
 }
 
 async function copyFromCard(btn) {
@@ -241,7 +271,7 @@ async function copyFromCard(btn) {
   return copyToClipboard(source.value);
 }
 
-async function doSearch(query) {
+async function doSearch(query, { playVoice = false } = {}) {
   const q = query.trim();
   if (!q) return;
 
@@ -268,6 +298,11 @@ async function doSearch(query) {
     resultsEl.innerHTML = data.items
       .map((item, i) => renderCard(item, q, i))
       .join("");
+    bindVoiceHintButtons(resultsEl);
+
+    if (playVoice && data.items[0]) {
+      playSearchHint(data.items[0].title || q);
+    }
 
     resultsEl.querySelectorAll(".copy-btn").forEach((el) => {
       el.addEventListener("mousedown", (e) => {
@@ -292,7 +327,7 @@ async function doSearch(query) {
 
 form.addEventListener("submit", (e) => {
   e.preventDefault();
-  doSearch(input.value);
+  doSearch(input.value, { playVoice: true });
 });
 
 input.addEventListener("input", () => {

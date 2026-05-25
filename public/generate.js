@@ -322,7 +322,18 @@ function showPostCaption(plan) {
     postCaptionBox?.classList.add("hidden");
     return;
   }
-  postCaptionEl.textContent = text;
+  let memeHint = "";
+  if (plan?.edit_style === "meme") {
+    const caps = (plan.body_segments || [])
+      .flatMap((s) => s.meme_captions || [])
+      .slice(0, 6)
+      .map((c) => (typeof c === "string" ? c : c.text))
+      .filter(Boolean);
+    if (caps.length) {
+      memeHint = `\n\n【Meme 字幕】${caps.join(" · ")}`;
+    }
+  }
+  postCaptionEl.textContent = text + memeHint;
   postCaptionBox.classList.remove("hidden");
 }
 
@@ -409,8 +420,8 @@ function renderEpisodes() {
       }
       generateHint.textContent =
         selected.size === 1
-          ? "已选 1 集：AI 将自动裁高潮正片并生成发布文案"
-          : `已选 ${selected.size} 集`;
+          ? "已选 1 集：AI 剪辑大师只留最精彩片段"
+          : `已选 ${selected.size} 集：AI 只留最精彩，拼成约 3 分钟钩子`;
       if (selected.size === 1) {
         loadServiceConfig(id);
         resolveEpisodeUrl(id, { quiet: true });
@@ -682,7 +693,7 @@ btnGenerate.addEventListener("click", async () => {
   resultPanel.classList.remove("hidden");
   postCaptionBox?.classList.add("hidden");
   resultMsg.textContent =
-    "AI 正在写推广文案并裁剪正片，请耐心等待…";
+    "AI 正在写 Meme 梗字幕与裁剪正片，请耐心等待…";
   previewEl.classList.add("hidden");
   previewEl.removeAttribute("src");
   downloadLink.classList.add("hidden");

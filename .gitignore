@@ -6,4 +6,6 @@ __pycache__/
 public/materials/
 public/downloads/*.mp4
 !public/downloads/.gitkeep
+public/tts_cache/*.mp3
+!public/tts_cache/.gitkeep
 public copy/

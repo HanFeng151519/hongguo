@@ -100,6 +100,8 @@ STATIC_DIR = Path(__file__).resolve().parent.parent / "public"
 _hot_cache: dict[str, Any] = {"day": "", "items": []}
 _hot_lock = asyncio.Lock()
 DOWNLOAD_DIR = STATIC_DIR / "downloads"
+TTS_CACHE_DIR = STATIC_DIR / "tts_cache"
+TTS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 DOWNLOAD_TTL_SEC = 3600
 GENERATE_JOBS: dict[str, dict[str, Any]] = {}
 GENERATE_JOBS_LOCK = asyncio.Lock()
@@ -448,6 +450,13 @@ async def _run_generate_job(job_id: str, body: GenerateHookRequest) -> None:
         task_id = _new_job_id()
         saved = DOWNLOAD_DIR / f"{task_id}.mp4"
         saved.write_bytes(video_bytes)
+        logging.getLogger(__name__).info(
+            "成片已保存 %s（任务 job_id=%s，%d 字节，约 %.1f MB）",
+            saved,
+            job_id,
+            len(video_bytes),
+            len(video_bytes) / 1024 / 1024,
+        )
 
         async def _delayed_remove() -> None:
             await asyncio.sleep(DOWNLOAD_TTL_SEC)
@@ -806,6 +815,32 @@ async def download_douyin_material(body: KuaishouMaterialRequest):
         "size": local.stat().st_size if local.is_file() else 0,
         "preview_match": preview,
     }
+
+
+@app.get("/api/tts/search-hint.mp3")
+async def tts_search_hint(
+    title: str = Query(..., min_length=1, max_length=64, description="剧名"),
+):
+    """首页语音：请搜索《剧名》在红果短剧观看原片（Edge TTS，带缓存）。"""
+    from edge_tts_narration import (
+        edge_tts_available,
+        ensure_search_hint_mp3,
+        tts_enabled,
+    )
+
+    if not tts_enabled() or not edge_tts_available():
+        raise HTTPException(status_code=503, detail="TTS 未启用或未安装 edge-tts")
+    try:
+        path = await ensure_search_hint_mp3(title.strip(), TTS_CACHE_DIR)
+    except Exception as exc:
+        logging.getLogger(__name__).warning("搜索提示 TTS 失败: %s", exc)
+        raise HTTPException(status_code=500, detail="语音合成失败") from exc
+    return FileResponse(
+        path,
+        media_type="audio/mpeg",
+        filename="search-hint.mp3",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
 
 
 @app.get("/api/generate/splash-preview.png")
