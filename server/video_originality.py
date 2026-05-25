@@ -20,8 +20,20 @@ def originality_enabled() -> bool:
 
 
 def originality_outro_enabled() -> bool:
-    v = os.getenv("HONGGUO_ORIGINALITY_OUTRO", "1").strip().lower()
-    return originality_enabled() and v not in ("0", "false", "no", "off")
+    if not originality_enabled():
+        return False
+    v = os.getenv("HONGGUO_ORIGINALITY_OUTRO", "").strip().lower()
+    try:
+        from platform_compliance import douyin_safe_enabled
+
+        if douyin_safe_enabled():
+            # 抖音合规默认关闭「搜 App 看全集」片尾；需片尾时设 HONGGUO_ORIGINALITY_OUTRO=1（站内话术）
+            return v in ("1", "true", "yes", "on")
+    except ImportError:
+        pass
+    if not v:
+        return True
+    return v not in ("0", "false", "no", "off")
 
 
 def authentic_preservation_enabled() -> bool:
@@ -252,23 +264,15 @@ def pick_commentary_lines(
                 seen.add(line)
                 out.append(line)
 
-    for line in plan_lines:
-        add(line)
-    if not meme_mode:
-        add(subtitle_hint)
-        add(opening_text)
+    from platform_compliance import safe_commentary_fallbacks, sanitize_promo_copy
 
-    short = (drama_title or "短剧").strip()[:10]
-    fallbacks = (
-        ["前方高能", "这反转绝了", f"红果搜{short}"]
-        if meme_mode
-        else [
-            f"《{short}》这段太炸了",
-            "注意看男主这个眼神",
-            "反转来得猝不及防",
-            f"红果搜「{short}」看全集",
-        ]
-    )
+    for line in plan_lines:
+        add(sanitize_promo_copy(line, max_len=36))
+    if not meme_mode:
+        add(sanitize_promo_copy(subtitle_hint, max_len=36))
+        add(sanitize_promo_copy(opening_text, max_len=36))
+
+    fallbacks = safe_commentary_fallbacks(drama_title, meme_mode=meme_mode)
     for fb in fallbacks:
         if len(out) >= max_lines:
             break

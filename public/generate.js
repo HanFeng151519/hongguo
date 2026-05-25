@@ -421,7 +421,7 @@ function renderEpisodes() {
       generateHint.textContent =
         selected.size === 1
           ? "已选 1 集：AI 剪辑大师只留最精彩片段"
-          : `已选 ${selected.size} 集：AI 只留最精彩，拼成约 3 分钟钩子`;
+          : `已选 ${selected.size} 集：AI 只留最精彩，拼成约 2分30–3分30 钩子`;
       if (selected.size === 1) {
         loadServiceConfig(id);
         resolveEpisodeUrl(id, { quiet: true });

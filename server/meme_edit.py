@@ -205,11 +205,14 @@ def normalize_meme_beats(raw: Any) -> list[MemeBeat]:
 
 
 def default_meme_captions(drama_title: str, episode_index: int = 1) -> list[MemeCaption]:
+    from platform_compliance import douyin_safe_enabled
+
     short = (drama_title or "短剧").strip()[:8]
+    bottom = "关注看全集" if douyin_safe_enabled() else f"红果搜{short}"
     templates = [
         ("前方高能！", 1.2, "top", "punch"),
         ("这反转绝了", 8.0, "impact", "shock"),
-        (f"红果搜{short}", 16.0, "bottom", "whisper"),
+        (bottom, 16.0, "bottom", "whisper"),
     ]
     return [
         MemeCaption(

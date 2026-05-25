@@ -23,6 +23,9 @@ from meme_edit import (
 from hook_duration_budget import (
     body_budget_seconds,
     hook_budget_enabled,
+    hook_duration_range_text,
+    hook_target_max_sec,
+    hook_target_min_sec,
     hook_target_total_sec,
     per_episode_target_sec,
     scale_body_segments_to_budget,
@@ -39,6 +42,12 @@ from multi_clip import (
     refine_clips_for_hook_arc,
     scale_clips_to_episode_duration,
     sync_segment_from_clips,
+)
+from platform_compliance import (
+    ai_compliance_rule_block,
+    douyin_safe_enabled,
+    safe_post_caption,
+    sanitize_promo_copy,
 )
 from video_originality import authentic_preservation_enabled, body_playback_speed
 from qwen_client import (
@@ -244,12 +253,7 @@ def default_plan(
             seg.meme_captions = default_meme_captions(drama_title, i + 1)
             seg.meme_beats = default_meme_beats(seg.duration_sec)
         segments.append(seg)
-    post = (
-        f"🔥《{short}》也太上头了！\n"
-        f"第1集就高能，评论区说说你最气/最爽的是谁？\n"
-        f"👉 红果搜「{short}」继续看\n"
-        f"#{short} #短剧 #漫剧推荐"
-    )
+    post = safe_post_caption(short)
     if multi_budget:
         scale_body_segments_to_budget(segments, episode_count=ep_n)
         for seg in segments:
@@ -271,7 +275,7 @@ def default_plan(
                 else "连续裁剪"
             )
             hook_summary = (
-                f"剪辑大师：{ep_n} 集仅留最精彩镜头，合集约 {hook_target_total_sec():.0f}s，"
+                f"剪辑大师：{ep_n} 集仅留最精彩镜头，合集 {hook_duration_range_text()}，"
                 f"正片 {sum(s.duration_sec for s in segments):.0f}s，{clip_note}"
             )
         edit_style = "authentic"
@@ -280,7 +284,7 @@ def default_plan(
             [
                 "不是吧？？？",
                 "这波直接封神",
-                f"红果搜「{short}」别停",
+                "关注看全集" if douyin_safe_enabled() else f"红果搜「{short}」别停",
             ]
             if meme_on_body_enabled()
             else []
@@ -295,7 +299,7 @@ def default_plan(
         commentary = [
             f"《{short}》高能预警",
             "这反转谁想得到？",
-            f"红果搜「{short}」继续看",
+            "关注看全集" if douyin_safe_enabled() else f"红果搜「{short}」继续看",
         ]
         hook_summary = "规则默认：短钩子片头 + 高潮正片裁剪"
         edit_style = "promo"
@@ -306,7 +310,7 @@ def default_plan(
         outro_seconds=DEFAULT_OUTRO_SEC,
         body_segments=segments,
         hook_summary=hook_summary,
-        subtitle_hint=f"红果搜 {short}",
+        subtitle_hint="" if douyin_safe_enabled() else f"红果搜 {short}",
         commentary_lines=commentary,
         edit_style=edit_style,
     )
@@ -483,6 +487,22 @@ def _normalize_plan(
                 )
                 seg.duration_sec = total
 
+    opening_text = sanitize_promo_copy(opening_text, max_len=60) or opening_text
+    subtitle_hint = sanitize_promo_copy(str(raw.get("subtitle_hint") or ""), max_len=24)
+    post_caption = sanitize_promo_copy(post_caption, max_len=200)
+    if not post_caption:
+        post_caption = safe_post_caption(drama_title)
+    commentary_lines = [
+        sanitize_promo_copy(x, max_len=36)
+        for x in commentary_lines
+        if sanitize_promo_copy(x, max_len=36)
+    ]
+    for seg in segments:
+        for cap in seg.meme_captions:
+            cap.text = sanitize_promo_copy(cap.text, max_len=24) or cap.text
+    for cap in plan_caps:
+        cap.text = sanitize_promo_copy(cap.text, max_len=24) or cap.text
+
     return HookEditPlan(
         opening_text=opening_text,
         opening_seconds=opening_seconds,
@@ -490,7 +510,7 @@ def _normalize_plan(
         outro_seconds=outro_seconds,
         body_segments=segments,
         hook_summary=str(raw.get("hook_summary") or raw.get("summary") or ""),
-        subtitle_hint=str(raw.get("subtitle_hint") or ""),
+        subtitle_hint=subtitle_hint,
         post_caption=post_caption,
         commentary_lines=commentary_lines,
         edit_style=edit_style,
@@ -516,9 +536,12 @@ def _build_authentic_prompt(
     if hook_budget_enabled(n):
         body = body_budget_seconds(n)
         per = per_episode_target_sec(n)
+        body_lo = body_budget_seconds(n, total_sec=hook_target_min_sec())
+        body_hi = body
         if multi_clip_enabled():
             duration_rule = (
-                f"2. 共 {n} 集、正片合计约 {body:.0f}s（整条约 {hook_target_total_sec():.0f}s）；"
+                f"2. 共 {n} 集、正片合计约 {body_lo:.0f}–{body_hi:.0f}s（整条约 {hook_duration_range_text()}，"
+                f"宁长勿短、优先剧情完整）；"
                 f"每集 duration_sec≈{per:.0f}，clips 必须 {clips_per_episode()} 段快切，弧线：{hook_arc_hint_text()}。"
                 f"每段 duration_sec 建议 9-13s（宁长勿短，禁止对白说到一半就切）；"
                 f"trim_start_sec 须落在冲突/打脸/反转/悬念附近，"
@@ -527,8 +550,8 @@ def _build_authentic_prompt(
             )
         else:
             duration_rule = (
-                f"2. 共 {n} 集精彩合集：正片合计约 {body:.0f} 秒（整条钩子约 "
-                f"{hook_target_total_sec():.0f} 秒），每集 duration_sec 建议 {per:.0f}±6 秒；"
+                f"2. 共 {n} 集精彩合集：正片合计约 {body_lo:.0f}–{body_hi:.0f} 秒（整条钩子 "
+                f"{hook_duration_range_text()}），每集 duration_sec 建议 {per:.0f}±8 秒；"
                 f"trim_start_sec 跳过铺垫；成片倍速 {speed:g}x。"
             )
     elif multi_clip_enabled():
@@ -577,6 +600,7 @@ def _build_authentic_prompt(
 规则：
 1. commentary_lines 必须为空数组；meme_captions、meme_beats 必须为空数组。
 {duration_rule}
+{ai_compliance_rule_block()}
 3. opening_text ≤ 24 字，必须含反转/高能暗示；hook_summary 说明本集选了哪些爽点。
 4. 每集 clips 按时间顺序排列；第 1 集第一条尽量「开篇冲突」；最后一条尽量「悬念」。
 5. body_segments 覆盖 episode_index 1 到 {n}。"""
@@ -740,6 +764,7 @@ async def plan_hook_edit(
                     else " 删除铺垫，只留高潮与反转。"
                 )
                 + (" meme 方案须含 meme_captions、meme_beats。" if meme_edit_enabled() else "")
+                + ai_compliance_rule_block()
             ),
         },
         {"role": "user", "content": prompt},

@@ -25,7 +25,7 @@
     <section class="generate-panel">
       <h2 class="panel-title">AI 推广剪辑</h2>
       <label class="field">
-        <span>片头关键词（1 秒品牌渐变封面，左上红果 logo + 白字《关键词》+ 搜索引导）</span>
+        <span>片头关键词（1 秒品牌封面，白字《关键词》+ 副标题；抖音合规模式无站外搜索引导）</span>
         <input id="keyword" type="text" placeholder="例：这次可摊上事了" />
       </label>
       <div class="splash-font-row">
@@ -34,7 +34,7 @@
           <input id="splash-title-font" type="number" min="48" max="220" step="2" value="120" />
         </label>
         <label class="field field-compact">
-          <span>红果短剧搜索看全集 (px)</span>
+          <span>片头副标题字号 (px)</span>
           <input id="splash-subtitle-font" type="number" min="32" max="180" step="2" value="70" />
         </label>
       </div>
@@ -47,7 +47,7 @@
           <input id="splash-badge" type="text" maxlength="24" placeholder="例如：1-5、6-30" />
         </label>
       </div>
-      <p class="episode-status"><strong>AI 剪辑大师</strong>：从每集正片里只留最精彩片段，快切成约 3 分钟钩子（冲突→打脸→反转→悬念），原声 1x + 丰丰漫剧推荐水印。</p>
+      <p class="episode-status"><strong>AI 剪辑大师</strong>：从每集正片里只留最精彩片段，快切成约 2分30–3分30 钩子（冲突→打脸→反转→悬念），原声 1x + 丰丰漫剧推荐水印。</p>
       <label class="field field-checkbox">
         <input id="use-ai-edit" type="checkbox" checked />
         <span>AI 剪辑大师（LM Studio：自动挑最精彩镜头 + 快切；需本机已启动）</span>
@@ -107,7 +107,7 @@
 
     <section class="generate-actions">
       <button type="button" id="btn-generate" class="btn-primary" disabled>生成钩子视频</button>
-      <p id="generate-hint" class="generate-hint">AI 只留最精彩：片头 → 解说卡 → 多集快切正片（约3分钟）→ 片尾</p>
+      <p id="generate-hint" class="generate-hint">AI 只留最精彩：片头 → 解说卡 → 多集快切正片（约2分30–3分30）→ 片尾</p>
     </section>
 
     <section id="result-panel" class="result-panel hidden">

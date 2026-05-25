@@ -46,7 +46,18 @@ from edge_tts_narration import (
     tts_enabled,
     tts_on_body_enabled,
 )
-from hook_duration_budget import budget_summary, hook_budget_enabled
+from hook_duration_budget import (
+    budget_summary,
+    hook_budget_enabled,
+    hook_duration_range_text,
+)
+from platform_compliance import (
+    commentary_footer_hint,
+    compliance_brand_name,
+    douyin_safe_enabled,
+    outro_card_lines,
+    splash_subtitle_text,
+)
 from meme_edit import meme_edit_enabled, meme_on_body_enabled
 from multi_clip import (
     clip_crossfade_sec,
@@ -71,7 +82,6 @@ OUTRO_SECONDS = 4
 KEYWORD_SPLASH_SECONDS = 1.0
 COMMENTARY_CARD_SECONDS = 1.2
 OUTRO_SEARCH_SECONDS = 2.0
-SPLASH_SUBTITLE = "——  红果短剧搜索看全集  ——"
 HONGGUO_BRAND_NAME = "红果短剧"
 # 片头渐变四角色（取自品牌 logo：橙红 → 蜜桃 → 薄荷青）
 _SPLASH_GRAD_TL = (255, 209, 148)
@@ -432,13 +442,14 @@ def _draw_hongguo_brand_corner(img: Image.Image) -> Image.Image:
 
     draw = ImageDraw.Draw(base)
     brand_font = _load_font(44, bold=True)
-    bbox = draw.textbbox((0, 0), HONGGUO_BRAND_NAME, font=brand_font)
+    brand_label = compliance_brand_name()
+    bbox = draw.textbbox((0, 0), brand_label, font=brand_font)
     tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
     tx = mx + target_w + 18 - bbox[0]
     ty = my + (target_h - th) // 2 - bbox[1]
     draw.text(
         (tx, ty),
-        HONGGUO_BRAND_NAME,
+        compliance_brand_name(),
         fill=(255, 255, 255, 255),
         font=brand_font,
         stroke_width=2,
@@ -493,7 +504,7 @@ def _auto_fit_splash_fonts(draw: ImageDraw.ImageDraw, title: str) -> tuple[int, 
         sub_size = _splash_subtitle_font_size(size)
         sub_font = _load_font(sub_size, bold=False)
         tbox_try = draw.textbbox((0, 0), title, font=title_font)
-        sbox_try = draw.textbbox((0, 0), SPLASH_SUBTITLE, font=sub_font)
+        sbox_try = draw.textbbox((0, 0), splash_subtitle_text(), font=sub_font)
         if (tbox_try[2] - tbox_try[0] <= max_w) and (sbox_try[2] - sbox_try[0] <= max_w):
             return size, sub_size
         size -= 4
@@ -541,7 +552,8 @@ def render_keyword_splash_card(
 
     tbox = draw.textbbox((0, 0), title, font=title_font)
     tw, th = tbox[2] - tbox[0], tbox[3] - tbox[1]
-    sbox = draw.textbbox((0, 0), SPLASH_SUBTITLE, font=sub_font)
+    sub_line = splash_subtitle_text()
+    sbox = draw.textbbox((0, 0), sub_line, font=sub_font)
     sw, sh = sbox[2] - sbox[0], sbox[3] - sbox[1]
     bbox = (
         draw.textbbox((0, 0), badge, font=badge_font)
@@ -569,7 +581,7 @@ def render_keyword_splash_card(
     sy = y0 + th + title_sub_gap - sbox[1]
     draw.text(
         (sx, sy),
-        SPLASH_SUBTITLE,
+        sub_line,
         fill=(255, 255, 255),
         font=sub_font,
         stroke_width=2,
@@ -621,7 +633,7 @@ def render_commentary_card(path: Path, text: str, *, drama_title: str = "") -> N
             )
             y += 72
 
-    hint = f"红果短剧搜「{short}」看全集"
+    hint = commentary_footer_hint(drama_title)
     hint_font = _load_font(32, bold=False)
     hbox = draw.textbbox((0, 0), hint, font=hint_font)
     draw.text(
@@ -641,8 +653,7 @@ def render_outro_card(path: Path, keyword: str) -> None:
     kw = (keyword or "短剧").strip()[:16]
     img = Image.new("RGB", (WORK_WIDTH, WORK_HEIGHT), (8, 8, 12))
     draw = ImageDraw.Draw(img)
-    line1 = "想看全集？"
-    line2 = f"红果短剧搜「{kw}」"
+    line1, line2 = outro_card_lines(kw)
     f1 = _load_font(48, bold=True)
     f2 = _load_font(56, bold=True)
     for text, font, y_off, color in (
@@ -1879,7 +1890,7 @@ async def generate_hook_video(
                 budget_tip = ""
                 if hook_budget_enabled(ep_count):
                     mc = "多段快切" if multi_clip_enabled() else "连续裁剪"
-                    budget_tip = f"{ep_count}集≈3分钟（{mc}）；"
+                    budget_tip = f"{ep_count}集{hook_duration_range_text()}（{mc}）；"
                 wm_tip = (
                     f"角落水印「{watermark_text()}」；"
                     if watermark_enabled()
@@ -1889,7 +1900,8 @@ async def generate_hook_video(
                     f"横屏 {WORK_WIDTH}×{WORK_HEIGHT}（{ASPECT_LABEL}），"
                     f"{budget_tip}{wm_tip}"
                     f"正片原味（{body_playback_speed():g}x、原声对白、无正片解说条/meme），"
-                    f"{light}像素去重+片头片尾引导。"
+                    f"{light}像素去重"
+                    f"{'+抖音合规片头（无站外导流）' if douyin_safe_enabled() else '+片头片尾引导'}。"
                 )
             elif meme_edit_enabled() and edit_plan.edit_style == "meme":
                 warning = (
