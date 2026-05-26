@@ -48,8 +48,14 @@ def splash_subtitle_text() -> str:
     if custom:
         return sanitize_promo_copy(custom, max_len=48) or custom[:48]
     if douyin_safe_enabled():
-        return _DEFAULT_SPLASH_SUBTITLE_SAFE
-    return _DEFAULT_SPLASH_SUBTITLE_PROMO
+        return (
+            os.getenv("HONGGUO_SPLASH_SUBTITLE_SAFE_DEFAULT", _DEFAULT_SPLASH_SUBTITLE_SAFE).strip()
+            or _DEFAULT_SPLASH_SUBTITLE_SAFE
+        )
+    return (
+        os.getenv("HONGGUO_SPLASH_SUBTITLE_PROMO_DEFAULT", _DEFAULT_SPLASH_SUBTITLE_PROMO).strip()
+        or _DEFAULT_SPLASH_SUBTITLE_PROMO
+    )
 
 
 def commentary_footer_hint(drama_title: str) -> str:

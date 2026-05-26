@@ -215,6 +215,7 @@ def process_body_clip(
     meme_beats: Optional[list[MemeBeat]] = None,
     clip_tail_pad: Optional[float] = None,
     soft_audio_fade_out: bool = False,
+    soft_audio_fade_in: bool = False,
 ) -> None:
     """正片：裁剪 → 画布适配 → 倍速 → meme 特效 → 解说叠加 → 导出。"""
     from moviepy import VideoFileClip
@@ -259,14 +260,21 @@ def process_body_clip(
         if use_speed:
             sub = sub.with_speed_scaled(speed)
 
-        if soft_audio_fade_out and sub.duration and sub.duration > 0.45:
+        if sub.duration and sub.duration > 0.45:
             try:
                 from moviepy import afx
 
-                fade = min(0.35, max(0.12, float(sub.duration) * 0.12))
-                sub = sub.with_effects([afx.AudioFadeOut(fade)])
+                effects = []
+                if soft_audio_fade_in:
+                    fade_in = min(0.4, max(0.08, float(sub.duration) * 0.08))
+                    effects.append(afx.AudioFadeIn(fade_in))
+                if soft_audio_fade_out:
+                    fade_out = min(0.35, max(0.12, float(sub.duration) * 0.12))
+                    effects.append(afx.AudioFadeOut(fade_out))
+                if effects:
+                    sub = sub.with_effects(effects)
             except Exception as exc:
-                logger.debug("%s 段尾音淡出跳过: %s", label, exc)
+                logger.debug("%s 段音淡入淡出跳过: %s", label, exc)
 
         final_meme_caps: list[MemeCaption] = []
         if meme_on_body_enabled() and work_dir and (meme_captions or meme_beats):

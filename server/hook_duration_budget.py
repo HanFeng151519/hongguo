@@ -1,4 +1,4 @@
-"""多集钩子时长预算：成片可在约 2分30秒–3分30秒 区间浮动，优先保证内容完整。"""
+"""多集钩子时长预算：支持 1 分钟专业推荐钩子（60±2s）与长钩子模式。"""
 
 from __future__ import annotations
 
@@ -29,18 +29,55 @@ _OUTRO_SEC = 2.0
 _DEFAULT_TARGET_MIN = 150.0  # 2:30
 _DEFAULT_TARGET_MAX = 210.0  # 3:30
 _DEFAULT_TARGET_TOTAL = 180.0
+_ONE_MIN_TARGET_MIN = 58.0
+_ONE_MIN_TARGET_MAX = 62.0
+_ONE_MIN_TARGET_TOTAL = 60.0
+_ONE_MIN_COMPLETE_MIN = 54.0
+_ONE_MIN_COMPLETE_MAX = 72.0
+_ONE_MIN_COMPLETE_TOTAL = 62.0
+
+
+def completeness_first_enabled() -> bool:
+    try:
+        from edge_tts_narration import dialogue_completeness_enabled
+
+        return dialogue_completeness_enabled()
+    except ImportError:
+        return True
+
+
+def _hook_preset() -> str:
+    return os.getenv("HONGGUO_HOOK_PRESET", "").strip().lower()
+
+
+def _preset_defaults() -> tuple[float, float, float]:
+    """(min, max, target) 默认值。"""
+    if _hook_preset() in ("1min", "one_minute", "one-minute", "一分钟", "60s", "60"):
+        if completeness_first_enabled():
+            return (
+                _ONE_MIN_COMPLETE_MIN,
+                _ONE_MIN_COMPLETE_MAX,
+                _ONE_MIN_COMPLETE_TOTAL,
+            )
+        return _ONE_MIN_TARGET_MIN, _ONE_MIN_TARGET_MAX, _ONE_MIN_TARGET_TOTAL
+    return _DEFAULT_TARGET_MIN, _DEFAULT_TARGET_MAX, _DEFAULT_TARGET_TOTAL
 
 
 def hook_target_min_sec() -> float:
     """成片最短目标（含片头/解说/片尾）。"""
-    return _read_sec_env("HONGGUO_HOOK_MIN_SEC", _DEFAULT_TARGET_MIN)
+    env = os.getenv("HONGGUO_HOOK_MIN_SEC", "").strip()
+    dmin, _, _ = _preset_defaults()
+    return _read_sec_env("HONGGUO_HOOK_MIN_SEC", dmin) if env else dmin
 
 
 def hook_target_max_sec() -> float:
     """成片最长目标（含片头/解说/片尾）。"""
-    mx = _read_sec_env("HONGGUO_HOOK_MAX_SEC", _DEFAULT_TARGET_MAX)
+    env = os.getenv("HONGGUO_HOOK_MAX_SEC", "").strip()
+    _, dmax, _ = _preset_defaults()
+    mx = _read_sec_env("HONGGUO_HOOK_MAX_SEC", dmax) if env else dmax
     mn = hook_target_min_sec()
-    return max(mn + 15.0, mx)
+    min_gap = 2.0 if _hook_preset() in ("1min", "one_minute", "one-minute", "一分钟", "60s", "60") else 15.0
+    return max(mn + min_gap, mx)
 
 
 def hook_target_total_sec() -> float:
@@ -48,7 +85,8 @@ def hook_target_total_sec() -> float:
     mn = hook_target_min_sec()
     mx = hook_target_max_sec()
     default_mid = (mn + mx) / 2.0
-    raw = os.getenv("HONGGUO_HOOK_TARGET_SEC", str(_DEFAULT_TARGET_TOTAL)).strip()
+    _, _, dmid = _preset_defaults()
+    raw = os.getenv("HONGGUO_HOOK_TARGET_SEC", str(dmid)).strip()
     try:
         v = float(raw)
     except ValueError:
@@ -68,8 +106,47 @@ def hook_duration_range_text() -> str:
     return f"{_fmt_mmss(hook_target_min_sec())}–{_fmt_mmss(hook_target_max_sec())}"
 
 
+def is_one_minute_hook_preset() -> bool:
+    return _hook_preset() in ("1min", "one_minute", "one-minute", "一分钟", "60s", "60")
+
+
+def _use_pro_timeline() -> bool:
+    try:
+        from hook_timeline import pro_60_template_enabled
+
+        return pro_60_template_enabled()
+    except ImportError:
+        return False
+
+
+def opening_card_overhead_sec() -> float:
+    """片头口播占用时长（用于预算）。"""
+    if _use_pro_timeline():
+        from hook_timeline import golden_open_sec
+
+        return golden_open_sec()
+    raw = os.getenv("HONGGUO_OPENING_CARD_SEC", "").strip()
+    if raw:
+        try:
+            return max(1.0, min(10.0, float(raw)))
+        except ValueError:
+            pass
+    try:
+        from edge_tts_narration import fixed_opening_text
+
+        if fixed_opening_text():
+            return 4.2
+    except ImportError:
+        pass
+    return _COMMENTARY_SEC
+
+
 def hook_budget_enabled(episode_count: int) -> bool:
-    """2 集及以上按总时长预算分配。"""
+    """专业 60s：1 集起即按 46s 正片预算；多集长钩子默认 2 集起。"""
+    if episode_count < 1:
+        return False
+    if _use_pro_timeline():
+        return True
     if episode_count < 2:
         return False
     v = os.getenv("HONGGUO_HOOK_BUDGET", "1").strip().lower()
@@ -77,9 +154,13 @@ def hook_budget_enabled(episode_count: int) -> bool:
 
 
 def intro_outro_overhead_sec(*, with_commentary: bool = True) -> float:
+    if _use_pro_timeline():
+        from hook_timeline import intro_outro_overhead_pro
+
+        return intro_outro_overhead_pro()
     total = _SPLASH_SEC + _OUTRO_SEC
     if with_commentary:
-        total += _COMMENTARY_SEC
+        total += opening_card_overhead_sec()
     return total
 
 
@@ -93,8 +174,14 @@ def body_budget_seconds(
     if episode_count < 1:
         return 0.0
     overhead = intro_outro_overhead_sec(with_commentary=with_commentary)
+    if _use_pro_timeline():
+        from hook_timeline import body_main_sec
+
+        return body_main_sec()
     total = hook_target_max_sec() if total_sec is None else float(total_sec)
-    return max(60.0, total - overhead)
+    body = total - overhead
+    floor = 8.0 if is_one_minute_hook_preset() else 60.0
+    return max(floor, body)
 
 
 def per_episode_target_sec(
@@ -131,8 +218,16 @@ def scale_body_segments_to_budget(
     wsum = sum(weights)
     # 按上限规划，减少为凑固定 3 分钟而过度压缩
     targets = [budget_max * w / wsum for w in weights]
-    min_each = max(18.0, budget_min / n * 0.55)
-    max_each = min(58.0, budget_max / n * 1.42)
+    if _use_pro_timeline():
+        min_each = max(3.0, budget_min / n * 0.38)
+        # 专业 60s 单集需吃满整段正片预算（此前 28s 上限导致成片仅 ~44s）
+        max_each = budget_max if n == 1 else min(28.0, budget_max / n * 1.6)
+    elif is_one_minute_hook_preset():
+        min_each = max(3.0, budget_min / n * 0.38)
+        max_each = min(28.0, budget_max / n * 1.6)
+    else:
+        min_each = max(18.0, budget_min / n * 0.55)
+        max_each = min(58.0, budget_max / n * 1.42)
 
     for seg, target in zip(segments, targets):
         seg.duration_sec = _clamp(float(seg.duration_sec or target), min_each, max_each)

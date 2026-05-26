@@ -17,6 +17,7 @@ from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlunparse
 import httpx
 
 from material_common import (
+    _ffmpeg_bin,
     apply_fanqie_vod_query,
     download_http_video,
     is_usable_video_file,
@@ -546,11 +547,34 @@ def _local_material_candidates(book_id: str, item_id: str) -> list[Path]:
     return paths
 
 
-def local_material_duration(book_id: str, item_id: str) -> float:
-    """本地推广中心素材时长（秒），无则 0。"""
-    path = find_local_material(book_id, item_id)
-    if not path:
-        return 0.0
+def _probe_local_duration(path: Path) -> float:
+    """ffprobe 优先，失败则用 ffmpeg -i 解析 Duration 行。"""
+    import shutil
+
+    ffprobe = shutil.which("ffprobe")
+    if ffprobe:
+        try:
+            proc = subprocess.run(
+                [
+                    ffprobe,
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                    str(path),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            if proc.returncode == 0:
+                raw = (proc.stdout or "").strip().splitlines()
+                if raw:
+                    return max(0.0, float(raw[0]))
+        except (ValueError, subprocess.TimeoutExpired, OSError) as exc:
+            logger.debug("ffprobe 时长 %s: %s", path.name, exc)
     try:
         proc = subprocess.run(
             [_ffmpeg_bin(), "-hide_banner", "-i", str(path)],
@@ -563,9 +587,17 @@ def local_material_duration(book_id: str, item_id: str) -> float:
                 part = line.split("Duration:", 1)[1].split(",")[0].strip()
                 h, m, s = part.split(":")
                 return float(h) * 3600 + float(m) * 60 + float(s)
-    except Exception:
-        pass
+    except (ValueError, subprocess.TimeoutExpired, OSError) as exc:
+        logger.debug("ffmpeg 时长 %s: %s", path.name, exc)
     return 0.0
+
+
+def local_material_duration(book_id: str, item_id: str) -> float:
+    """本地推广中心素材时长（秒），无则 0。"""
+    path = find_local_material(book_id, item_id)
+    if not path:
+        return 0.0
+    return _probe_local_duration(path)
 
 
 def local_material_decode_ok(path: Path) -> bool:

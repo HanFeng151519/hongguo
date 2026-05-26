@@ -6,7 +6,10 @@ import logging
 import os
 import random
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
+
+if TYPE_CHECKING:
+    from video_transcript import TranscriptCue
 
 import httpx
 
@@ -30,12 +33,48 @@ from hook_duration_budget import (
     per_episode_target_sec,
     scale_body_segments_to_budget,
 )
+from episode_edit_brief import (
+    ai_edit_retry_enabled,
+    auto_fix_clip_gaps_in_raw,
+    briefs_block_for_prompt,
+    build_validation_retry_prompt,
+    dedupe_narrative_clips,
+    early_body_budget_ratio,
+    enforce_opening_from_beats,
+    enforce_program_visual_opening,
+    few_shot_block_for_prompt,
+    narrative_cohesion_enabled,
+    extend_clips_to_reason_span,
+    polish_arc_pacing_clips,
+    restore_arc_body_total,
+    polish_clips_narrative_coherence,
+    max_late_body_sec,
+    min_late_body_sec,
+    rebalance_clips_front_heavy,
+    repair_clip_durations_in_raw,
+    validate_ai_edit_raw,
+)
+from hook_edit_methodology import (
+    ai_editor_autonomy_enabled,
+    creative_editor_autonomy_block,
+    drama_type_hint_for_prompt,
+    editing_rules_block,
+    hook_narrative_arc_block,
+    human_impact_script_brief,
+    opening_hook_pattern_block,
+)
 from multi_clip import (
     ClipFragment,
     build_default_clips,
+    clip_max_sec,
+    clip_min_sec,
     clip_summary_for_log,
     clip_tail_pad_sec,
     clips_per_episode,
+    ai_clip_strict_enabled,
+    apply_ai_clips_strict,
+    cohesive_edit_enabled,
+    ensure_clips_count,
     hook_arc_hint_text,
     multi_clip_enabled,
     normalize_clip_list,
@@ -49,6 +88,7 @@ from platform_compliance import (
     safe_post_caption,
     sanitize_promo_copy,
 )
+from edge_tts_narration import fixed_opening_text
 from video_originality import authentic_preservation_enabled, body_playback_speed
 from qwen_client import (
     chat_completion,
@@ -61,17 +101,94 @@ from qwen_client import (
 
 logger = logging.getLogger(__name__)
 
-# 产品定位：AI = 剪辑大师，从整集里只留最精彩
+# 产品定位：AI 输出对人最友好、最有冲击力的可执行剪辑脚本
 MASTER_EDITOR_PERSONA = (
-    "你是抖音短剧「钩子剪辑大师」：从每集完整正片里只挑最精彩的镜头，"
-    "其余铺垫、闲聊、过场一律删掉。只留会让观众停下滑动的瞬间——"
-    "冲突爆发、高能打脸、剧情反转、悬念断点。用快切拼成 3 秒抓眼的钩子。"
+    "你是抖音全品类短剧「每集独立剪辑导演」（都市/甜宠/悬疑/玄幻/虐恋/家庭等均适用）："
+    "结合本片对白/画面/音效轴自主构思，产出「流畅、开场高能、霸气叙事、反转、尾钩引流、完整闭环」的 JSON 分镜。"
+    "选片优先级：画面动感/情绪张力 > 音效冲击 > 对白金句；禁止套用其他剧/其他集固定模板。"
 )
 MASTER_EDITOR_REJECT = (
-    "严禁选取：纯铺垫、走路、吃饭、重复镜头、无对白信息量的空镜、"
-    "温和日常戏（除非内含反转伏笔且本段能看懂）。"
-    "每段必须让一句对白说完再结束，禁止卡在人说话中间。"
+    "严禁 C 类：重复/长空镜/闲聊拖沓/慢日常/回忆注水/片头片尾/无关配角。"
+    "严禁仅因台词好听而选无动感画面；严禁乱序大跳（相邻 clip 间隔>20s 须有 fight/motion 理由）；"
+    "严禁 clips 总时长与 body duration_sec 不一致。"
 )
+
+
+def _hard_constraints_block(body_sec: float, *, has_visual: bool, has_transcript: bool) -> str:
+    try:
+        from hook_timeline import story_first_edit_enabled
+
+        story_first = story_first_edit_enabled() and has_transcript
+    except ImportError:
+        story_first = False
+    visual_rule = (
+        "无对白/对白稀少时段须采用 Brief 中「程序视听选段」的 trim/duration；"
+        "有对白段用对白表 start_sec/end_sec。"
+        if has_visual and has_transcript
+        else (
+            "至少 3 段 clip 的 trim 须落在「画面/音效高能轴」某段的 start_sec~end_sec 内，"
+            "reason 注明 tags（如 motion/fight/sfx_high）。"
+            if has_visual
+            else "优先选剧情高能段，避免纯静态对话。"
+        )
+    )
+    tx_rule = (
+        "有对白的 clip 须在 reason 写 start_sec/end_sec，duration 须覆盖到 end_sec+0.4s。"
+        if has_transcript
+        else ""
+    )
+    if story_first:
+        return f"""
+【硬约束 · 故事完整优先（完整对白表已提供，勿卡秒数）】
+1. body duration_sec == sum(clips[].duration_sec)（±0.5）；时长由情节决定，**禁止**为控时长短句或删 A 类/反转/尾钩。
+2. {visual_rule}
+3. {tx_rule}
+4. 须覆盖六步叙事各环节；大跳剪标「跳剪」或加 B| 过渡。
+5. 每条 reason 以 A| 或 B| 开头；hook_summary 写全六步闭环。
+""".strip()
+    return f"""
+【硬约束 · 输出 JSON 前必须自检，不满足则重新分配 duration】
+1. sum(clips[].duration_sec) == body_segments[].duration_sec（误差 ≤0.5），参考约 {body_sec:.0f}s。
+2. {visual_rule}
+3. {tx_rule}
+4. 按源片时间顺序；同场景连续高能尽量合并为较长 clip，减少碎切与空档跳剪。
+5. 每条 reason 以 A| 或 B| 开头，写清观众会看到/听到什么（打斗/快切/音效峰/打脸/反转等）。
+6. hook_summary 须覆盖六步：叙事线、开场高能、霸气立势、反转、尾钩、闭环说明。
+""".strip()
+
+
+def _opening_prompt_block() -> str:
+    if ai_editor_autonomy_enabled():
+        return creative_editor_autonomy_block()
+    return opening_hook_pattern_block()
+
+
+def _log_ai_clip_duration_check(
+    clips: list[ClipFragment], target_sec: float, *, episode_index: int
+) -> None:
+    if not clips:
+        return
+    total = sum(c.duration_sec for c in clips)
+    try:
+        from hook_timeline import story_first_edit_enabled
+
+        if story_first_edit_enabled():
+            logger.info(
+                "第%d集 AI 正片 clips 合计 %.1fs（故事优先，不以 %.0fs 为目标）",
+                episode_index,
+                total,
+                target_sec,
+            )
+            return
+    except ImportError:
+        pass
+    if abs(total - target_sec) > 0.8:
+        logger.warning(
+            "第%d集 AI clips 时长合计 %.1fs ≠ 参考 %.1fs",
+            episode_index,
+            total,
+            target_sec,
+        )
 
 MAX_PROMO_BODY_SEC = 120.0
 MIN_PROMO_BODY_SEC = 15.0
@@ -87,6 +204,7 @@ class BodySegmentPlan:
     label: str = ""
     reason: str = ""
     clips: list[ClipFragment] = field(default_factory=list)
+    clips_dialogue_full: list[ClipFragment] = field(default_factory=list)
     meme_captions: list[MemeCaption] = field(default_factory=list)
     meme_beats: list[MemeBeat] = field(default_factory=list)
 
@@ -124,6 +242,42 @@ class HookEditPlan:
             if seg.episode_index == index:
                 return seg
         return None
+
+
+def plan_has_dialogue_full_variant(plan: HookEditPlan) -> bool:
+    from edge_tts_narration import dialogue_dual_min_gap_sec
+
+    min_gap = dialogue_dual_min_gap_sec()
+    for seg in plan.body_segments:
+        if not seg.clips_dialogue_full:
+            continue
+        comp = sum(c.duration_sec for c in seg.clips)
+        full = sum(c.duration_sec for c in seg.clips_dialogue_full)
+        if full - comp >= min_gap - 0.05:
+            return True
+    return False
+
+
+def hook_plan_clip_variant(plan: HookEditPlan, variant: str = "compressed") -> HookEditPlan:
+    """variant: compressed（默认）| full（未压缩对白对齐）。"""
+    import copy
+
+    if variant == "full":
+        if not plan_has_dialogue_full_variant(plan):
+            return plan
+        out = copy.deepcopy(plan)
+        for seg in out.body_segments:
+            seg.clips = copy.deepcopy(seg.clips_dialogue_full)
+            trim, duration, clips = sync_segment_from_clips(
+                trim_start_sec=seg.trim_start_sec,
+                duration_sec=seg.duration_sec,
+                clips=seg.clips,
+            )
+            seg.trim_start_sec = trim
+            seg.duration_sec = duration
+            seg.clips = clips
+        return out
+    return plan
 
 
 def _clamp(v: float, lo: float, hi: float) -> float:
@@ -185,6 +339,23 @@ def plan_to_dict(plan: HookEditPlan) -> dict:
     }
 
 
+def apply_fixed_opening_to_plan(plan: HookEditPlan) -> None:
+    """仅保留 env 配置的片头口播，清空其它解说句。"""
+    try:
+        from hook_timeline import fixed_opening_line, pro_60_template_enabled
+
+        if pro_60_template_enabled():
+            plan.opening_text = fixed_opening_line()
+            plan.commentary_lines = []
+            return
+    except ImportError:
+        pass
+    fixed = fixed_opening_text()
+    if fixed:
+        plan.opening_text = fixed
+        plan.commentary_lines = []
+
+
 def _title_short(drama_title: str, max_len: int = 14) -> str:
     title = (drama_title or "短剧").strip()
     return title[:max_len] if len(title) > max_len else title
@@ -199,8 +370,10 @@ def default_plan(
     episode_durations: list[float],
 ) -> HookEditPlan:
     short = _title_short(drama_title)
-    opening_text = (opening or "").strip() or (
-        f"第1集就反转？《{short}》别划走"
+    opening_text = (
+        fixed_opening_text()
+        or (opening or "").strip()
+        or f"第1集就反转？《{short}》别划走"
     )
     outro_keyword = (keyword or "").strip() or short
     ep_n = len(episode_labels)
@@ -303,7 +476,7 @@ def default_plan(
         ]
         hook_summary = "规则默认：短钩子片头 + 高潮正片裁剪"
         edit_style = "promo"
-    return HookEditPlan(
+    plan = HookEditPlan(
         opening_text=opening_text,
         opening_seconds=DEFAULT_OPENING_SEC,
         outro_keyword=outro_keyword,
@@ -314,6 +487,8 @@ def default_plan(
         commentary_lines=commentary,
         edit_style=edit_style,
     )
+    apply_fixed_opening_to_plan(plan)
+    return plan
 
 
 def _normalize_plan(
@@ -324,10 +499,13 @@ def _normalize_plan(
     keyword: str = "",
     episode_labels: list[str],
     episode_durations: list[float],
+    episode_transcripts: Optional[dict[int, list]] = None,
+    episode_edit_briefs: Optional[dict] = None,
 ) -> HookEditPlan:
     short = _title_short(drama_title)
     opening_text = (
-        str(raw.get("opening_text") or opening).strip()
+        fixed_opening_text()
+        or str(raw.get("opening_text") or opening).strip()
         or (opening or "").strip()
         or f"《{short}》这集信息量太大了"
     )
@@ -368,6 +546,8 @@ def _normalize_plan(
             duration = float(
                 item.get("duration_sec") or item.get("duration") or 60
             )
+            if duration < 3.0:
+                continue
             speed = body_playback_speed()
             max_source = max(0.0, dur_avail - trim_start)
             max_allowed = max(MIN_PROMO_BODY_SEC, max_source / speed)
@@ -380,25 +560,171 @@ def _normalize_plan(
             raw_clips = normalize_clip_list(
                 item.get("clips") or item.get("fragments") or item.get("cuts")
             )
+            if raw_clips:
+                raw_clips = dedupe_narrative_clips(raw_clips)
+            ep_cues_pre = (episode_transcripts or {}).get(idx) or []
+            if raw_clips:
+                raw_clips = polish_clips_narrative_coherence(
+                    raw_clips, ep_cues_pre, dur_avail=dur_avail
+                )
+                try:
+                    from hook_timeline import story_first_edit_enabled
+
+                    arc_target = 0.0 if story_first_edit_enabled() else duration
+                except ImportError:
+                    arc_target = duration
+                raw_clips = polish_arc_pacing_clips(
+                    raw_clips,
+                    ep_cues_pre,
+                    dur_avail=dur_avail,
+                    target_sec=arc_target,
+                )
+            brief = (episode_edit_briefs or {}).get(idx)
+            from hook_timeline import ai_body_faithful_enabled
+
+            if (
+                raw_clips
+                and brief
+                and multi_clip_enabled()
+                and not ai_body_faithful_enabled()
+            ):
+                raw_clips = enforce_opening_from_beats(
+                    raw_clips,
+                    brief.suggested_beats,
+                    dur_avail=dur_avail,
+                )
             clip_rng = random.Random(f"{drama_title}:{idx}:{dur_avail:.0f}")
             if not raw_clips and multi_clip_enabled():
                 raw_clips = build_default_clips(
                     dur_avail, duration, clip_rng, episode_index=idx
                 )
             elif raw_clips and multi_clip_enabled():
-                raw_clips = refine_clips_for_hook_arc(
-                    raw_clips,
-                    dur_avail=dur_avail,
-                    target_sec=duration,
-                    rng=clip_rng,
-                    episode_index=idx,
-                )
+                ep_cues = (episode_transcripts or {}).get(idx) or []
+                if ai_clip_strict_enabled():
+                    _log_ai_clip_duration_check(
+                        raw_clips, duration, episode_index=idx
+                    )
+                    clips_dialogue_full: list[ClipFragment] = []
+                    base_clips = list(raw_clips)
+                    faithful = ai_body_faithful_enabled()
+                    if faithful:
+                        if brief and brief.program_visual_clips:
+                            raw_clips = enforce_program_visual_opening(
+                                raw_clips,
+                                brief.program_visual_clips,
+                                ep_cues,
+                                dur_avail=dur_avail,
+                            )
+                        if ep_cues:
+                            raw_clips = extend_clips_to_reason_span(
+                                base_clips, ep_cues, dur_avail=dur_avail
+                            )
+                            from multi_clip import enforce_clip_duration_floor
+
+                            raw_clips = enforce_clip_duration_floor(
+                                raw_clips, dur_avail, cues=ep_cues
+                            )
+                        else:
+                            from multi_clip import enforce_clip_duration_floor
+
+                            raw_clips = enforce_clip_duration_floor(
+                                base_clips, dur_avail, cues=None
+                            )
+                        clip_total = sum(c.duration_sec for c in raw_clips)
+                        raw_clips = apply_ai_clips_strict(
+                            raw_clips,
+                            dur_avail=dur_avail,
+                            target_sec=clip_total or duration,
+                            preserve_duration=True,
+                        )
+                    elif ep_cues:
+                        from edge_tts_narration import dual_dialogue_export_enabled
+                        from video_transcript import (
+                            align_clips_dialogue_variants,
+                            align_clips_to_transcript,
+                        )
+
+                        if dual_dialogue_export_enabled():
+                            raw_clips, full_clips = align_clips_dialogue_variants(
+                                base_clips, ep_cues, target_sec=duration
+                            )
+                            if full_clips:
+                                full_target = sum(
+                                    c.duration_sec for c in full_clips
+                                )
+                                clips_dialogue_full = apply_ai_clips_strict(
+                                    full_clips,
+                                    dur_avail=dur_avail,
+                                    target_sec=full_target,
+                                    preserve_duration=True,
+                                )
+                        else:
+                            extended = extend_clips_to_reason_span(
+                                base_clips, ep_cues, dur_avail=dur_avail
+                            )
+                            raw_clips = align_clips_to_transcript(
+                                extended, ep_cues, target_sec=duration
+                            )
+                        raw_clips = rebalance_clips_front_heavy(
+                            raw_clips,
+                            dur_avail=dur_avail,
+                            target_sec=duration,
+                        )
+                        raw_clips = apply_ai_clips_strict(
+                            raw_clips,
+                            dur_avail=dur_avail,
+                            target_sec=duration,
+                        )
+                    else:
+                        from multi_clip import enforce_clip_duration_floor
+
+                        raw_clips = enforce_clip_duration_floor(
+                            base_clips, dur_avail
+                        )
+                        raw_clips = rebalance_clips_front_heavy(
+                            raw_clips,
+                            dur_avail=dur_avail,
+                            target_sec=duration,
+                        )
+                        raw_clips = apply_ai_clips_strict(
+                            raw_clips,
+                            dur_avail=dur_avail,
+                            target_sec=duration,
+                        )
+                else:
+                    raw_clips = refine_clips_for_hook_arc(
+                        raw_clips,
+                        dur_avail=dur_avail,
+                        target_sec=duration,
+                        rng=clip_rng,
+                        episode_index=idx,
+                    )
+                    ep_cues = (episode_transcripts or {}).get(idx) or []
+                    if ep_cues:
+                        raw_clips = _snap_clips_to_transcript(
+                            raw_clips, ep_cues, dur_avail=dur_avail
+                        )
+                    before = len(raw_clips)
+                    raw_clips = ensure_clips_count(
+                        raw_clips,
+                        dur_avail=dur_avail,
+                        target_sec=duration,
+                        rng=clip_rng,
+                        episode_index=idx,
+                    )
+                    if len(raw_clips) > before:
+                        logger.info(
+                            "第%d集 AI 仅 %d 段，已补至 %d 段快切",
+                            idx,
+                            before,
+                            len(raw_clips),
+                        )
             trim, duration, raw_clips = sync_segment_from_clips(
                 trim_start_sec=trim_start,
                 duration_sec=duration,
                 clips=raw_clips,
             )
-            if raw_clips:
+            if raw_clips and not ai_clip_strict_enabled():
                 scale_clips_to_episode_duration(raw_clips, duration)
                 trim, duration, raw_clips = sync_segment_from_clips(
                     trim_start_sec=trim,
@@ -417,6 +743,7 @@ def _normalize_plan(
                     label=label,
                     reason=str(item.get("reason") or ""),
                     clips=raw_clips,
+                    clips_dialogue_full=clips_dialogue_full,
                     meme_captions=seg_caps,
                     meme_beats=seg_beats,
                 )
@@ -475,7 +802,9 @@ def _normalize_plan(
         commentary_lines = [c.text for seg in segments for c in seg.meme_captions[:3]]
 
     ep_n = len(episode_labels) or len(segments)
-    if hook_budget_enabled(ep_n) and segments:
+    from hook_timeline import ai_body_faithful_enabled
+
+    if hook_budget_enabled(ep_n) and segments and not ai_body_faithful_enabled():
         scale_body_segments_to_budget(segments, episode_count=ep_n)
         for seg in segments:
             if seg.clips:
@@ -486,8 +815,23 @@ def _normalize_plan(
                     clips=seg.clips,
                 )
                 seg.duration_sec = total
+    elif segments and ai_body_faithful_enabled():
+        for seg in segments:
+            if seg.clips:
+                _, total, seg.clips = sync_segment_from_clips(
+                    trim_start_sec=seg.trim_start_sec,
+                    duration_sec=seg.duration_sec,
+                    clips=seg.clips,
+                )
+                seg.duration_sec = total
+        logger.info(
+            "正片按 AI 分镜：%d 集 clips 合计 %.1fs（未压至 body_main_sec 配方）",
+            len(segments),
+            sum(s.duration_sec for s in segments),
+        )
 
-    opening_text = sanitize_promo_copy(opening_text, max_len=60) or opening_text
+    if not fixed_opening_text():
+        opening_text = sanitize_promo_copy(opening_text, max_len=60) or opening_text
     subtitle_hint = sanitize_promo_copy(str(raw.get("subtitle_hint") or ""), max_len=24)
     post_caption = sanitize_promo_copy(post_caption, max_len=200)
     if not post_caption:
@@ -503,7 +847,7 @@ def _normalize_plan(
     for cap in plan_caps:
         cap.text = sanitize_promo_copy(cap.text, max_len=24) or cap.text
 
-    return HookEditPlan(
+    plan = HookEditPlan(
         opening_text=opening_text,
         opening_seconds=opening_seconds,
         outro_keyword=outro_keyword,
@@ -517,6 +861,39 @@ def _normalize_plan(
         meme_captions=plan_caps,
         meme_beats=plan_beats,
     )
+    apply_fixed_opening_to_plan(plan)
+    return plan
+
+
+def _snap_clips_to_transcript(
+    clips: list[ClipFragment],
+    cues: list,
+    *,
+    dur_avail: float,
+) -> list[ClipFragment]:
+    """将 AI 给出的入点贴近真实对白起点，并尽量覆盖整句台词。"""
+    if not clips or not cues:
+        return clips
+    max_start = max(5.0, float(dur_avail) - 8.0)
+    out: list[ClipFragment] = []
+    for c in clips:
+        trim = max(0.0, min(max_start, float(c.trim_start_sec)))
+        best = min(cues, key=lambda cue: abs(float(cue.start_sec) - trim))
+        start = max(0.0, float(best.start_sec) - 0.8)
+        end = float(best.end_sec) + 0.35
+        dur = max(c.duration_sec, end - start, 2.5)
+        if cohesive_edit_enabled():
+            dur = min(dur, clip_max_sec())
+        else:
+            dur = min(dur, clip_max_sec())
+        out.append(
+            ClipFragment(
+                trim_start_sec=start,
+                duration_sec=dur,
+                reason=c.reason or f"A|{best.text[:24]}",
+            )
+        )
+    return out
 
 
 def _build_authentic_prompt(
@@ -525,6 +902,9 @@ def _build_authentic_prompt(
     drama_intro: str,
     episode_labels: list[str],
     episode_durations: list[float],
+    episode_transcripts: Optional[dict[int, list]] = None,
+    episode_visual_profiles: Optional[dict[int, list]] = None,
+    episode_edit_briefs: Optional[dict] = None,
 ) -> str:
     eps_lines = []
     for i, (lab, dur) in enumerate(zip(episode_labels, episode_durations), start=1):
@@ -533,20 +913,54 @@ def _build_authentic_prompt(
     speed = body_playback_speed()
     n = len(episode_labels)
     per = per_episode_target_sec(n) if hook_budget_enabled(n) else 45.0
+    try:
+        from hook_timeline import body_main_sec, pro_60_template_enabled, timeline_summary
+
+        pro_tpl = pro_60_template_enabled()
+    except ImportError:
+        pro_tpl = False
+
+    type_hint = drama_type_hint_for_prompt(drama_title, drama_intro)
     if hook_budget_enabled(n):
         body = body_budget_seconds(n)
         per = per_episode_target_sec(n)
         body_lo = body_budget_seconds(n, total_sec=hook_target_min_sec())
         body_hi = body
-        if multi_clip_enabled():
+        clip_n = clips_per_episode(per) if multi_clip_enabled() else 0
+        abc_block = editing_rules_block(
+            body_sec=body_main_sec() if pro_tpl else per,
+            opening_sec=5.0 if pro_tpl else 3.0,
+        )
+        if pro_tpl:
+            from hook_timeline import ai_body_faithful_enabled
+
+            if ai_body_faithful_enabled():
+                duration_rule = (
+                    "2. 专业60s：片头黄金口播+片尾 CTA 由系统固定；"
+                    "**正片只输出 clips 分镜表**，body duration_sec 必须等于 clips 时长之和（±0.5）。\n"
+                    f"{abc_block}\n"
+                    f"{type_hint}\n"
+                    f"每集 clips 约 {clip_n} 段；按你判断写 trim_start_sec/duration_sec，"
+                    "勿为凑满固定秒数压短对白；整条可 55~75s。\n"
+                    f"硬切无转场；原速 {speed:g}x；commentary_lines 为空。"
+                )
+            else:
+                duration_rule = (
+                    f"2. 专业60秒：{timeline_summary()}；正片精华约 {body_main_sec():.0f}s（5–50s 位）。\n"
+                    f"{abc_block}\n"
+                    f"{type_hint}\n"
+                    f"每集 clips 约 {clip_n} 段（"
+                    f"{'连贯 7~12s/段、同场景少切镜' if cohesive_edit_enabled() else 'A|2~4s + 少量 B|≤1s'}），"
+                    f"硬切无转场；原速 {speed:g}x；"
+                    f"commentary_lines 为空；opening_text 由系统口播。"
+                )
+        elif multi_clip_enabled():
             duration_rule = (
-                f"2. 共 {n} 集、正片合计约 {body_lo:.0f}–{body_hi:.0f}s（整条约 {hook_duration_range_text()}，"
-                f"宁长勿短、优先剧情完整）；"
-                f"每集 duration_sec≈{per:.0f}，clips 必须 {clips_per_episode()} 段快切，弧线：{hook_arc_hint_text()}。"
-                f"每段 duration_sec 建议 9-13s（宁长勿短，禁止对白说到一半就切）；"
-                f"trim_start_sec 须落在冲突/打脸/反转/悬念附近，"
-                f"禁止平铺叙事或连续 30s；reason 必填且含「冲突/打脸/反转/悬念」之一；倍速 {speed:g}x。"
-                f"系统会为每段自动留约 {clip_tail_pad_sec():.1f}s 尾音并做段间淡化。"
+                f"2. 正片 {body_lo:.0f}–{body_hi:.0f}s（{hook_duration_range_text()}）；"
+                f"每集≈{per:.0f}s、clips 约 {clip_n} 段。\n"
+                f"{abc_block}\n"
+                f"{type_hint}\n"
+                f"{hook_arc_hint_text()}；倍速 {speed:g}x；尾音约 {clip_tail_pad_sec():.1f}s。"
             )
         else:
             duration_rule = (
@@ -563,14 +977,91 @@ def _build_authentic_prompt(
         duration_rule = (
             f"2. 单集成片 30-60 秒；trim_start_sec 常 8-20 秒；成片倍速 {speed:g}x（duration_sec=成片时长）。"
         )
+    from video_moment_profile import visual_block_for_episodes
+    from video_transcript import transcript_block_for_episodes
+
+    body_tgt = body_main_sec() if pro_tpl else per
+    has_tx = bool(episode_transcripts)
+    has_vis = bool(episode_visual_profiles)
+
+    visual_block = (
+        visual_block_for_episodes(episode_visual_profiles or {}, episode_labels)
+        if has_vis
+        else ""
+    )
+    transcript_block = (
+        transcript_block_for_episodes(
+            episode_transcripts or {},
+            episode_labels,
+            body_target_sec=body_tgt,
+        )
+        if has_tx
+        else ""
+    )
+    hard_block = _hard_constraints_block(
+        body_tgt, has_visual=has_vis, has_transcript=has_tx
+    )
+    impact_brief = human_impact_script_brief(body_sec=body_tgt)
+    opening_block = _opening_prompt_block()
+    structure_block = briefs_block_for_prompt(episode_edit_briefs or {})
+    few_shot_block = few_shot_block_for_prompt(episode_edit_briefs or {}, body_tgt)
+    if has_tx or has_vis:
+        from hook_timeline import ai_body_faithful_enabled
+
+        if ai_body_faithful_enabled() and pro_tpl:
+            from hook_timeline import story_first_edit_enabled
+
+            if story_first_edit_enabled() and has_tx:
+                duration_rule = (
+                    "2. **故事完整优先**：从完整对白表+画面轴选出六步叙事所需的全部好情节；"
+                    "body duration_sec = clips 之和（±0.5），时长是结果不是目标。\n"
+                    f"{type_hint}\n"
+                    "禁止为控时长短句/删反转/删尾钩；每条 clip duration 覆盖对白 end_sec。\n"
+                    f"{hard_block}"
+                )
+            else:
+                autonomy_note = (
+                    "段数与入点由你按本集自主决定（3~6 段均可），勿套固定 4 段/固定起切秒数。"
+                    if ai_editor_autonomy_enabled()
+                    else "开篇尽量短、删无对白穿梭；全片叙事连贯。"
+                )
+                duration_rule = (
+                    "2. 正片以 AI clips 为准：结合画面/音效轴+对白表选点；"
+                    "body duration_sec = clips 之和（±0.5）。\n"
+                    f"{type_hint}\n"
+                    f"{autonomy_note} "
+                    "每条 clip duration 须覆盖对白 end_sec；为故事完整可长于模板参考。\n"
+                    f"{hard_block}"
+                )
+        else:
+            duration_rule = (
+                f"2. 正片目标 {body_tgt:.0f}s：结合「画面/音效高能轴」+「对白时间轴」选 clip；"
+                f"clips.duration_sec 之和必须等于 {body_tgt:.0f}（±0.5）。\n"
+                f"{type_hint}\n"
+                "打斗/快切/音效峰段落优先；**前段爽点略多（约占正文 "
+                f"{int(early_body_budget_ratio() * 100)}% 内）**，"
+                f"后段仍须冲突/铺垫/悬念（合计约 {min_late_body_sec():.0f}–{max_late_body_sec():.0f}s，"
+                "避免长身世回忆抢戏）；"
+                "**台词必须说完整**（duration 须覆盖对白 end_sec），完整度优先于卡死 60s。\n"
+                f"{hard_block}"
+            )
     return f"""{MASTER_EDITOR_PERSONA}
 {MASTER_EDITOR_REJECT}
-成片要求：正片保留原声对白（不叠解说条），用 clips 快切只留最精彩；系统会做去重与片头片尾。
+
+{impact_brief}
+
+{opening_block}
+
+成片要求：正片保留原声对白（不叠解说条）；下方数据表用于写出「对人最友好、最有冲击力」的 clips 脚本。
 
 剧名：{drama_title}
 简介：{drama_intro[:500] if drama_intro else "（无）"}
 已选分集：
 {eps_block}
+{structure_block}
+{visual_block}
+{transcript_block}
+{few_shot_block}
 
 请只输出 JSON（不要 markdown）：
 {{
@@ -578,18 +1069,18 @@ def _build_authentic_prompt(
   "opening_text": "1 句短钩子，≤24 字，仅用于 1 秒解说卡配音",
   "outro_keyword": "搜索词 8-16 字",
   "post_caption": "发布文案 2-4 行 + 话题",
-  "hook_summary": "一句话：本集删掉了什么、保留了哪几个最精彩瞬间",
+  "hook_summary": "①叙事线 ②开场高能 ③霸气立势 ④反转 ⑤尾钩 ⑥闭环（为何看懂且想追）",
   "commentary_lines": [],
   "body_segments": [
     {{
       "episode_index": 1,
-      "duration_sec": {int(per) if hook_budget_enabled(n) else 45},
-      "reason": "本集快切合集",
+      "duration_sec": 52,
+      "reason": "须等于 clips.duration_sec 之和（故事完整优先，勿凑固定秒数）",
       "clips": [
-        {{"trim_start_sec": 14, "duration_sec": 10, "reason": "起冲突：被羞辱"}},
-        {{"trim_start_sec": 42, "duration_sec": 11, "reason": "高能打脸：碾压"}},
-        {{"trim_start_sec": 68, "duration_sec": 12, "reason": "剧情反转：身份揭晓"}},
-        {{"trim_start_sec": 95, "duration_sec": 10, "reason": "悬念断点：危机来临"}}
+        {{"trim_start_sec": 0.0, "duration_sec": 10.0, "reason": "A|开场高能 tags=... start_sec=... end_sec=..."}},
+        {{"trim_start_sec": 0.0, "duration_sec": 12.0, "reason": "A|霸气叙事/对峙（秒数按本集轴填写）"}},
+        {{"trim_start_sec": 0.0, "duration_sec": 10.0, "reason": "A|反转（跳剪须标注）"}},
+        {{"trim_start_sec": 0.0, "duration_sec": 6.0, "reason": "A|尾钩引流"}}
       ],
       "meme_captions": [],
       "meme_beats": []
@@ -601,8 +1092,16 @@ def _build_authentic_prompt(
 1. commentary_lines 必须为空数组；meme_captions、meme_beats 必须为空数组。
 {duration_rule}
 {ai_compliance_rule_block()}
-3. opening_text ≤ 24 字，必须含反转/高能暗示；hook_summary 说明本集选了哪些爽点。
-4. 每集 clips 按时间顺序排列；第 1 集第一条尽量「开篇冲突」；最后一条尽量「悬念」。
+3. opening_text ≤ 24 字；hook_summary 按六步叙事写全。
+4. clips 按时间顺序；reason 以 A|/B| 开头；秒数必须来自本集数据表，勿照抄示例里的 0.0；{
+        "自检：各段 duration 相加必须精确等于 body duration_sec"
+        if (has_tx or has_vis)
+        else (
+            "每段 duration_sec 7~" + str(int(clip_max_sec())) + "s"
+            if cohesive_edit_enabled()
+            else "A 类 2~" + str(int(clip_max_sec())) + "s"
+        )
+    }。
 5. body_segments 覆盖 episode_index 1 到 {n}。"""
 
 
@@ -612,6 +1111,9 @@ def _build_prompt(
     drama_intro: str,
     episode_labels: list[str],
     episode_durations: list[float],
+    episode_transcripts: Optional[dict[int, list]] = None,
+    episode_visual_profiles: Optional[dict[int, list]] = None,
+    episode_edit_briefs: Optional[dict] = None,
 ) -> str:
     eps_lines = []
     for i, (lab, dur) in enumerate(zip(episode_labels, episode_durations), start=1):
@@ -624,6 +1126,9 @@ def _build_prompt(
             drama_intro=drama_intro,
             episode_labels=episode_labels,
             episode_durations=episode_durations,
+            episode_transcripts=episode_transcripts,
+            episode_visual_profiles=episode_visual_profiles,
+            episode_edit_briefs=episode_edit_briefs,
         )
 
     if meme_edit_enabled():
@@ -721,6 +1226,10 @@ async def plan_hook_edit(
     keyword: str = "",
     episode_labels: list[str],
     episode_durations: list[float],
+    episode_transcripts: Optional[dict[int, list]] = None,
+    episode_visual_profiles: Optional[dict[int, list]] = None,
+    episode_keyframes: Optional[dict[int, list]] = None,
+    episode_edit_briefs: Optional[dict] = None,
 ) -> HookEditPlan:
     """调用 LLM 生成剪辑方案；失败则回退 default_plan。"""
     if not is_configured():
@@ -745,38 +1254,207 @@ async def plan_hook_edit(
         episode_durations=episode_durations,
     )
 
+    has_transcript = bool(episode_transcripts)
+    has_visual = bool(episode_visual_profiles)
+    try:
+        from hook_timeline import body_main_sec
+
+        body_pick_sec = body_main_sec()
+    except ImportError:
+        body_pick_sec = 50.0
+
+    from video_transcript import transcript_edit_required
+
+    if transcript_edit_required() and not has_transcript:
+        logger.warning(
+            "未获取对白时间轴（请安装 faster-whisper 或确认片源含字幕），"
+            "AI 无法按台词选 ~%.0fs 片段",
+            body_pick_sec,
+        )
     prompt = _build_prompt(
         drama_title=drama_title,
         drama_intro=drama_intro,
         episode_labels=episode_labels,
         episode_durations=episode_durations,
+        episode_transcripts=episode_transcripts,
+        episode_visual_profiles=episode_visual_profiles,
+        episode_edit_briefs=episode_edit_briefs,
     )
-    messages = [
+    if has_visual or has_transcript:
+        try:
+            from hook_timeline import story_first_edit_enabled
+
+            if story_first_edit_enabled():
+                clip_hint = (
+                    " 已提供完整对白表+画面/音效轴："
+                    "**故事完整优先**，选出六步叙事所需的全部好情节；"
+                    "body duration_sec = clips 之和，勿为控时长短句或删反转/尾钩；"
+                    "每条 duration 覆盖对白 end_sec；reason 写 tags 与 start_sec/end_sec。"
+                )
+            else:
+                clip_hint = (
+                    f" 已提供画面/音效高能轴"
+                    f"{' + 对白表' if has_transcript else ''}：按本集自主选高光与简版叙事，"
+                    f"参考约 {body_pick_sec:.0f}s（可略长保对白完整）；"
+                    "clips.duration_sec 之和 = body duration_sec（±0.5）；"
+                    "须覆盖六步叙事：流畅·开场高能·霸气·反转·尾钩·闭环；"
+                    "reason 建议标环节并写 tags、start_sec/end_sec。"
+                )
+        except ImportError:
+            clip_hint = (
+                f" 已提供画面/音效高能轴"
+                f"{' + 对白表' if has_transcript else ''}："
+                f"参考约 {body_pick_sec:.0f}s；"
+                "clips.duration_sec 之和 = body duration_sec（±0.5）。"
+            )
+    elif multi_clip_enabled():
+        clip_hint = (
+            " clips 弧线：冲突→打脸→反转→悬念；reason 必填高能类型；"
+            "每段 duration_sec 宁长勿短，禁止对白说到一半就切。"
+        )
+    else:
+        clip_hint = " 删除铺垫，只留高潮与反转。"
+    from qwen_client import is_likely_vision_model
+    from video_keyframes import (
+        build_edit_vision_user_content,
+        vision_effective_max_for_api,
+        vision_frames_enabled,
+    )
+
+    all_kfs: list = []
+    if episode_keyframes:
+        for idx in sorted(episode_keyframes.keys()):
+            all_kfs.extend(episode_keyframes[idx] or [])
+
+    use_vision = bool(all_kfs) and vision_frames_enabled() and is_likely_vision_model()
+    vision_cap = vision_effective_max_for_api() if use_vision else 0
+    system_extra = ""
+    if use_vision:
+        n_vision_send = min(len(all_kfs), vision_cap)
+        system_extra = (
+            f" 已附 {n_vision_send} 张关键帧 JPEG：你必须结合亲眼看到的画面"
+            "（打斗、表情、特效、构图）与对白/音效表写 clips，禁止只靠台词臆测。"
+        )
+
+    messages: list[dict] = [
         {
             "role": "system",
             "content": (
                 MASTER_EDITOR_PERSONA
-                + " 你只输出合法 JSON；像剪辑大师一样工作，每集只提交最精彩的片段时间点。"
-                + (
-                    " clips 弧线：冲突→打脸→反转→悬念；reason 必填高能类型；"
-                    "每段 duration_sec 宁长勿短（9-13s），禁止对白说到一半就切。"
-                    if multi_clip_enabled()
-                    else " 删除铺垫，只留高潮与反转。"
-                )
+                + " 你只输出合法 JSON；产出对人最友好、最有冲击力的剪辑脚本（非剧情摘要）。"
+                + human_impact_script_brief(body_sec=body_pick_sec)
+                + _opening_prompt_block()
+                + clip_hint
+                + system_extra
                 + (" meme 方案须含 meme_captions、meme_beats。" if meme_edit_enabled() else "")
                 + ai_compliance_rule_block()
             ),
         },
-        {"role": "user", "content": prompt},
     ]
+
+    if use_vision:
+        messages.append(
+            {
+                "role": "user",
+                "content": build_edit_vision_user_content(
+                    episode_keyframes,
+                    episode_labels,
+                    task_prompt=prompt,
+                    max_images=vision_cap,
+                ),
+            }
+        )
+    else:
+        messages.append({"role": "user", "content": prompt})
+
+    dur0 = episode_durations[0] if episode_durations else 120.0
+
+    async def _complete(msgs: list[dict]) -> str:
+        return await chat_completion(
+            client, msgs, model=default_model(), json_mode=True
+        )
+
+    async def _complete_with_vision_fallback() -> str:
+        """多模态 400 时先减帧再纯文本，避免误走 JSON 修复分支。"""
+        try:
+            return await _complete(messages)
+        except RuntimeError as exc:
+            if not use_vision or "400" not in str(exc):
+                raise
+            half = max(4, vision_cap // 2)
+            if len(all_kfs) > half:
+                logger.warning(
+                    "多模态 LLM 400，减至 %d 张关键帧重试: %s",
+                    half,
+                    exc,
+                )
+                slim = [
+                    messages[0],
+                    {
+                        "role": "user",
+                        "content": build_edit_vision_user_content(
+                            episode_keyframes,
+                            episode_labels,
+                            task_prompt=prompt,
+                            max_images=half,
+                        ),
+                    },
+                ]
+                try:
+                    return await _complete(slim)
+                except RuntimeError:
+                    pass
+            logger.warning("多模态仍失败，改用对白+画面轴纯文本: %s", exc)
+            return await _complete(
+                [messages[0], {"role": "user", "content": prompt}]
+            )
 
     raw_text = ""
     first_err: Optional[Exception] = None
     try:
-        raw_text = await chat_completion(
-            client, messages, model=default_model(), json_mode=True
-        )
+        raw_text = await _complete_with_vision_fallback()
         raw = extract_json_object(raw_text)
+        repaired = repair_clip_durations_in_raw(
+            raw, dur_avail=dur0, body_target_sec=body_pick_sec
+        )
+        if repaired:
+            from multi_clip import clip_min_sec
+
+            logger.info(
+                "已自动将 %d 段过短 clip 抬至 ≥%.0fs（免 LLM 重答）",
+                repaired,
+                clip_min_sec(),
+            )
+        auto_fix_clip_gaps_in_raw(raw)
+        val_errors = validate_ai_edit_raw(
+            raw, body_target_sec=body_pick_sec, dur_avail=dur0
+        )
+        if val_errors and ai_edit_retry_enabled():
+            logger.warning(
+                "AI 分镜校验未通过（%d 项），自动重答一次：%s",
+                len(val_errors),
+                val_errors[0][:80],
+            )
+            retry_user = build_validation_retry_prompt(
+                val_errors, raw_text, body_target_sec=body_pick_sec
+            )
+            raw_text = await _complete(
+                messages
+                + [
+                    {"role": "assistant", "content": raw_text},
+                    {"role": "user", "content": retry_user},
+                ]
+            )
+            raw = extract_json_object(raw_text)
+            repair_clip_durations_in_raw(
+                raw, dur_avail=dur0, body_target_sec=body_pick_sec
+            )
+            auto_fix_clip_gaps_in_raw(raw)
+            val2 = validate_ai_edit_raw(
+                raw, body_target_sec=body_pick_sec, dur_avail=dur0
+            )
+            if val2:
+                logger.warning("重答后仍有校验项：%s", "; ".join(val2[:3]))
         plan = _normalize_plan(
             raw,
             drama_title=drama_title,
@@ -784,8 +1462,23 @@ async def plan_hook_edit(
             keyword=keyword,
             episode_labels=episode_labels,
             episode_durations=episode_durations,
+            episode_transcripts=episode_transcripts,
+            episode_edit_briefs=episode_edit_briefs,
         )
-        logger.info("AI 剪辑方案: %s", plan.hook_summary or "ok")
+        apply_fixed_opening_to_plan(plan)
+        parts = []
+        if use_vision:
+            parts.append(f"关键帧{len(all_kfs)}张")
+        if has_visual:
+            parts.append(f"画面轴{sum(len(v) for v in episode_visual_profiles.values())}段")
+        if has_transcript:
+            parts.append(f"对白{sum(len(v) for v in episode_transcripts.values())}条")
+        tag = f"（{'+'.join(parts)}）" if parts else ""
+        logger.info("AI 剪辑方案%s: %s", tag, plan.hook_summary or "ok")
+        if transcript_edit_required() and not has_transcript:
+            plan.hook_summary = (
+                (plan.hook_summary or "") + "（警告：无对白时间轴，未按台词选段）"
+            ).strip()
         return plan
     except Exception as exc:
         first_err = exc
@@ -813,6 +1506,8 @@ async def plan_hook_edit(
             keyword=keyword,
             episode_labels=episode_labels,
             episode_durations=episode_durations,
+            episode_transcripts=episode_transcripts,
+            episode_edit_briefs=episode_edit_briefs,
         )
     except Exception as exc2:
         logger.warning("AI 剪辑方案失败，使用默认: %s", exc2)

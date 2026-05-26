@@ -42,14 +42,28 @@ from video_originality import (
 )
 from edge_tts_narration import (
     edge_tts_available,
+    fixed_opening_text,
+    opening_card_duration_for_text,
     pick_voice_for_episode,
+    probe_media_duration,
+    resolve_voice,
     tts_enabled,
     tts_on_body_enabled,
 )
+
+TTS_CACHE_DIR = Path(__file__).resolve().parent.parent / "public" / "tts_cache"
 from hook_duration_budget import (
     budget_summary,
     hook_budget_enabled,
     hook_duration_range_text,
+)
+from hook_timeline import (
+    fixed_opening_line,
+    fixed_outro_line,
+    golden_open_sec,
+    outro_cta_sec,
+    pro_60_template_enabled,
+    timeline_summary,
 )
 from platform_compliance import (
     commentary_footer_hint,
@@ -164,19 +178,160 @@ def _run_ffmpeg(args: list[str], timeout: int = 300) -> None:
         raise RuntimeError(f"视频处理失败: {tail}")
 
 
-def _probe_duration(path: Path) -> float:
-    proc = subprocess.run(
-        [FFMPEG, "-hide_banner", "-i", str(path), "-f", "null", "-"],
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    for line in (proc.stderr or "").splitlines():
+def _resolve_ffprobe() -> Optional[str]:
+    found = shutil.which("ffprobe")
+    if found:
+        return found
+    for candidate in ("/opt/homebrew/bin/ffprobe", "/usr/local/bin/ffprobe"):
+        if Path(candidate).is_file():
+            return candidate
+    return None
+
+
+def _parse_ffmpeg_duration(stderr: str) -> float:
+    for line in (stderr or "").splitlines():
         if "Duration:" in line:
             part = line.split("Duration:", 1)[1].split(",")[0].strip()
             h, m, s = part.split(":")
             return float(h) * 3600 + float(m) * 60 + float(s)
     return 0.0
+
+
+def _probe_duration(path: Path) -> float:
+    """读取容器时长（不整段解码，避免大文件 probe 超时）。"""
+    if not path.is_file():
+        return 0.0
+    ffprobe = _resolve_ffprobe()
+    if ffprobe:
+        try:
+            proc = subprocess.run(
+                [
+                    ffprobe,
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                    str(path),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            if proc.returncode == 0:
+                raw = (proc.stdout or "").strip().splitlines()
+                if raw:
+                    return max(0.0, float(raw[0]))
+        except (subprocess.TimeoutExpired, ValueError, OSError) as exc:
+            logger.debug("ffprobe 读取时长失败 %s: %s", path.name, exc)
+
+    try:
+        proc = subprocess.run(
+            [FFMPEG, "-hide_banner", "-i", str(path)],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except subprocess.TimeoutExpired:
+        logger.warning("ffmpeg 读取时长超时: %s", path)
+        return 0.0
+    return _parse_ffmpeg_duration(proc.stderr or "")
+
+
+def _extract_leading_clip(src: Path, dest: Path, seconds: float) -> None:
+    """截取片头若干秒（用于黄金口播入场）。"""
+    dest.unlink(missing_ok=True)
+    dur = max(0.5, float(seconds))
+    _run_ffmpeg(
+        [
+            "-hide_banner",
+            "-i",
+            str(src),
+            "-t",
+            f"{dur:.3f}",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "20",
+            "-c:a",
+            "aac",
+            "-movflags",
+            "+faststart",
+            str(dest),
+        ],
+        timeout=120,
+    )
+
+
+def _extend_video_to_duration(src: Path, dest: Path, target_sec: float) -> None:
+    """正片短于预算时末帧定格补齐（保证整条钩子接近 60s）。"""
+    target = max(0.5, float(target_sec))
+    dur = _probe_duration(src) or 0.0
+    if dur >= target - 0.2:
+        if src.resolve() != dest.resolve():
+            shutil.copy2(src, dest)
+        return
+    pad = target - dur
+    dest.unlink(missing_ok=True)
+    _run_ffmpeg(
+        [
+            "-hide_banner",
+            "-i",
+            str(src),
+            "-vf",
+            f"scale={WORK_WIDTH}:{WORK_HEIGHT},tpad=stop_mode=clone:stop_duration={pad:.3f}",
+            "-af",
+            f"apad=pad_dur={pad:.3f}",
+            "-c:v",
+            "libx264",
+            "-preset",
+            ENCODE_PRESET,
+            "-crf",
+            str(OUTPUT_CRF),
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-movflags",
+            "+faststart",
+            str(dest),
+        ],
+        timeout=300,
+    )
+
+
+def _trim_leading_clip(src: Path, dest: Path, skip_sec: float) -> None:
+    """去掉片头若干秒（黄金口播与正片不重复）。"""
+    skip = max(0.0, float(skip_sec))
+    if skip < 0.05:
+        if src.resolve() != dest.resolve():
+            shutil.copy2(src, dest)
+        return
+    dest.unlink(missing_ok=True)
+    _run_ffmpeg(
+        [
+            "-hide_banner",
+            "-ss",
+            f"{skip:.3f}",
+            "-i",
+            str(src),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "20",
+            "-c:a",
+            "aac",
+            "-movflags",
+            "+faststart",
+            str(dest),
+        ],
+        timeout=180,
+    )
 
 
 def _has_audio(path: Path) -> bool:
@@ -459,10 +614,13 @@ def _draw_hongguo_brand_corner(img: Image.Image) -> Image.Image:
 
 
 def _format_splash_title(keyword: str) -> str:
-    text = keyword.strip() or "短剧"
-    if text.startswith("《") and text.endswith("》"):
+    fallback = os.getenv("HONGGUO_SPLASH_TITLE_FALLBACK", "短剧").strip() or "短剧"
+    lb = os.getenv("HONGGUO_SPLASH_TITLE_LBRACKET", "《").strip() or "《"
+    rb = os.getenv("HONGGUO_SPLASH_TITLE_RBRACKET", "》").strip() or "》"
+    text = keyword.strip() or fallback
+    if text.startswith(lb) and text.endswith(rb):
         return text
-    return f"《{text}》"
+    return f"{lb}{text}{rb}"
 
 
 def _splash_subtitle_font_size(title_size: int) -> int:
@@ -603,13 +761,23 @@ def render_keyword_splash_card(
     img.save(path)
 
 
-def render_commentary_card(path: Path, text: str, *, drama_title: str = "") -> None:
+def render_commentary_card(
+    path: Path,
+    text: str,
+    *,
+    drama_title: str = "",
+    minimal: bool = False,
+) -> None:
     """解说卡：原创过渡画面，降低判重风险。"""
     short = (drama_title or "短剧").strip()[:12]
-    body = (text or "").strip() or f"《{short}》高能片段"
-    lines = [ln.strip() for ln in re.split(r"[\n；;]+", body) if ln.strip()][:3]
-    if not lines:
-        lines = [f"《{short}》这段太顶了"]
+    body = (text or "").strip()
+    if minimal:
+        lines = [body] if body else [short]
+    else:
+        body = body or f"《{short}》高能片段"
+        lines = [ln.strip() for ln in re.split(r"[\n；;]+", body) if ln.strip()][:3]
+        if not lines:
+            lines = [f"《{short}》这段太顶了"]
 
     img = Image.new("RGB", (WORK_WIDTH, WORK_HEIGHT), (18, 12, 16))
     draw = ImageDraw.Draw(img)
@@ -633,26 +801,51 @@ def render_commentary_card(path: Path, text: str, *, drama_title: str = "") -> N
             )
             y += 72
 
-    hint = commentary_footer_hint(drama_title)
-    hint_font = _load_font(32, bold=False)
-    hbox = draw.textbbox((0, 0), hint, font=hint_font)
-    draw.text(
-        (
-            (WORK_WIDTH - (hbox[2] - hbox[0])) // 2 - hbox[0],
-            WORK_HEIGHT - 90 - hbox[1],
-        ),
-        hint,
-        fill=(255, 180, 120),
-        font=hint_font,
-    )
+    if not minimal:
+        hint = commentary_footer_hint(drama_title)
+        hint_font = _load_font(32, bold=False)
+        hbox = draw.textbbox((0, 0), hint, font=hint_font)
+        draw.text(
+            (
+                (WORK_WIDTH - (hbox[2] - hbox[0])) // 2 - hbox[0],
+                WORK_HEIGHT - 90 - hbox[1],
+            ),
+            hint,
+            fill=(255, 180, 120),
+            font=hint_font,
+        )
     img.save(path)
 
 
-def render_outro_card(path: Path, keyword: str) -> None:
-    """片尾搜索引导卡。"""
-    kw = (keyword or "短剧").strip()[:16]
+def render_outro_card(
+    path: Path,
+    keyword: str,
+    *,
+    cta_line: str = "",
+) -> None:
+    """片尾引导卡；cta_line 非空时为专业尾帧大号话术。"""
     img = Image.new("RGB", (WORK_WIDTH, WORK_HEIGHT), (8, 8, 12))
     draw = ImageDraw.Draw(img)
+    full = (cta_line or "").strip()
+    if full:
+        font = _load_font(64, bold=True)
+        box = draw.textbbox((0, 0), full, font=font, stroke_width=3)
+        tw = box[2] - box[0]
+        draw.text(
+            (
+                (WORK_WIDTH - tw) // 2 - box[0],
+                WORK_HEIGHT // 2 - box[1],
+            ),
+            full,
+            fill=(255, 255, 255),
+            font=font,
+            stroke_width=3,
+            stroke_fill=(0, 0, 0),
+        )
+        img.save(path)
+        return
+
+    kw = (keyword or "短剧").strip()[:16]
     line1, line2 = outro_card_lines(kw)
     f1 = _load_font(48, bold=True)
     f2 = _load_font(56, bold=True)
@@ -787,6 +980,13 @@ def _normalize_segment(src: Path, dest: Path, *, seconds: float = 0) -> None:
     )
 
 
+def _encode_parallel_workers() -> int:
+    try:
+        return max(1, min(4, int(os.getenv("HONGGUO_ENCODE_PARALLEL", "2"))))
+    except ValueError:
+        return 2
+
+
 def _clip_with_plan(
     raw: Path,
     dest: Path,
@@ -834,7 +1034,7 @@ def _clip_with_plan(
     work = work_dir or dest.parent
     parts: list[Path] = []
     try:
-        for i, frag in enumerate(clips):
+        def _encode_fragment(i: int, frag) -> tuple[int, Path]:
             part = work / f"{dest.stem}_f{i:02d}.mp4"
             trim = frag.trim_start_sec
             if originality_enabled():
@@ -861,8 +1061,33 @@ def _clip_with_plan(
                 meme_beats=[],
                 clip_tail_pad=clip_tail_pad_sec(),
                 soft_audio_fade_out=True,
+                soft_audio_fade_in=(i == 0),
             )
-            parts.append(part)
+            return i, part
+
+        workers = _encode_parallel_workers()
+        if workers > 1 and len(clips) > 1:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
+            indexed: list[tuple[int, Path]] = []
+            with ThreadPoolExecutor(max_workers=min(workers, len(clips))) as pool:
+                futures = [
+                    pool.submit(_encode_fragment, i, frag)
+                    for i, frag in enumerate(clips)
+                ]
+                for fut in as_completed(futures):
+                    indexed.append(fut.result())
+            parts = [p for _, p in sorted(indexed, key=lambda x: x[0])]
+            logger.info(
+                "%s 并行编码 %d 段（workers=%d）",
+                label,
+                len(parts),
+                min(workers, len(clips)),
+            )
+        else:
+            for i, frag in enumerate(clips):
+                _, part = _encode_fragment(i, frag)
+                parts.append(part)
         if _use_moviepy():
             try:
                 mpy_merge_video_files(
@@ -945,6 +1170,7 @@ def _process_body_clip(
     meme_beats: Optional[list] = None,
     clip_tail_pad: Optional[float] = None,
     soft_audio_fade_out: bool = False,
+    soft_audio_fade_in: bool = False,
 ) -> None:
     """裁剪正片；开启去重增强时强制重编码并烧录解说字幕。"""
     trim_start = max(0.0, float(trim_start_sec or 0))
@@ -980,6 +1206,7 @@ def _process_body_clip(
                 meme_beats=meme_beats,
                 clip_tail_pad=clip_tail_pad,
                 soft_audio_fade_out=soft_audio_fade_out,
+                soft_audio_fade_in=soft_audio_fade_in,
             )
             dur = _probe_duration(dest)
             if dur < 0.5:
@@ -1625,9 +1852,134 @@ async def generate_hook_video(
             (episode_titles or {}).get(item_id) or f"第{index}集"
         )
         dur_local = local_material_duration(series_id, item_id)
+        if dur_local <= 1:
+            mat = find_local_material(series_id, item_id)
+            if mat:
+                dur_local = _probe_duration(mat)
+        if dur_local <= 1:
+            logger.warning(
+                "第%d集素材时长探测失败，AI 校验将暂用 120s 占位：%s",
+                index,
+                item_id,
+            )
         episode_durations_pre.append(dur_local if dur_local > 1 else 120.0)
 
+    episode_transcripts: dict = {}
+    episode_visual_profiles: dict = {}
     if use_ai_edit:
+        import asyncio
+
+        from video_transcript import asr_enabled, gather_episode_transcripts
+        from video_moment_profile import (
+            gather_episode_visual_profiles,
+            visual_profile_enabled,
+        )
+
+        async def _gather_tx() -> dict:
+            if not asr_enabled():
+                return {}
+            return await asyncio.to_thread(
+                gather_episode_transcripts,
+                series_id=series_id,
+                episode_item_ids=episode_item_ids,
+                episode_labels=episode_labels_pre,
+                work_dir=work,
+            )
+
+        async def _gather_vis() -> dict:
+            if not visual_profile_enabled():
+                return {}
+            return await asyncio.to_thread(
+                gather_episode_visual_profiles,
+                series_id=series_id,
+                episode_item_ids=episode_item_ids,
+                episode_labels=episode_labels_pre,
+                work_dir=work,
+            )
+
+        episode_transcripts, episode_visual_profiles = await asyncio.gather(
+            _gather_tx(), _gather_vis()
+        )
+        if episode_transcripts:
+            from video_transcript import write_transcript_sidecar
+
+            total_cues = 0
+            for ep_idx, cues in episode_transcripts.items():
+                total_cues += len(cues)
+                write_transcript_sidecar(
+                    cues, work / f"transcript_ep{ep_idx:02d}_full.txt"
+                )
+            logger.info(
+                "已抽取 %d 集对白（共 %d 条），供 AI 分镜",
+                len(episode_transcripts),
+                total_cues,
+            )
+        elif use_ai_edit:
+            logger.warning(
+                "未得到对白时间轴：请 pip install -r server/requirements-asr.txt "
+                "并确认 HONGGUO_ASR_ENABLED=1"
+            )
+        if episode_visual_profiles:
+            total_moments = sum(len(v) for v in episode_visual_profiles.values())
+            logger.info(
+                "已分析 %d 集画面/音效高能轴（共 %d 段），供 AI 选打斗与快切",
+                len(episode_visual_profiles),
+                total_moments,
+            )
+
+        episode_edit_briefs: dict = {}
+        try:
+            from hook_timeline import body_main_sec
+
+            body_tgt = body_main_sec()
+        except ImportError:
+            body_tgt = 50.0
+        from episode_edit_brief import gather_episode_edit_briefs
+        from video_keyframes import gather_episode_keyframes, vision_frames_enabled
+        from qwen_client import is_likely_vision_model
+
+        async def _gather_brief() -> dict:
+            if not (episode_transcripts or episode_visual_profiles):
+                return {}
+            return await asyncio.to_thread(
+                gather_episode_edit_briefs,
+                episode_labels=episode_labels_pre,
+                episode_durations=episode_durations_pre,
+                episode_transcripts=episode_transcripts or None,
+                episode_visual_profiles=episode_visual_profiles or None,
+                body_target_sec=body_tgt,
+                work_dir=work,
+            )
+
+        async def _gather_kf() -> dict:
+            if not (vision_frames_enabled() and is_likely_vision_model()):
+                return {}
+            return await asyncio.to_thread(
+                gather_episode_keyframes,
+                series_id=series_id,
+                episode_item_ids=episode_item_ids,
+                episode_labels=episode_labels_pre,
+                episode_durations=episode_durations_pre,
+                work_dir=work,
+                episode_visual_profiles=episode_visual_profiles or None,
+                episode_transcripts=episode_transcripts or None,
+            )
+
+        episode_edit_briefs, episode_keyframes = await asyncio.gather(
+            _gather_brief(), _gather_kf()
+        )
+        if episode_keyframes:
+            n_kf = sum(len(v) for v in episode_keyframes.values())
+            logger.info(
+                "已抽取 %d 张关键帧，将以多模态方式发给视觉模型（%s）",
+                n_kf,
+                os.getenv("QWEN_MODEL", "").strip() or "default",
+            )
+        else:
+            logger.info(
+                "纯文本分镜（未传关键帧）；无对白段由本地画面/音效轴程序选段"
+            )
+
         edit_plan = await plan_hook_edit(
             client,
             drama_title=drama_title,
@@ -1636,6 +1988,10 @@ async def generate_hook_video(
             keyword=keyword,
             episode_labels=episode_labels_pre,
             episode_durations=episode_durations_pre,
+            episode_transcripts=episode_transcripts or None,
+            episode_visual_profiles=episode_visual_profiles or None,
+            episode_keyframes=episode_keyframes or None,
+            episode_edit_briefs=episode_edit_briefs or None,
         )
     else:
         edit_plan = default_plan(
@@ -1655,17 +2011,47 @@ async def generate_hook_video(
         tts_note,
     )
 
+    use_pro = pro_60_template_enabled()
     splash_keyword = (keyword or "").strip() or drama_title.strip()
     promo_keyword = splash_keyword or edit_plan.outro_keyword
-    commentary_lines = pick_commentary_lines(
-        plan_lines=edit_plan.commentary_lines,
-        opening_text=edit_plan.opening_text,
-        subtitle_hint=edit_plan.subtitle_hint,
-        hook_summary=edit_plan.hook_summary,
-        drama_title=drama_title,
-        max_lines=3,
-        meme_mode=meme_edit_enabled(),
-    )
+    fixed_opening = fixed_opening_text()
+    if use_pro:
+        edit_plan.opening_text = fixed_opening_line()
+        edit_plan.commentary_lines = []
+        fixed_opening = edit_plan.opening_text
+        from hook_timeline import ai_body_faithful_enabled
+
+        logger.info(timeline_summary())
+        if ai_body_faithful_enabled():
+            try:
+                from hook_timeline import story_first_edit_enabled
+
+                if story_first_edit_enabled():
+                    logger.info(
+                        "正片剪辑：故事完整优先（AI 据完整对白表选情节，时长由 clips 之和决定）"
+                    )
+                else:
+                    logger.info(
+                        "正片剪辑：严格按 AI 分镜（不压 body_main_sec、不对白压缩/前重后轻配方）"
+                    )
+            except ImportError:
+                logger.info(
+                    "正片剪辑：严格按 AI 分镜（不压 body_main_sec、不对白压缩/前重后轻配方）"
+                )
+    elif fixed_opening:
+        edit_plan.opening_text = fixed_opening
+        edit_plan.commentary_lines = []
+    commentary_lines: list[str] = []
+    if not fixed_opening:
+        commentary_lines = pick_commentary_lines(
+            plan_lines=edit_plan.commentary_lines,
+            opening_text=edit_plan.opening_text,
+            subtitle_hint=edit_plan.subtitle_hint,
+            hook_summary=edit_plan.hook_summary,
+            drama_title=drama_title,
+            max_lines=3,
+            meme_mode=meme_edit_enabled(),
+        )
     ep_count = len(episode_item_ids)
     if hook_budget_enabled(ep_count):
         budget_note = budget_summary(
@@ -1682,6 +2068,10 @@ async def generate_hook_video(
         segments: list[Path] = []
         intro_seconds = 0.0
 
+        golden_src: Optional[Path] = None
+        body_paths: list[Path] = []
+
+        splash_segment: Optional[Path] = None
         if splash_keyword:
             splash_img = work / "00_splash.png"
             splash_mp4 = work / "00_splash.mp4"
@@ -1700,184 +2090,441 @@ async def generate_hook_video(
                 splash_mp4, splash_norm, seconds=KEYWORD_SPLASH_SECONDS
             )
             splash_mp4.unlink(missing_ok=True)
-            segments.append(splash_norm)
-            intro_seconds = KEYWORD_SPLASH_SECONDS
+            splash_segment = splash_norm
+            if not use_pro:
+                segments.append(splash_norm)
+                intro_seconds = KEYWORD_SPLASH_SECONDS
             logger.info(
                 "已添加关键词片头 %.1fs：%s",
-                intro_seconds,
+                KEYWORD_SPLASH_SECONDS,
                 _format_splash_title(splash_keyword),
             )
 
-        if originality_enabled() and edit_plan.opening_text.strip():
+        if (
+            not use_pro
+            and originality_enabled()
+            and edit_plan.opening_text.strip()
+        ):
             comm_img = work / "00b_commentary.png"
             comm_mp4 = work / "00b_commentary.mp4"
+            opening_line = edit_plan.opening_text.strip()
+            opening_card_sec = COMMENTARY_CARD_SECONDS
+            narr_voice = resolve_voice(
+                os.getenv("HONGGUO_TTS_VOICE", "").strip()
+                or pick_voice_for_episode(originality_seed)
+            )
+            if fixed_opening and tts_enabled() and edge_tts_available():
+                _opening_mp3, opening_card_sec = opening_card_duration_for_text(
+                    opening_line,
+                    work,
+                    voice=narr_voice,
+                    cache_dir=TTS_CACHE_DIR,
+                )
+                logger.info(
+                    "片头口播 TTS %.1fs → 卡片 %.1fs：%s",
+                    probe_media_duration(_opening_mp3),
+                    opening_card_sec,
+                    opening_line,
+                )
             render_commentary_card(
                 comm_img,
-                edit_plan.opening_text,
+                opening_line,
                 drama_title=drama_title,
+                minimal=bool(fixed_opening),
             )
             _card_to_video(
                 comm_img,
                 comm_mp4,
-                COMMENTARY_CARD_SECONDS,
+                opening_card_sec,
                 ken_burns=False,
-                narration_text=edit_plan.opening_text.strip(),
+                narration_text=opening_line,
                 work_dir=work,
-                narration_voice=pick_voice_for_episode(originality_seed),
+                narration_voice=narr_voice,
             )
             comm_norm = work / "00b_commentary_norm.mp4"
-            _normalize_segment(
-                comm_mp4, comm_norm, seconds=COMMENTARY_CARD_SECONDS
-            )
+            _normalize_segment(comm_mp4, comm_norm, seconds=opening_card_sec)
             comm_mp4.unlink(missing_ok=True)
             segments.append(comm_norm)
-            intro_seconds += COMMENTARY_CARD_SECONDS
-            logger.info("已添加解说过渡卡 %.1fs", COMMENTARY_CARD_SECONDS)
+            intro_seconds += opening_card_sec
+            logger.info("已添加片头口播卡 %.1fs", opening_card_sec)
 
         body_notes: list[str] = []
-        for index, item_id in enumerate(episode_item_ids, start=1):
-            label = episode_labels_pre[index - 1]
-            seg_plan = edit_plan.body_for_index(index)
-            ep_seconds = episode_durations_pre[index - 1]
-            clip_path = work / f"{index:02d}_body.mp4"
-            note = ""
-            fq_err: Optional[Exception] = None
-            episode_ready = False
+        from ai_edit_planner import hook_plan_clip_variant, plan_has_dialogue_full_variant
+        from edge_tts_narration import dual_dialogue_export_enabled
 
-            if use_fq_koc_material:
-                has_local = bool(find_local_material(series_id, item_id))
-                if not has_local and not fq_koc_configured():
+        render_runs: list[tuple[str, HookEditPlan, str, str]] = [
+            ("", edit_plan, "hook_merged.mp4", "hook_output.mp4"),
+        ]
+        from hook_timeline import ai_body_faithful_enabled
+
+        if (
+            dual_dialogue_export_enabled()
+            and not ai_body_faithful_enabled()
+            and plan_has_dialogue_full_variant(edit_plan)
+        ):
+            render_runs.append(
+                (
+                    "_full",
+                    hook_plan_clip_variant(edit_plan, "full"),
+                    "hook_merged_full.mp4",
+                    "hook_output_完整对白.mp4",
+                )
+            )
+            logger.info("对白双版本：将同时导出压缩版与完整对白版")
+
+        outro_norm_pro: Optional[Path] = None
+        outro_dur_pro = 0.0
+        narr_voice_pro = resolve_voice(
+            os.getenv("HONGGUO_TTS_VOICE", "").strip()
+            or pick_voice_for_episode(originality_seed)
+        )
+        if use_pro:
+            outro_line = fixed_outro_line()
+            outro_img = work / "99_outro_cta.png"
+            outro_mp4 = work / "99_outro_cta_raw.mp4"
+            outro_norm_pro = work / "99_outro_cta.mp4"
+            render_outro_card(outro_img, "", cta_line=outro_line)
+            outro_dur_pro = outro_cta_sec()
+            if tts_enabled() and edge_tts_available():
+                from edge_tts_narration import opening_card_duration_for_text
+
+                _, outro_dur_pro = opening_card_duration_for_text(
+                    outro_line,
+                    work,
+                    voice=narr_voice_pro,
+                    cache_dir=TTS_CACHE_DIR,
+                )
+                outro_dur_pro = max(outro_cta_sec(), min(6.0, outro_dur_pro))
+            _card_to_video(
+                outro_img,
+                outro_mp4,
+                outro_dur_pro,
+                ken_burns=False,
+                narration_text=outro_line,
+                work_dir=work,
+                narration_voice=narr_voice_pro,
+            )
+            _normalize_segment(outro_mp4, outro_norm_pro, seconds=outro_dur_pro)
+            outro_mp4.unlink(missing_ok=True)
+
+        primary_output: Optional[Path] = None
+
+        for file_tag, plan_run, merged_name, output_name in render_runs:
+            logger.info("开始合成成片…")
+            body_paths = []
+            golden_src = None
+            body_seconds_total = 0.0
+            intro_seconds = 0.0
+
+            for index, item_id in enumerate(episode_item_ids, start=1):
+                label = episode_labels_pre[index - 1]
+                seg_plan = plan_run.body_for_index(index)
+                if (
+                    use_pro
+                    and index == 1
+                    and file_tag == ""
+                    and not ai_body_faithful_enabled()
+                ):
+                    seg_plan.duration_sec += golden_open_sec()
+                ep_seconds = episode_durations_pre[index - 1]
+                clip_path = work / f"{index:02d}_body{file_tag}.mp4"
+                note = ""
+                fq_err: Optional[Exception] = None
+                episode_ready = False
+
+                if use_fq_koc_material:
+                    has_local = bool(find_local_material(series_id, item_id))
+                    if not has_local and not fq_koc_configured():
+                        try:
+                            raise_material_download_error(
+                                book_id=series_id, item_id=item_id
+                            )
+                        except RuntimeError as exc:
+                            fq_err = exc
+                    else:
+                        try:
+                            note = await _download_episode_segment_from_fq_koc(
+                                client,
+                                clip_path,
+                                label,
+                                ep_seconds,
+                                series_id=series_id,
+                                item_id=item_id,
+                                drama_title=drama_title,
+                                work_dir=work,
+                                segment_plan=seg_plan,
+                                commentary_lines=commentary_lines,
+                                originality_seed=f"{originality_seed}:{item_id}",
+                            )
+                            episode_ready = True
+                        except Exception as exc:
+                            fq_err = exc
+                            logger.warning("推广中心素材失败 %s: %s", label, exc)
+
+                if not episode_ready and use_kuaishou_material:
                     try:
-                        raise_material_download_error(
-                            book_id=series_id, item_id=item_id
-                        )
-                    except RuntimeError as exc:
-                        fq_err = exc
-                else:
-                    try:
-                        note = await _download_episode_segment_from_fq_koc(
+                        note = await _download_episode_segment_from_external(
                             client,
                             clip_path,
                             label,
                             ep_seconds,
-                            series_id=series_id,
-                            item_id=item_id,
                             drama_title=drama_title,
+                            promo_keyword=promo_keyword,
+                            share_url=kuaishou_share_url,
                             work_dir=work,
                             segment_plan=seg_plan,
                             commentary_lines=commentary_lines,
-                            originality_seed=f"{originality_seed}:{item_id}",
+                            originality_seed=f"{originality_seed}:ext",
                         )
                         episode_ready = True
                     except Exception as exc:
-                        fq_err = exc
-                        logger.warning("推广中心素材失败 %s: %s", label, exc)
+                        logger.warning("站外素材（快手/抖音）失败 %s: %s", label, exc)
+                        if fq_err:
+                            raise RuntimeError(
+                                f"推广中心与站外素材均失败。推广中心: {fq_err}"
+                            ) from exc
+                        raise RuntimeError(f"站外素材失败: {exc}") from exc
 
-            if not episode_ready and use_kuaishou_material:
-                try:
-                    note = await _download_episode_segment_from_external(
-                        client,
-                        clip_path,
-                        label,
-                        ep_seconds,
-                        drama_title=drama_title,
-                        promo_keyword=promo_keyword,
-                        share_url=kuaishou_share_url,
-                        work_dir=work,
-                        segment_plan=seg_plan,
-                        commentary_lines=commentary_lines,
-                        originality_seed=f"{originality_seed}:ext",
-                    )
-                    episode_ready = True
-                except Exception as exc:
-                    logger.warning("站外素材（快手/抖音）失败 %s: %s", label, exc)
+                if not episode_ready:
                     if fq_err:
-                        raise RuntimeError(
-                            f"推广中心与站外素材均失败。推广中心: {fq_err}"
-                        ) from exc
-                    raise RuntimeError(f"站外素材失败: {exc}") from exc
+                        raise fq_err
+                    raise RuntimeError(
+                        "未启用推广中心素材。请勾选「使用推广中心素材」并配置 Cookie。"
+                    )
 
-            if not episode_ready:
-                if fq_err:
-                    raise fq_err
-                raise RuntimeError(
-                    "未启用推广中心素材。请勾选「使用推广中心素材」并配置 Cookie。"
+                if not clip_path.is_file() or clip_path.stat().st_size < 10_000:
+                    raise RuntimeError(f"{label} 素材文件未生成或过小，请重试下载")
+
+                clip_dur = _probe_duration(clip_path) or 0.0
+                body_seconds_total += clip_dur
+                body_notes.append(note)
+                body_paths.append(clip_path)
+                if use_pro and index == 1 and golden_src is None:
+                    golden_src = work / f"00_golden_src{file_tag}.mp4"
+                    _extract_leading_clip(clip_path, golden_src, golden_open_sec())
+
+            if use_pro:
+                from hook_pro_render import (
+                    build_freeze_segment,
+                    enhance_golden_opening_clip,
                 )
 
-            if not clip_path.is_file() or clip_path.stat().st_size < 10_000:
-                raise RuntimeError(f"{label} 素材文件未生成或过小，请重试下载")
+                pro_segments: list[Path] = []
+                if splash_segment and splash_segment.is_file():
+                    pro_segments.append(splash_segment)
+                if golden_src and golden_src.is_file():
+                    golden_final = work / f"00_golden{file_tag}.mp4"
+                    enhance_golden_opening_clip(
+                        golden_src,
+                        opening_text=fixed_opening_line(),
+                        work_dir=work,
+                        voice=narr_voice_pro,
+                        dest=golden_final,
+                    )
+                    pro_segments.append(golden_final)
+                    intro_seconds = _probe_duration(golden_final) or golden_open_sec()
+                    if body_paths:
+                        golden_dur = intro_seconds
+                        trimmed = work / f"01_body_nogolden{file_tag}.mp4"
+                        _trim_leading_clip(body_paths[0], trimmed, golden_dur)
+                        body_paths[0].unlink(missing_ok=True)
+                        trimmed.rename(body_paths[0])
+                        body_seconds_total = sum(
+                            _probe_duration(p) or 0.0 for p in body_paths
+                        )
+                elif body_paths:
+                    golden_src = work / f"00_golden_src{file_tag}.mp4"
+                    _extract_leading_clip(
+                        body_paths[0], golden_src, golden_open_sec()
+                    )
+                    golden_final = work / f"00_golden{file_tag}.mp4"
+                    enhance_golden_opening_clip(
+                        golden_src,
+                        opening_text=fixed_opening_line(),
+                        work_dir=work,
+                        voice=narr_voice_pro,
+                        dest=golden_final,
+                    )
+                    pro_segments.append(golden_final)
+                    intro_seconds = _probe_duration(golden_final) or golden_open_sec()
+                    golden_dur = intro_seconds
+                    trimmed = work / f"01_body_nogolden{file_tag}.mp4"
+                    _trim_leading_clip(body_paths[0], trimmed, golden_dur)
+                    body_paths[0].unlink(missing_ok=True)
+                    trimmed.rename(body_paths[0])
+                    body_seconds_total = sum(
+                        _probe_duration(p) or 0.0 for p in body_paths
+                    )
 
-            clip_dur = _probe_duration(clip_path) or 0.0
-            body_seconds_total += clip_dur
-            body_notes.append(note)
-            segments.append(clip_path)
+                pro_segments.extend(body_paths)
+                freeze_mp4 = work / f"98_fadeout{file_tag}.mp4"
+                from hook_duration_budget import hook_target_min_sec
+                from hook_timeline import (
+                    body_outro_skip_transition,
+                    body_outro_use_fade,
+                    freeze_hold_sec,
+                )
 
-        if originality_outro_enabled() and promo_keyword:
-            outro_img = work / "99_outro.png"
-            outro_mp4 = work / "99_outro.mp4"
-            render_outro_card(outro_img, promo_keyword)
-            _card_to_video(
-                outro_img, outro_mp4, OUTRO_SEARCH_SECONDS, ken_burns=False
+                splash_dur_pre = (
+                    _probe_duration(splash_segment) or KEYWORD_SPLASH_SECONDS
+                    if splash_segment
+                    else 0.0
+                )
+                golden_dur_pre = sum(
+                    _probe_duration(p) or 0.0
+                    for p in pro_segments
+                    if "golden" in p.name
+                )
+                body_dur_pre = sum(_probe_duration(p) or 0.0 for p in body_paths)
+                outro_dur_est = outro_dur_pro or outro_cta_sec()
+                skip_tail = body_outro_skip_transition()
+                fade_dur = 0.0 if skip_tail else freeze_hold_sec()
+                min_total = hook_target_min_sec()
+                projected = (
+                    splash_dur_pre
+                    + golden_dur_pre
+                    + body_dur_pre
+                    + fade_dur
+                    + outro_dur_est
+                )
+                if (
+                    not skip_tail
+                    and projected < min_total - 0.25
+                    and not ai_body_faithful_enabled()
+                ):
+                    fade_dur = min(3.0, fade_dur + (min_total - projected))
+                if skip_tail:
+                    logger.info("正片尾跳过黑场/淡出，直接接片尾口播")
+                else:
+                    freeze_src = body_paths[-1] if body_paths else pro_segments[-1]
+                    build_freeze_segment(
+                        freeze_src,
+                        freeze_mp4,
+                        work_dir=work,
+                        duration=fade_dur,
+                    )
+                    pro_segments.append(freeze_mp4)
+                if outro_norm_pro and outro_norm_pro.is_file():
+                    pro_segments.append(outro_norm_pro)
+                run_segments = pro_segments
+                body_seconds_total = sum(
+                    _probe_duration(p) or 0.0 for p in body_paths
+                )
+                splash_dur = (
+                    _probe_duration(splash_segment) or KEYWORD_SPLASH_SECONDS
+                    if splash_segment
+                    else 0.0
+                )
+                fade_label = "跳过" if skip_tail else ("淡出" if body_outro_use_fade() else "定格")
+                fade_dur_actual = 0.0 if skip_tail else (_probe_duration(freeze_mp4) or 0.0)
+                seg0 = plan_run.body_for_index(1)
+                plan_body = float(seg0.duration_sec) if seg0 else 0.0
+                plan_clips = (
+                    sum(c.duration_sec for c in seg0.clips) if seg0 and seg0.clips else 0.0
+                )
+                measured_total = (
+                    splash_dur
+                    + intro_seconds
+                    + body_seconds_total
+                    + fade_dur_actual
+                    + outro_dur_pro
+                )
+                logger.info(
+                    "专业60s 成片实测(ffprobe)：封面%.1fs + 黄金%.1fs + 正片%.1fs"
+                    " + %s%.1fs + 尾帧%.1fs ≈ %.1fs | AI 计划正片 body=%.1fs clips=%.1fs",
+                    splash_dur,
+                    intro_seconds,
+                    body_seconds_total,
+                    fade_label,
+                    fade_dur_actual,
+                    outro_dur_pro,
+                    measured_total,
+                    plan_body,
+                    plan_clips,
+                )
+            else:
+                run_segments = list(segments)
+                run_segments.extend(body_paths)
+
+            if not use_pro and originality_outro_enabled() and promo_keyword:
+                outro_img = work / f"99_outro{file_tag}.png"
+                outro_mp4 = work / f"99_outro{file_tag}.mp4"
+                render_outro_card(outro_img, promo_keyword)
+                _card_to_video(
+                    outro_img, outro_mp4, OUTRO_SEARCH_SECONDS, ken_burns=False
+                )
+                outro_norm = work / f"99_outro_norm{file_tag}.mp4"
+                _normalize_segment(
+                    outro_mp4, outro_norm, seconds=OUTRO_SEARCH_SECONDS
+                )
+                outro_mp4.unlink(missing_ok=True)
+                run_segments.append(outro_norm)
+                logger.info("已添加片尾搜索引导 %.1fs", OUTRO_SEARCH_SECONDS)
+
+            merged = work / merged_name
+            _merge_segments(
+                run_segments,
+                merged,
+                body_seconds=body_seconds_total,
+                intro_seconds=intro_seconds,
             )
-            outro_norm = work / "99_outro_norm.mp4"
-            _normalize_segment(outro_mp4, outro_norm, seconds=OUTRO_SEARCH_SECONDS)
-            outro_mp4.unlink(missing_ok=True)
-            segments.append(outro_norm)
-            logger.info("已添加片尾搜索引导 %.1fs", OUTRO_SEARCH_SECONDS)
 
-        merged = work / "hook_merged.mp4"
-        _merge_segments(
-            segments,
-            merged,
-            body_seconds=body_seconds_total,
-            intro_seconds=intro_seconds,
-        )
-
-        output = work / "hook_output.mp4"
-        need_transcode = (
-            _video_codec(merged) in ("hevc", "h265")
-            or _video_bitrate_bps(merged) < 200_000
-        )
-        if need_transcode:
-            if not _finalize_for_browser(merged, output):
+            output = work / output_name
+            need_transcode = (
+                _video_codec(merged) in ("hevc", "h265")
+                or _video_bitrate_bps(merged) < 200_000
+            )
+            if need_transcode:
+                if not _finalize_for_browser(merged, output):
+                    raise RuntimeError(
+                        "合成视频无法在浏览器中播放，请检查推广中心素材是否完整后重试"
+                    )
+            elif video_decodes(merged):
+                merged.rename(output)
+            elif not _finalize_for_browser(merged, output):
                 raise RuntimeError(
                     "合成视频无法在浏览器中播放，请检查推广中心素材是否完整后重试"
                 )
-        elif video_decodes(merged):
-            merged.rename(output)
-        elif not _finalize_for_browser(merged, output):
-            raise RuntimeError(
-                "合成视频无法在浏览器中播放，请检查推广中心素材是否完整后重试"
-            )
 
-        out_w, out_h = _probe_video_size(output)
-        if out_w != WORK_WIDTH or out_h != WORK_HEIGHT:
-            fixed = work / "hook_final_169.mp4"
-            _normalize_segment(
-                output, fixed, seconds=_probe_duration(output) or 120.0
-            )
-            output.unlink(missing_ok=True)
-            fixed.rename(output)
-            logger.info("成片已校正为横屏 %dx%d (%s)", WORK_WIDTH, WORK_HEIGHT, ASPECT_LABEL)
-
-        if output.stat().st_size < MIN_OUTPUT_BYTES:
-            raise RuntimeError("合成视频过小，剧集画面可能未成功写入")
-
-        if not video_decodes(output):
-            raise RuntimeError("成片无法解码播放，请重试或换一集")
-
-        if watermark_enabled():
-            wm_path = work / "hook_watermarked.mp4"
-            if burn_corner_watermark(output, wm_path):
+            out_w, out_h = _probe_video_size(output)
+            if out_w != WORK_WIDTH or out_h != WORK_HEIGHT:
+                fixed = work / f"hook_final_169{file_tag}.mp4"
+                _normalize_segment(
+                    output, fixed, seconds=_probe_duration(output) or 120.0
+                )
                 output.unlink(missing_ok=True)
-                wm_path.rename(output)
+                fixed.rename(output)
+                logger.info(
+                    "成片已校正为横屏 %dx%d (%s)",
+                    WORK_WIDTH,
+                    WORK_HEIGHT,
+                    ASPECT_LABEL,
+                )
 
-        if not _has_audio(output):
-            logger.warning("成片未检测到音轨")
-        elif not audio_is_audible(output):
-            logger.warning("成片音轨音量过低，听感可能接近无声")
+            if output.stat().st_size < MIN_OUTPUT_BYTES:
+                raise RuntimeError("合成视频过小，剧集画面可能未成功写入")
 
-        final_name = f"{_safe_filename(drama_title)}_钩子.mp4"
+            if not video_decodes(output):
+                raise RuntimeError("成片无法解码播放，请重试或换一集")
+
+            if watermark_enabled():
+                wm_path = work / f"hook_watermarked{file_tag}.mp4"
+                if burn_corner_watermark(output, wm_path):
+                    output.unlink(missing_ok=True)
+                    wm_path.rename(output)
+
+            if not _has_audio(output):
+                logger.warning("成片未检测到音轨")
+            elif not audio_is_audible(output):
+                logger.warning("成片音轨音量过低，听感可能接近无声")
+
+            final_name = f"{_safe_filename(drama_title)}_钩子.mp4"
+            primary_output = output
+
+        if primary_output is None:
+            raise RuntimeError("未生成成片")
+        output = primary_output
+
         warning = ""
         if body_notes and all("明文" in n for n in body_notes):
             tts_tip = (

@@ -22,8 +22,18 @@ VOICE_PRESETS: dict[str, str] = {
     "晓晓": "zh-CN-XiaoxiaoNeural",
     "xiaoyi": "zh-CN-XiaoyiNeural",
     "晓伊": "zh-CN-XiaoyiNeural",
+    "yunxi": "zh-CN-YunxiNeural",
+    "云希": "zh-CN-YunxiNeural",
+    "yunjian": "zh-CN-YunjianNeural",
+    "云健": "zh-CN-YunjianNeural",
+    "yunxia": "zh-CN-YunxiaNeural",
+    "云夏": "zh-CN-YunxiaNeural",
     "yunyang": "zh-CN-YunyangNeural",
     "云阳": "zh-CN-YunyangNeural",
+    "xiaobei": "zh-CN-liaoning-XiaobeiNeural",
+    "小北": "zh-CN-liaoning-XiaobeiNeural",
+    "xiaoni": "zh-CN-shaanxi-XiaoniNeural",
+    "小妮": "zh-CN-shaanxi-XiaoniNeural",
 }
 DEFAULT_VOICE_KEY = "xiaoyi"
 DEFAULT_RATE = "+2%"
@@ -65,9 +75,103 @@ def edge_tts_available() -> bool:
         return False
 
 
+def fixed_opening_text() -> str:
+    """统一片头口播文案（专业时间轴优先）。"""
+    try:
+        from hook_timeline import fixed_opening_line, pro_60_template_enabled
+
+        if pro_60_template_enabled():
+            return fixed_opening_line()
+    except ImportError:
+        pass
+    return os.getenv("HONGGUO_FIXED_OPENING_TEXT", "").strip()
+
+
+def probe_media_duration(path: Path) -> float:
+    """读取 mp3/mp4 时长（秒）。"""
+    import shutil
+    import subprocess
+
+    if not path.is_file():
+        return 0.0
+    ffprobe = shutil.which("ffprobe")
+    if ffprobe:
+        try:
+            proc = subprocess.run(
+                [
+                    ffprobe,
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                    str(path),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            if proc.returncode == 0:
+                raw = (proc.stdout or "").strip().splitlines()
+                if raw:
+                    return max(0.0, float(raw[0]))
+        except (ValueError, subprocess.TimeoutExpired, OSError):
+            pass
+    return 0.0
+
+
+def opening_card_duration_for_text(
+    text: str,
+    work_dir: Path,
+    *,
+    voice: Optional[str] = None,
+    cache_dir: Optional[Path] = None,
+) -> tuple[Path, float]:
+    """
+    合成片头口播 mp3，并返回卡片视频应使用的时长（≥ 口播长度，避免被截断）。
+    """
+    import hashlib
+
+    line = (text or "").strip()
+    if not line:
+        return Path(), float(os.getenv("HONGGUO_OPENING_CARD_SEC", "1.2") or 1.2)
+
+    cache = cache_dir or work_dir
+    cache.mkdir(parents=True, exist_ok=True)
+    key = hashlib.md5(f"{line}:{resolve_voice(voice)}".encode("utf-8")).hexdigest()[:18]
+    mp3 = cache / f"opening_{key}.mp3"
+    if not mp3.is_file() or mp3.stat().st_size < 200:
+        ok = _run_coro_sync(
+            synthesize_to_file(
+                line,
+                mp3,
+                voice=voice,
+                rate=os.getenv("HONGGUO_TTS_RATE", "-4%"),
+                preserve_brackets=True,
+            )
+        )
+        if not ok:
+            return mp3, max(2.5, float(os.getenv("HONGGUO_OPENING_CARD_SEC", "4.0") or 4.0))
+
+    audio_dur = probe_media_duration(mp3)
+    pad = max(0.2, min(0.6, float(os.getenv("HONGGUO_OPENING_TTS_PAD_SEC", "0.35") or 0.35)))
+    card_sec = max(2.5, min(8.0, audio_dur + pad))
+    env_cap = os.getenv("HONGGUO_OPENING_CARD_SEC", "").strip()
+    if env_cap:
+        try:
+            card_sec = max(card_sec, float(env_cap))
+        except ValueError:
+            pass
+    return mp3, card_sec
+
+
 def resolve_voice(voice_key: Optional[str] = None) -> str:
     """环境变量 HONGGUO_TTS_VOICE：xiaoxiao | xiaoyi | yunyang | random"""
     raw = (voice_key or os.getenv("HONGGUO_TTS_VOICE", DEFAULT_VOICE_KEY)).strip().lower()
+    # 允许直接传 edge-tts 的完整 voice id，例如：zh-CN-XiaoxuanNeural
+    if raw.startswith("zh-") and raw.endswith("neural"):
+        return voice_key.strip()
     if raw in ("random", "rand", "auto"):
         return random.choice(list(VOICE_PRESETS.values()))
     return VOICE_PRESETS.get(raw, VOICE_PRESETS[DEFAULT_VOICE_KEY])
@@ -214,6 +318,63 @@ def smart_duck_enabled() -> bool:
     return v not in ("0", "false", "no", "off")
 
 
+def golden_opening_duck_volume() -> float:
+    """片头黄金口播时段：原声弱化（非静音），避免与 TTS 抢戏。"""
+    return max(
+        0.05,
+        min(0.4, float(os.getenv("HONGGUO_GOLDEN_DUCK_ORIGINAL", "0.14"))),
+    )
+
+
+def dialogue_completeness_enabled() -> bool:
+    """完整度优先：台词说全，总时长可不卡死 60s。"""
+    v = os.getenv("HONGGUO_DIALOGUE_COMPLETE", "1").strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
+def dialogue_tail_pad_sec() -> float:
+    return max(0.2, min(1.0, float(os.getenv("HONGGUO_DIALOGUE_TAIL_PAD", "0.45"))))
+
+
+def dialogue_compress_grace_sec() -> float:
+    """完整度优先：正片超出目标在此秒数内不压缩台词（默认 10s）。"""
+    try:
+        return max(0.0, float(os.getenv("HONGGUO_DIALOGUE_COMPRESS_GRACE", "10")))
+    except ValueError:
+        return 10.0
+
+
+def dialogue_compress_enabled() -> bool:
+    """是否压缩正片对白时长（默认关，只出一版、按 AI 分镜全长）。"""
+    v = os.getenv("HONGGUO_DIALOGUE_COMPRESS", "0").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def should_compress_for_dialogue(total: float, target_sec: float) -> bool:
+    """是否应对齐后 clip 总时长做压缩。"""
+    if not dialogue_compress_enabled():
+        return False
+    if not dialogue_completeness_enabled():
+        return total > target_sec + 2.0
+    return total > target_sec + dialogue_compress_grace_sec()
+
+
+def dialogue_dual_min_gap_sec() -> float:
+    """压缩版与完整版正片计划时长至少相差该秒数才导出双版本。"""
+    try:
+        return max(3.0, float(os.getenv("HONGGUO_DIALOGUE_DUAL_MIN_GAP", "5")))
+    except ValueError:
+        return 5.0
+
+
+def dual_dialogue_export_enabled() -> bool:
+    """已弃用：默认只导出单一成片。仅当显式开启压缩+双版本时可用。"""
+    if not dialogue_compress_enabled():
+        return False
+    v = os.getenv("HONGGUO_HOOK_DUAL_DIALOGUE_EXPORT", "0").strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
 def _merge_narr_windows(
     windows: list[tuple[float, float]],
     total: float,
@@ -343,6 +504,10 @@ def mix_narration_on_clip(
     narr_mix = CompositeAudioClip(narr_layers)
 
     if narration_only or clip.audio is None:
+        narr_dur = float(narr_mix.duration or 0.0)
+        clip_dur = float(clip.duration or 0.0)
+        if narr_dur > clip_dur + 0.05:
+            clip = clip.with_duration(narr_dur + 0.02)
         return clip.with_audio(narr_mix)
 
     if clip.audio is not None:

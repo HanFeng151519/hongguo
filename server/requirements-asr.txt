@@ -1,0 +1,3 @@
+# 可选：本地 ASR 对白时间轴（生成前抽字幕供 AI 分镜）
+# pip install -r server/requirements-asr.txt
+faster-whisper>=1.0.0

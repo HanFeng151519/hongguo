@@ -458,9 +458,12 @@ async def _run_generate_job(job_id: str, body: GenerateHookRequest) -> None:
             len(video_bytes) / 1024 / 1024,
         )
 
+        paths_to_remove = [saved]
+
         async def _delayed_remove() -> None:
             await asyncio.sleep(DOWNLOAD_TTL_SEC)
-            saved.unlink(missing_ok=True)
+            for p in paths_to_remove:
+                p.unlink(missing_ok=True)
 
         asyncio.create_task(_delayed_remove())
 
@@ -841,6 +844,92 @@ async def tts_search_hint(
         filename="search-hint.mp3",
         headers={"Cache-Control": "public, max-age=86400"},
     )
+
+
+@app.get("/api/tts/voices")
+async def tts_voice_presets():
+    """返回可选 TTS 音色预设（key -> edge-tts voice）。"""
+    from edge_tts_narration import VOICE_PRESETS, edge_tts_available, tts_enabled
+
+    return {
+        "ok": True,
+        "enabled": bool(tts_enabled() and edge_tts_available()),
+        "voices": VOICE_PRESETS,
+    }
+
+
+def _safe_voice_test_name(voice_key: str) -> str:
+    v = (voice_key or "").strip().lower()
+    return re.sub(r"[^\w-]+", "_", v)[:32] or "voice"
+
+
+@app.get("/api/tts/voice-test.mp3")
+async def tts_voice_test_mp3(
+    text: str = Query(
+        default="这段声音用来试听不同的配音风格，你觉得哪个更好听？",
+        min_length=1,
+        max_length=120,
+        description="试听文本",
+    ),
+    voice: str = Query(
+        default="xiaoyi",
+        min_length=1,
+        max_length=32,
+        description="音色 key（如 xiaoyi/xiaoxiao/yunyang）",
+    ),
+):
+    """生成单个音色的试听 mp3（带缓存）。"""
+    from edge_tts_narration import edge_tts_available, synthesize_to_file, tts_enabled
+
+    if not tts_enabled() or not edge_tts_available():
+        raise HTTPException(status_code=503, detail="TTS 未启用或未安装 edge-tts")
+
+    import hashlib
+
+    vkey = _safe_voice_test_name(voice)
+    key = hashlib.md5(f"{vkey}:{text}".encode("utf-8")).hexdigest()[:18]
+    path = TTS_CACHE_DIR / f"voice_test_{vkey}_{key}.mp3"
+    if not path.is_file() or path.stat().st_size < 200:
+        ok = await synthesize_to_file(text, path, voice=vkey, preserve_brackets=True)
+        if not ok:
+            raise HTTPException(status_code=500, detail="语音合成失败")
+    return FileResponse(
+        path,
+        media_type="audio/mpeg",
+        filename=path.name,
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
+@app.get("/api/tts/voice-test")
+async def tts_voice_test_batch(
+    text: str = Query(
+        default="这段声音用来试听不同的配音风格，你觉得哪个更好听？",
+        min_length=1,
+        max_length=120,
+        description="试听文本",
+    )
+):
+    """一次生成多音色试听，返回可直接访问的 mp3 URL 列表。"""
+    from edge_tts_narration import VOICE_PRESETS, edge_tts_available, tts_enabled
+
+    if not tts_enabled() or not edge_tts_available():
+        raise HTTPException(status_code=503, detail="TTS 未启用或未安装 edge-tts")
+
+    # 去重：同一个 voice id 只生成一次
+    seen_voice_ids: set[str] = set()
+    keys: list[str] = []
+    for k, vid in VOICE_PRESETS.items():
+        if vid in seen_voice_ids:
+            continue
+        seen_voice_ids.add(vid)
+        keys.append(k)
+
+    samples = []
+    for k in keys:
+        url = f"/api/tts/voice-test.mp3?voice={k}&text={httpx.QueryParams({'t': text})['t']}"
+        samples.append({"voice_key": k, "url": url})
+    return {"ok": True, "text": text, "samples": samples}
 
 
 @app.get("/api/generate/splash-preview.png")

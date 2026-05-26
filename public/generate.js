@@ -128,7 +128,6 @@ const postCaptionEl = document.getElementById("post-caption");
 const btnCopyCaption = document.getElementById("btn-copy-caption");
 const previewEl = document.getElementById("preview");
 const downloadLink = document.getElementById("download-link");
-
 let episodes = [];
 const selected = new Set();
 let lastPreviewUrl = "";

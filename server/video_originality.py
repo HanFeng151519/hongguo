@@ -251,6 +251,13 @@ def pick_commentary_lines(
     meme_mode: bool = False,
 ) -> list[str]:
     """合并 AI 解说句；meme 模式仅保留短句供 TTS，避免与大字幕重复冗长。"""
+    try:
+        from edge_tts_narration import fixed_opening_text
+
+        if fixed_opening_text():
+            return []
+    except ImportError:
+        pass
     out: list[str] = []
     seen: set[str] = set()
     max_len = 14 if meme_mode else 36
