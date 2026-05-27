@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import socket
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import parse_qs, urlparse
@@ -229,12 +230,33 @@ async def _release_context_after_run(context: Any) -> None:
 
 async def _launch_context(p: Any, *, headless: bool) -> Any:
     """优先用本机 Chrome/Edge，无需 playwright install chromium。"""
+    # 部分网络环境下，系统 DNS 可能会间歇性失败，导致 Playwright 里
+    # Chromium 打不开站点（net::ERR_NAME_NOT_RESOLVED）。这里提供 host-resolver-rules 兜底。
+    resolver_rules_env = os.getenv(
+        "HONGGUO_FQ_KOC_HOST_RESOLVER_RULES", ""
+    ).strip()
+    host_resolver_rules = ""
+    if resolver_rules_env:
+        host_resolver_rules = resolver_rules_env
+    else:
+        fallback_ip = os.getenv(
+            "HONGGUO_FQ_KOC_HOST_RESOLVER_KOC_IP", "101.47.85.10"
+        ).strip()
+        # 如果 DNS 可用，尽量使用实时解析出来的 IP；否则使用 fallback。
+        try:
+            resolved_ip = socket.gethostbyname("koc.fqopenplatform.com")
+            host_resolver_rules = f"MAP koc.fqopenplatform.com {resolved_ip}"
+        except Exception:
+            if fallback_ip:
+                host_resolver_rules = f"MAP koc.fqopenplatform.com {fallback_ip}"
+
     base_kw: dict[str, Any] = {
         "user_data_dir": str(PROFILE_DIR),
         "headless": headless,
         "viewport": {"width": 1366, "height": 900},
         "locale": "zh-CN",
-        "args": ["--disable-blink-features=AutomationControlled"],
+        "args": ["--disable-blink-features=AutomationControlled"]
+        + ([f"--host-resolver-rules={host_resolver_rules}"] if host_resolver_rules else []),
     }
     last_err: Optional[Exception] = None
     for channel in ("chrome", "msedge", None):
@@ -438,7 +460,11 @@ async def _run_in_browser(
             elif str(click_note).startswith("clicked"):
                 wait_sec = 45
             else:
-                wait_sec = 20
+                # 推广中心有时会延迟返回 CDN 地址；之前默认只等 20s
+                # 容易导致仍在等待时就返回 400。
+                wait_sec = int(
+                    os.getenv("HONGGUO_FQ_KOC_SYNC_WAIT_SEC", "60").strip() or "60"
+                )
             logger.info(
                 "接口未返回地址，等待浏览器产生 MP4 请求（最多 %s 秒）…",
                 wait_sec,

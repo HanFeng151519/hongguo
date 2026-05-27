@@ -56,40 +56,6 @@
         <input id="use-fq-koc" type="checkbox" checked />
         <span>正片使用推广中心素材（番茄达人中心下载，不再使用红果加密原片）</span>
       </label>
-      <label class="field field-checkbox">
-        <input id="use-kuaishou" type="checkbox" />
-        <span>可选：推广中心失败时再尝试快手/抖音</span>
-      </label>
-      <label class="field">
-        <span>快手 / 抖音作品链接（可选）</span>
-        <input id="kuaishou-url" type="url" placeholder="v.kuaishou.com / kuaishou.com/short-video / v.douyin.com / douyin.com/video …" />
-      </label>
-      <label class="field">
-        <span>达人中心下载接口 URL（可选，从 F12 复制 batch_download/create 整段）</span>
-        <input id="fq-koc-url" type="url" placeholder="https://koc.fqopenplatform.com/api/platform/content/batch_download/create/v1?..." />
-      </label>
-      <label class="field">
-        <span>达人中心 Cookie（未写 .env 时必填，否则无法用明文正片）</span>
-        <textarea id="fq-koc-cookie" rows="2" placeholder="登录 koc.fqopenplatform.com 后从 Network 请求头复制 Cookie"></textarea>
-      </label>
-      <label class="field">
-        <span>下载 Payload（F12 → Request Payload；导入抓包后会自动保存）</span>
-        <textarea id="fq-koc-download-body" rows="3" placeholder="book_id={book_id}&amp;item_id={item_id}&amp;content_tab=6&amp;app_id=457699&amp;..."></textarea>
-      </label>
-      <label class="field">
-        <span>本集 CDN 直链（F12 下载该集 MP4 的完整 URL）</span>
-        <input id="fq-koc-mp4-url" type="url" placeholder="https://v6-fqkol.fanqieopenvod.com/...（须对应当前选中集）" />
-      </label>
-      <div class="panel-actions" style="margin-top:0.25rem">
-        <button type="button" id="fq-koc-resolve-url" class="btn-ghost">自动获取下载地址</button>
-        <button type="button" id="fq-koc-cache-url" class="btn-ghost">缓存本集到本地</button>
-        <a class="btn-ghost" href="/koc-capture-helper.js" target="_blank" rel="noopener" style="margin-left:0.5rem;font-size:0.9em">推广中心助手脚本</a>
-      </div>
-      <div class="panel-actions" style="margin-top:0.5rem">
-        <button type="button" id="fq-koc-sync-browser" class="btn-ghost" title="需 Playwright；推荐用 .env + 导入 F12，勿弹窗请保持 AUTO_SYNC=0">Playwright 同步（可选）</button>
-        <button type="button" id="fq-koc-import-curl" class="btn-ghost">导入 F12 抓包</button>
-        <span id="fq-koc-import-status" class="episode-status" style="margin-left:0.5rem"></span>
-      </div>
       <p id="config-status" class="episode-status"></p>
     </section>
 
@@ -122,6 +88,6 @@
       <a id="download-link" class="btn-download hidden" href="#" download="hook_video.mp4">下载推广视频（MP4）</a>
     </section>
   </div>
-  <script src="/generate.js?v=37"></script>
+  <script src="/generate.js?v=38"></script>
 </body>
 </html>

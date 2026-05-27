@@ -43,16 +43,38 @@ def visual_profile_enabled() -> bool:
     return v not in ("0", "false", "no", "off")
 
 
-def _profile_cache_path(video: Path) -> Path:
-    return video.parent / f".{video.stem}_visual_profile.json"
+def _profile_cache_path(
+    video: Path,
+    *,
+    book_id: str = "",
+    item_id: str = "",
+) -> Path:
+    from fq_koc_material import material_sidecar_stem
+
+    stem = material_sidecar_stem(book_id, item_id) or video.stem
+    return video.parent / f".{stem}_visual_profile.json"
 
 
-def _load_cache(video: Path) -> Optional[list[VisualMoment]]:
-    path = _profile_cache_path(video)
+def _visual_cache_ok(raw: dict, *, book_id: str, item_id: str) -> bool:
+    if book_id and raw.get("book_id") and str(raw["book_id"]) != book_id:
+        return False
+    if item_id and raw.get("item_id") and str(raw["item_id"]) != item_id:
+        return False
+    return True
+
+
+def _load_cache_file(
+    path: Path,
+    *,
+    book_id: str,
+    item_id: str,
+) -> Optional[list[VisualMoment]]:
     if not path.is_file():
         return None
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(raw, dict) and not _visual_cache_ok(raw, book_id=book_id, item_id=item_id):
+            return None
         items = raw.get("moments") if isinstance(raw, dict) else raw
         if not isinstance(items, list):
             return None
@@ -74,14 +96,43 @@ def _load_cache(video: Path) -> Optional[list[VisualMoment]]:
         return None
 
 
-def _save_cache(video: Path, moments: list[VisualMoment]) -> None:
-    path = _profile_cache_path(video)
+def _load_cache(
+    video: Path,
+    *,
+    book_id: str = "",
+    item_id: str = "",
+) -> Optional[list[VisualMoment]]:
+    path = _profile_cache_path(video, book_id=book_id, item_id=item_id)
+    moments = _load_cache_file(path, book_id=book_id, item_id=item_id)
+    if moments:
+        return moments
+    if book_id and item_id:
+        legacy = video.parent / f".{video.stem}_visual_profile.json"
+        if legacy != path:
+            moments = _load_cache_file(legacy, book_id=book_id, item_id=item_id)
+            if moments:
+                _save_cache(video, moments, book_id=book_id, item_id=item_id)
+    return None
+
+
+def _save_cache(
+    video: Path,
+    moments: list[VisualMoment],
+    *,
+    book_id: str = "",
+    item_id: str = "",
+) -> None:
+    path = _profile_cache_path(video, book_id=book_id, item_id=item_id)
+    payload: dict = {
+        "source": video.name,
+        "moments": [m.to_dict() for m in moments],
+    }
+    if book_id:
+        payload["book_id"] = book_id
+    if item_id:
+        payload["item_id"] = item_id
     path.write_text(
-        json.dumps(
-            {"source": video.name, "moments": [m.to_dict() for m in moments]},
-            ensure_ascii=False,
-            indent=0,
-        ),
+        json.dumps(payload, ensure_ascii=False, indent=0),
         encoding="utf-8",
     )
 
@@ -183,10 +234,22 @@ def _cuts_near(t: float, cuts: list[float], radius: float = 2.5) -> int:
     return sum(1 for c in cuts if lo <= c <= hi)
 
 
-def build_visual_profile(video: Path, work_dir: Path) -> list[VisualMoment]:
-    cached = _load_cache(video)
+def build_visual_profile(
+    video: Path,
+    work_dir: Path,
+    *,
+    book_id: str = "",
+    item_id: str = "",
+) -> list[VisualMoment]:
+    cached = _load_cache(video, book_id=book_id, item_id=item_id)
     if cached:
-        logger.info("使用画面/音效缓存 %d 段：%s", len(cached), video.name)
+        logger.info(
+            "使用画面/音效缓存 %d 段：%s (book=%s item=%s)",
+            len(cached),
+            video.name,
+            book_id or "-",
+            item_id or "-",
+        )
         return cached
 
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -270,7 +333,7 @@ def build_visual_profile(video: Path, work_dir: Path) -> list[VisualMoment]:
             merged.append(m)
 
     if merged:
-        _save_cache(video, merged)
+        _save_cache(video, merged, book_id=book_id, item_id=item_id)
         logger.info("画面/音效轴 %d 段：%s", len(merged), video.name)
     return merged
 
@@ -338,7 +401,9 @@ def gather_episode_visual_profiles(
         if not path:
             continue
         ep_work = work_dir / f"visual_ep{idx:02d}"
-        moments = build_visual_profile(path, ep_work)
+        moments = build_visual_profile(
+            path, ep_work, book_id=series_id, item_id=item_id
+        )
         if moments:
             out[idx] = moments
             logger.info("%s 画面/音效轴 %d 段", label, len(moments))

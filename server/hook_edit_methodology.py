@@ -210,11 +210,16 @@ def ai_editor_autonomy_enabled() -> bool:
 def human_impact_script_brief(*, body_sec: float = 50.0) -> str:
     """产品北极星：六步叙事 + 故事完整（时长由情节决定）。"""
     try:
-        from hook_timeline import story_first_edit_enabled
+        from hook_timeline import (
+            ai_script_duration_guidance,
+            story_first_edit_enabled,
+        )
 
+        duration_line = ai_script_duration_guidance()
         if story_first_edit_enabled():
             return f"""
-【创作任务 · 故事完整优先，时长由情节决定】
+【创作任务 · 故事完整优先】
+{duration_line}
 {story_first_editor_brief()}
 
 {hook_narrative_arc_block()}
@@ -222,9 +227,11 @@ def human_impact_script_brief(*, body_sec: float = 50.0) -> str:
 hook_summary 六句式：①叙事线 ②开场高能 ③霸气立势 ④反转 ⑤尾钩 ⑥闭环。
 """.strip()
     except ImportError:
-        pass
+        duration_line = f"参考约 {body_sec:.0f}s"
+    else:
+        duration_line = ai_script_duration_guidance()
     return f"""
-【你的创作任务 · 闭环完整优先（参考约 {body_sec:.0f}s，可更长）】
+【你的创作任务 · 闭环完整优先（{duration_line}）】
 你是本集剪辑导演（全品类短剧）。结合「结构地图 + 对白表 + 画面/音效轴」剪出一条**流畅、霸气、有反转、能引流、能闭环**的简版故事。
 
 {hook_narrative_arc_block()}
@@ -237,16 +244,21 @@ hook_summary 六句式：①叙事线 ②开场高能点 ③霸气立势点 ④�
 def editing_rules_block(*, body_sec: float = 45.0, opening_sec: float = 5.0) -> str:
     """嵌入 AI 剪辑提示的核心规则（与产品口播结构对齐）。"""
     try:
-        from hook_timeline import story_first_edit_enabled
+        from hook_timeline import (
+            ai_script_duration_guidance,
+            story_first_edit_enabled,
+        )
 
+        duration_line = ai_script_duration_guidance()
         if story_first_edit_enabled():
             return f"""
 【核心筛选 · 故事完整优先（已提供完整对白表）】
+{duration_line}
 A 类必留：六步叙事各环节高光 + 因果链必要对白；金句说到 end_sec。
 B 类：大跳剪到反转/尾钩前的承上启下（须有对白）。
 C 类删：无信息过场、重复闲聊、无关回忆。
 0~{opening_sec:.0f}s：系统口播 TTS；其后全为原片 A+B，按剧情顺序，原速 1x。
-body duration_sec = clips 之和，**勿为凑 {body_sec:.0f}s 删情节**。
+body duration_sec = clips 之和；超上限须删 C 类/压缩 B，**禁止**为凑秒数删 A 类/反转/尾钩。
 """.strip()
     except ImportError:
         pass
@@ -263,7 +275,7 @@ C 类（优先删）：重复空镜、无信息闲聊、拖沓身世回忆、纯
 
 【两步剪辑】
 1) 粗剪：先标红(A)黄(B)删灰(C)，按剧情顺序拼 A，再插少量 B；超时长先缩短 B（如 3s→1s），再删重复情绪/相似角度 A；严禁乱序、严禁拆断单句关键台词。
-2) 精剪：以故事完整与高光为准，可略超 {body_sec:.0f}s；同场景连续高光尽量一镜到底；连贯对话整句保留。
+2) 精剪：以故事完整与高光为准，正片合计须落在时长要求内；同场景连续高光尽量一镜到底；连贯对话整句保留。
 
 【避坑】不凑水时长；不大跨度乱拼；金句必须说完再切；不要为了时长保留 C 类。
 每条 clips.reason 必须以 A| 或 B| 开头并写明类型（如 A|高能打脸：当众碾压）。

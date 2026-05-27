@@ -61,14 +61,33 @@ def golden_open_sec() -> float:
     return _read_seg("HONGGUO_GOLDEN_OPEN_SEC", 3.5, lo=2.5, hi=5.0)
 
 
-def body_main_sec() -> float:
-    try:
-        from edge_tts_narration import dialogue_completeness_enabled
+def ai_body_script_max_sec() -> float:
+    """AI 剪辑脚本（正片 clips 合计）硬上限。"""
+    return _read_seg("HONGGUO_AI_BODY_SCRIPT_MAX_SEC", 65.0, lo=55.0, hi=75.0)
 
-        hi = 58.0 if dialogue_completeness_enabled() else 52.0
-    except ImportError:
-        hi = 52.0
-    return _read_seg("HONGGUO_BODY_MAIN_SEC", 50.0, lo=42.0, hi=hi)
+
+def ai_body_script_optimal_range() -> tuple[float, float]:
+    """AI 剪辑脚本推荐时长区间（秒）。"""
+    lo = _read_seg("HONGGUO_AI_BODY_SCRIPT_OPT_LO", 50.0, lo=40.0, hi=62.0)
+    hi = _read_seg("HONGGUO_AI_BODY_SCRIPT_OPT_HI", 60.0, lo=48.0, hi=65.0)
+    mx = ai_body_script_max_sec()
+    return lo, min(hi, mx)
+
+
+def ai_script_duration_guidance() -> str:
+    lo, hi = ai_body_script_optimal_range()
+    mx = ai_body_script_max_sec()
+    return (
+        f"剪辑脚本（正片 body 的 clips 合计）**不得超过 {mx:.0f} 秒**，"
+        f"**{lo:.0f}–{hi:.0f} 秒为最佳**。"
+    )
+
+
+def body_main_sec() -> float:
+    """正片参考时长（默认取最佳区间中点）。"""
+    lo, hi = ai_body_script_optimal_range()
+    default_mid = (lo + hi) / 2.0
+    return _read_seg("HONGGUO_BODY_MAIN_SEC", default_mid, lo=lo, hi=hi)
 
 
 def freeze_hold_sec() -> float:
@@ -84,6 +103,22 @@ def body_outro_skip_transition() -> bool:
     if v in ("0", "false", "no", "off"):
         return False
     return freeze_hold_sec() <= 0.05
+
+
+def body_tail_fade_sec() -> float:
+    """
+    正片最后一镜末尾淡出（秒）。
+    跳过尾过渡段（BODY_OUTRO_SKIP）时默认仍淡出，避免硬切到片尾口播。
+    """
+    raw = os.getenv("HONGGUO_BODY_TAIL_FADE_SEC", "").strip()
+    if raw:
+        try:
+            return max(0.0, min(2.5, float(raw)))
+        except ValueError:
+            pass
+    if body_outro_skip_transition():
+        return 1.0
+    return 0.0
 
 
 def body_outro_use_fade() -> bool:
@@ -139,10 +174,11 @@ def opening_bgm_path() -> str:
 
 def timeline_summary() -> str:
     """成片合成前的 .env 参考项（故事优先模式下非成片时长标准）。"""
+    opt_lo, opt_hi = ai_body_script_optimal_range()
     story_note = (
-        f"；正片时长由 AI 据对白/情节决定，非卡 {body_main_sec():.0f}s"
+        f"；{ai_script_duration_guidance()}"
         if story_first_edit_enabled()
-        else ""
+        else f"；正片参考 {opt_lo:.0f}–{opt_hi:.0f}s"
     )
     return (
         f"专业60s 模板参考(.env)：黄金口播≤{golden_open_sec():.0f}s + "

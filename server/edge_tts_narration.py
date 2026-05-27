@@ -42,6 +42,8 @@ DEFAULT_PITCH = "+0Hz"
 DEFAULT_ORIGINAL_VOLUME = 1.06
 DEFAULT_DUCK_DURING_NARR = 0.58
 DEFAULT_NARR_VOLUME = 0.92
+# 片头/片尾静态卡、黄金口播（仅 TTS，无原声竞争）
+DEFAULT_CARD_NARR_VOLUME = 1.18
 
 
 def tts_enabled() -> bool:
@@ -311,6 +313,19 @@ def tts_duck_during_narration() -> float:
 
 def tts_narration_volume() -> float:
     return max(0.5, min(1.5, _env_float("HONGGUO_TTS_NARR_VOLUME", DEFAULT_NARR_VOLUME)))
+
+
+def card_narration_volume() -> float:
+    """片头/片尾口播卡与黄金口播 TTS 响度（略高于正片解说，减轻切入正片时原声偏响）。"""
+    return max(
+        0.7,
+        min(1.6, _env_float("HONGGUO_CARD_TTS_VOLUME", DEFAULT_CARD_NARR_VOLUME)),
+    )
+
+
+def body_entry_volume() -> float:
+    """正片首段原声上限（配合淡入，口播结束后切入更柔和）。"""
+    return max(0.7, min(1.0, _env_float("HONGGUO_BODY_ENTRY_VOLUME", 0.94)))
 
 
 def smart_duck_enabled() -> bool:

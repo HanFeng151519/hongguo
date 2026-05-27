@@ -3,6 +3,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from typing import Optional
@@ -67,7 +68,6 @@ from hook_timeline import (
 )
 from platform_compliance import (
     commentary_footer_hint,
-    compliance_brand_name,
     douyin_safe_enabled,
     outro_card_lines,
     splash_subtitle_text,
@@ -240,7 +240,7 @@ def _probe_duration(path: Path) -> float:
 
 
 def _extract_leading_clip(src: Path, dest: Path, seconds: float) -> None:
-    """截取片头若干秒（用于黄金口播入场）。"""
+    """截取片头若干秒（用于黄金口播），并缩放到当前成片画布。"""
     dest.unlink(missing_ok=True)
     dur = max(0.5, float(seconds))
     _run_ffmpeg(
@@ -250,12 +250,51 @@ def _extract_leading_clip(src: Path, dest: Path, seconds: float) -> None:
             str(src),
             "-t",
             f"{dur:.3f}",
+            "-vf",
+            _video_output_fit_filter(),
             "-c:v",
             "libx264",
             "-preset",
             "veryfast",
             "-crf",
-            "20",
+            str(OUTPUT_CRF),
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-movflags",
+            "+faststart",
+            str(dest),
+        ],
+        timeout=120,
+    )
+
+
+def _extract_trailing_clip(src: Path, dest: Path, seconds: float) -> None:
+    """截取片尾若干秒（用于片尾口播），并缩放到当前成片画布。"""
+    dest.unlink(missing_ok=True)
+    dur = max(0.5, float(seconds))
+    total = _probe_duration(src) or dur
+    start = max(0.0, total - dur)
+    _run_ffmpeg(
+        [
+            "-hide_banner",
+            "-ss",
+            f"{start:.3f}",
+            "-i",
+            str(src),
+            "-t",
+            f"{dur:.3f}",
+            "-vf",
+            _video_output_fit_filter(),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            str(OUTPUT_CRF),
+            "-pix_fmt",
+            "yuv420p",
             "-c:a",
             "aac",
             "-movflags",
@@ -464,12 +503,18 @@ def _load_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
     return ImageFont.load_default()
 
 
+def _ui_px(base: float) -> int:
+    from output_canvas import scaled_px
+
+    return scaled_px(base)
+
+
 def _compose_panel_canvas(
     cover_path: Optional[Path],
     *,
     bg_color: tuple[int, int, int] = (12, 8, 10),
 ) -> Image.Image:
-    """1920×1080 横屏画布，全宽放海报/画面。"""
+    """与成片同尺寸画布，全宽放海报/封面。"""
     canvas = Image.new("RGB", (WORK_WIDTH, WORK_HEIGHT), (0, 0, 0))
 
     if cover_path and cover_path.is_file():
@@ -515,9 +560,9 @@ def render_opening_card(path: Path, cover_path: Optional[Path], opening: str) ->
     img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
     draw = ImageDraw.Draw(img)
 
-    font = _load_font(40, bold=True)
-    margin_x = (WORK_WIDTH - PANEL_WIDTH) // 2 + 20
-    max_w = PANEL_WIDTH - 40
+    font = _load_font(_ui_px(40), bold=True)
+    margin_x = (WORK_WIDTH - PANEL_WIDTH) // 2 + _ui_px(20)
+    max_w = PANEL_WIDTH - _ui_px(40)
     lines: list[str] = []
     for para in opening.replace("\r", "").split("\n"):
         para = para.strip()
@@ -525,17 +570,18 @@ def render_opening_card(path: Path, cover_path: Optional[Path], opening: str) ->
             continue
         lines.extend(_wrap_text(draw, para, font, max_w))
     lines = lines[:4]
-    y = WORK_HEIGHT - 30 - len(lines) * 52
+    line_h = _ui_px(52)
+    y = WORK_HEIGHT - _ui_px(30) - len(lines) * line_h
     for line in lines:
         draw.text(
             (margin_x, y),
             line,
             fill=(255, 255, 255),
             font=font,
-            stroke_width=2,
+            stroke_width=max(1, _ui_px(2)),
             stroke_fill=(0, 0, 0),
         )
-        y += 52
+        y += line_h
     img.save(path)
 
 
@@ -581,34 +627,21 @@ def _hongguo_brand_icon_rgba() -> Optional[Image.Image]:
 
 
 def _draw_hongguo_brand_corner(img: Image.Image) -> Image.Image:
-    """左上角：品牌圆角图标 + 白色「红果短剧」。"""
+    """左上角：仅品牌圆角图标（不叠「丰丰漫剧」等字样）。"""
     icon = _hongguo_brand_icon_rgba()
     if icon is None:
         return img
 
-    target_h = _SPLASH_LOGO_ICON_H
+    target_h = _ui_px(_SPLASH_LOGO_ICON_H)
     scale = target_h / icon.size[1]
     target_w = max(1, int(icon.size[0] * scale))
     icon = icon.resize((target_w, target_h), Image.Resampling.LANCZOS)
 
     base = img.convert("RGBA")
-    mx, my = _SPLASH_LOGO_MARGIN_X, _SPLASH_LOGO_MARGIN_Y
-    base.paste(icon, (mx, my), icon)
-
-    draw = ImageDraw.Draw(base)
-    brand_font = _load_font(44, bold=True)
-    brand_label = compliance_brand_name()
-    bbox = draw.textbbox((0, 0), brand_label, font=brand_font)
-    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-    tx = mx + target_w + 18 - bbox[0]
-    ty = my + (target_h - th) // 2 - bbox[1]
-    draw.text(
-        (tx, ty),
-        compliance_brand_name(),
-        fill=(255, 255, 255, 255),
-        font=brand_font,
-        stroke_width=2,
-        stroke_fill=(30, 30, 30),
+    base.paste(
+        icon,
+        (_ui_px(_SPLASH_LOGO_MARGIN_X), _ui_px(_SPLASH_LOGO_MARGIN_Y)),
+        icon,
     )
     return base.convert("RGB")
 
@@ -626,8 +659,8 @@ def _format_splash_title(keyword: str) -> str:
 def _splash_subtitle_font_size(title_size: int) -> int:
     """副标题比关键词小两号，且不低于 SPLASH_SUBTITLE_FONT_MIN。"""
     return max(
-        SPLASH_SUBTITLE_FONT_MIN,
-        title_size - 2 * SPLASH_FONT_GRADE_PX,
+        _ui_px(SPLASH_SUBTITLE_FONT_MIN),
+        title_size - 2 * _ui_px(SPLASH_FONT_GRADE_PX),
     )
 
 
@@ -643,21 +676,26 @@ def splash_font_sizes_from_env() -> tuple[Optional[int], Optional[int]]:
     raw_s = os.getenv("HONGGUO_SPLASH_SUBTITLE_FONT", "").strip()
     if raw_t:
         try:
-            title = _clamp_splash_font(int(raw_t), min_px=48, max_px=220)
+            title = _clamp_splash_font(
+                _ui_px(int(raw_t)), min_px=_ui_px(48), max_px=_ui_px(220)
+            )
         except ValueError:
             pass
     if raw_s:
         try:
-            subtitle = _clamp_splash_font(int(raw_s), min_px=32, max_px=180)
+            subtitle = _clamp_splash_font(
+                _ui_px(int(raw_s)), min_px=_ui_px(32), max_px=_ui_px(180)
+            )
         except ValueError:
             pass
     return title, subtitle
 
 
 def _auto_fit_splash_fonts(draw: ImageDraw.ImageDraw, title: str) -> tuple[int, int]:
-    max_w = WORK_WIDTH - 100
-    size = SPLASH_TITLE_FONT_START
-    while size > SPLASH_TITLE_FONT_MIN:
+    max_w = WORK_WIDTH - _ui_px(100)
+    size = _ui_px(SPLASH_TITLE_FONT_START)
+    title_min = _ui_px(SPLASH_TITLE_FONT_MIN)
+    while size > title_min:
         title_font = _load_font(size, bold=True)
         sub_size = _splash_subtitle_font_size(size)
         sub_font = _load_font(sub_size, bold=False)
@@ -691,9 +729,13 @@ def render_keyword_splash_card(
         subtitle_font_px = env_s
 
     if title_font_px is not None:
-        size = _clamp_splash_font(title_font_px, min_px=48, max_px=220)
+        size = _clamp_splash_font(
+            _ui_px(title_font_px), min_px=_ui_px(48), max_px=_ui_px(220)
+        )
         if subtitle_font_px is not None:
-            sub_size = _clamp_splash_font(subtitle_font_px, min_px=32, max_px=180)
+            sub_size = _clamp_splash_font(
+                _ui_px(subtitle_font_px), min_px=_ui_px(32), max_px=_ui_px(180)
+            )
         else:
             sub_size = _splash_subtitle_font_size(size)
     else:
@@ -702,9 +744,9 @@ def render_keyword_splash_card(
     title_font = _load_font(size, bold=True)
     sub_font = _load_font(sub_size, bold=False)
     badge_size = _clamp_splash_font(
-        max(SPLASH_BADGE_FONT_MIN, int(sub_size * 0.85)),
-        min_px=SPLASH_BADGE_FONT_MIN,
-        max_px=120,
+        max(_ui_px(SPLASH_BADGE_FONT_MIN), int(sub_size * 0.85)),
+        min_px=_ui_px(SPLASH_BADGE_FONT_MIN),
+        max_px=_ui_px(120),
     )
     badge_font = _load_font(badge_size, bold=True) if badge else None
 
@@ -720,8 +762,8 @@ def render_keyword_splash_card(
     )
     bw, bh = bbox[2] - bbox[0], bbox[3] - bbox[1]
 
-    title_sub_gap = max(36, int(size * 0.22))
-    badge_gap = max(28, int(sub_size * 0.35)) if badge else 0
+    title_sub_gap = max(_ui_px(36), int(size * 0.22))
+    badge_gap = max(_ui_px(28), int(sub_size * 0.35)) if badge else 0
     block_h = th + title_sub_gap + sh + (badge_gap + bh if badge else 0)
     y0 = (WORK_HEIGHT - block_h) // 2
 
@@ -781,12 +823,13 @@ def render_commentary_card(
 
     img = Image.new("RGB", (WORK_WIDTH, WORK_HEIGHT), (18, 12, 16))
     draw = ImageDraw.Draw(img)
-    draw.rectangle((0, 0, WORK_WIDTH, 8), fill=(255, 77, 79))
+    draw.rectangle((0, 0, WORK_WIDTH, _ui_px(8)), fill=(255, 77, 79))
 
-    title_font = _load_font(56, bold=True)
-    sub_font = _load_font(36, bold=False)
-    max_w = WORK_WIDTH - 160
-    y = (WORK_HEIGHT - len(lines) * 72) // 2
+    title_font = _load_font(_ui_px(56), bold=True)
+    sub_font = _load_font(_ui_px(36), bold=False)
+    max_w = WORK_WIDTH - _ui_px(160)
+    line_step = _ui_px(72)
+    y = (WORK_HEIGHT - len(lines) * line_step) // 2
     for i, line in enumerate(lines):
         font = title_font if i == 0 else sub_font
         wrapped = _wrap_text(draw, line, font, max_w)[:2]
@@ -799,16 +842,16 @@ def render_commentary_card(
                 fill=(255, 255, 255),
                 font=font,
             )
-            y += 72
+            y += line_step
 
     if not minimal:
         hint = commentary_footer_hint(drama_title)
-        hint_font = _load_font(32, bold=False)
+        hint_font = _load_font(_ui_px(32), bold=False)
         hbox = draw.textbbox((0, 0), hint, font=hint_font)
         draw.text(
             (
                 (WORK_WIDTH - (hbox[2] - hbox[0])) // 2 - hbox[0],
-                WORK_HEIGHT - 90 - hbox[1],
+                WORK_HEIGHT - _ui_px(90) - hbox[1],
             ),
             hint,
             fill=(255, 180, 120),
@@ -828,8 +871,8 @@ def render_outro_card(
     draw = ImageDraw.Draw(img)
     full = (cta_line or "").strip()
     if full:
-        font = _load_font(64, bold=True)
-        box = draw.textbbox((0, 0), full, font=font, stroke_width=3)
+        font = _load_font(_ui_px(64), bold=True)
+        box = draw.textbbox((0, 0), full, font=font, stroke_width=max(1, _ui_px(3)))
         tw = box[2] - box[0]
         draw.text(
             (
@@ -839,7 +882,7 @@ def render_outro_card(
             full,
             fill=(255, 255, 255),
             font=font,
-            stroke_width=3,
+            stroke_width=max(1, _ui_px(3)),
             stroke_fill=(0, 0, 0),
         )
         img.save(path)
@@ -847,11 +890,11 @@ def render_outro_card(
 
     kw = (keyword or "短剧").strip()[:16]
     line1, line2 = outro_card_lines(kw)
-    f1 = _load_font(48, bold=True)
-    f2 = _load_font(56, bold=True)
+    f1 = _load_font(_ui_px(48), bold=True)
+    f2 = _load_font(_ui_px(56), bold=True)
     for text, font, y_off, color in (
-        (line1, f1, -60, (220, 220, 220)),
-        (line2, f2, 30, (255, 77, 79)),
+        (line1, f1, -_ui_px(60), (220, 220, 220)),
+        (line2, f2, _ui_px(30), (255, 77, 79)),
     ):
         box = draw.textbbox((0, 0), text, font=font)
         tw = box[2] - box[0]
@@ -883,7 +926,7 @@ def _body_effects_for_clip(
 
 
 def _video_output_fit_filter() -> str:
-    """异比例素材缩放并居中 pad 到 1920×1080 横屏。"""
+    """异比例素材缩放并居中 pad 到当前成片画布。"""
     w, h = WORK_WIDTH, WORK_HEIGHT
     return (
         f"scale={w}:{h}:force_original_aspect_ratio=decrease:flags=lanczos,"
@@ -1111,7 +1154,7 @@ def _clip_with_plan(
 
 
 def _ensure_output_aspect(segment: Path, label: str = "") -> None:
-    """横屏/异比例素材统一为 1920×1080（16:9）。"""
+    """异比例素材统一为当前成片画布（横屏 16:9 或竖屏 9:16）。"""
     w, h = _probe_video_size(segment)
     if w == WORK_WIDTH and h == WORK_HEIGHT:
         return
@@ -1420,6 +1463,52 @@ def _process_body_clip(
     _ensure_output_aspect(dest, label)
 
 
+async def _prefetch_fq_koc_for_planning(
+    client: httpx.AsyncClient,
+    *,
+    series_id: str,
+    episode_item_ids: list[str],
+    episode_labels: list[str],
+    drama_title: str,
+    work_dir: Path,
+) -> None:
+    """分镜/ASR 前把缺失集拉到 public/materials/fq_koc 缓存（避免「无本地 MP4」）。"""
+    missing: list[tuple[int, str]] = []
+    for index, item_id in enumerate(episode_item_ids, start=1):
+        if not find_local_material(series_id, item_id):
+            missing.append((index, item_id))
+    if not missing:
+        return
+    if not fq_koc_configured():
+        logger.warning(
+            "分镜前缺少 %d 集本地 MP4，且未配置推广中心 Cookie/直链，"
+            "AI 将用占位时长、无法按台词选段",
+            len(missing),
+        )
+        return
+    logger.info("分镜前预拉 %d 集素材到本地缓存…", len(missing))
+    dest_dir = work_dir / "prefetch_koc"
+    for index, item_id in missing:
+        label = (
+            episode_labels[index - 1]
+            if index - 1 < len(episode_labels)
+            else f"第{index}集"
+        )
+        try:
+            await fetch_fq_koc_episode(
+                client,
+                book_id=series_id,
+                item_id=item_id,
+                drama_title=drama_title,
+                dest_dir=dest_dir,
+            )
+            mat = find_local_material(series_id, item_id)
+            if mat:
+                logger.info("%s 已缓存 → %s", label, mat.name)
+        except Exception as exc:
+            logger.warning("%s 预拉失败（分镜可能无对白轴）: %s", label, exc)
+
+
 async def _download_episode_segment_from_fq_koc(
     client: httpx.AsyncClient,
     dest: Path,
@@ -1442,6 +1531,21 @@ async def _download_episode_segment_from_fq_koc(
         dest_dir=work_dir / "fq_koc",
     )
     local = Path(meta["local_path"])
+    sw, sh = _probe_video_size(local)
+    if sw > 0 and sh > 0:
+        from output_canvas import maybe_upgrade_canvas_from_source
+
+        if maybe_upgrade_canvas_from_source(sw, sh):
+            from output_canvas import sync_hook_generator_globals
+
+            global WORK_WIDTH, WORK_HEIGHT, ASPECT_LABEL, PANEL_WIDTH
+            spec = sync_hook_generator_globals(sys.modules[__name__])
+            WORK_WIDTH, WORK_HEIGHT, ASPECT_LABEL, PANEL_WIDTH = (
+                spec.width,
+                spec.height,
+                spec.label,
+                spec.width,
+            )
     clip_seconds = seconds
     from_local = meta.get("source") == "fq_koc_local"
     _clip_with_plan(
@@ -1839,6 +1943,9 @@ async def generate_hook_video(
         raise ValueError("请至少选择一集")
     if len(episode_item_ids) > MAX_EPISODES:
         raise ValueError(f"最多选择 {MAX_EPISODES} 集")
+    splash_keyword_required = (keyword or "").strip()
+    if not splash_keyword_required:
+        raise ValueError("请填写片头关键词（片头 1 秒标题卡《关键词》）")
 
     work = Path(tempfile.mkdtemp(prefix="hongguo_hook_"))
     tts_note = ""
@@ -1846,11 +1953,33 @@ async def generate_hook_video(
         tts_note = f"，TTS={pick_voice_for_episode(series_id)}"
     body_seconds_total = 0.0
     episode_labels_pre: list[str] = []
-    episode_durations_pre: list[float] = []
     for index, item_id in enumerate(episode_item_ids, start=1):
         episode_labels_pre.append(
             (episode_titles or {}).get(item_id) or f"第{index}集"
         )
+    if use_fq_koc_material and use_ai_edit:
+        await _prefetch_fq_koc_for_planning(
+            client,
+            series_id=series_id,
+            episode_item_ids=episode_item_ids,
+            episode_labels=episode_labels_pre,
+            drama_title=drama_title,
+            work_dir=work,
+        )
+    from output_canvas import (
+        activate_canvas,
+        resolve_canvas_for_hook,
+        sync_hook_generator_globals,
+    )
+
+    global WORK_WIDTH, WORK_HEIGHT, ASPECT_LABEL, PANEL_WIDTH
+    _canvas = resolve_canvas_for_hook(
+        series_id, episode_item_ids, probe_fn=_probe_video_size
+    )
+    activate_canvas(_canvas)
+    _canvas = sync_hook_generator_globals(sys.modules[__name__])
+    episode_durations_pre: list[float] = []
+    for index, item_id in enumerate(episode_item_ids, start=1):
         dur_local = local_material_duration(series_id, item_id)
         if dur_local <= 1:
             mat = find_local_material(series_id, item_id)
@@ -1915,10 +2044,23 @@ async def generate_hook_video(
                 total_cues,
             )
         elif use_ai_edit:
-            logger.warning(
-                "未得到对白时间轴：请 pip install -r server/requirements-asr.txt "
-                "并确认 HONGGUO_ASR_ENABLED=1"
-            )
+            if not any(
+                find_local_material(series_id, iid) for iid in episode_item_ids
+            ):
+                logger.warning(
+                    "未得到对白时间轴：本地无 MP4（推广中心下载失败或未配置本集直链），"
+                    "AI 无法按台词选段；请检查 Cookie/msToken 或 "
+                    "HONGGUO_FQ_KOC_DIRECT_MP4_URL + DIRECT_ITEM_ID/BOOK_ID"
+                )
+            elif not asr_enabled():
+                logger.warning(
+                    "未得到对白时间轴：HONGGUO_ASR_ENABLED=0，已关闭 ASR"
+                )
+            else:
+                logger.warning(
+                    "未得到对白时间轴：请 pip install -r server/requirements-asr.txt "
+                    "（faster-whisper），或确认片源含硬字幕"
+                )
         if episode_visual_profiles:
             total_moments = sum(len(v) for v in episode_visual_profiles.values())
             logger.info(
@@ -2012,7 +2154,7 @@ async def generate_hook_video(
     )
 
     use_pro = pro_60_template_enabled()
-    splash_keyword = (keyword or "").strip() or drama_title.strip()
+    splash_keyword = splash_keyword_required
     promo_keyword = splash_keyword or edit_plan.outro_keyword
     fixed_opening = fixed_opening_text()
     if use_pro:
@@ -2064,6 +2206,9 @@ async def generate_hook_video(
             logger.info(budget_note)
     originality_seed = f"{series_id}:{splash_keyword}:{promo_keyword}"
 
+    from keep_awake import start_keep_awake, stop_keep_awake
+
+    awake_guard = start_keep_awake()
     try:
         segments: list[Path] = []
         intro_seconds = 0.0
@@ -2173,39 +2318,21 @@ async def generate_hook_video(
             logger.info("对白双版本：将同时导出压缩版与完整对白版")
 
         outro_norm_pro: Optional[Path] = None
-        outro_dur_pro = 0.0
+        outro_dur_pro = outro_cta_sec()
         narr_voice_pro = resolve_voice(
             os.getenv("HONGGUO_TTS_VOICE", "").strip()
             or pick_voice_for_episode(originality_seed)
         )
-        if use_pro:
-            outro_line = fixed_outro_line()
-            outro_img = work / "99_outro_cta.png"
-            outro_mp4 = work / "99_outro_cta_raw.mp4"
-            outro_norm_pro = work / "99_outro_cta.mp4"
-            render_outro_card(outro_img, "", cta_line=outro_line)
-            outro_dur_pro = outro_cta_sec()
-            if tts_enabled() and edge_tts_available():
-                from edge_tts_narration import opening_card_duration_for_text
+        if use_pro and tts_enabled() and edge_tts_available():
+            from edge_tts_narration import opening_card_duration_for_text
 
-                _, outro_dur_pro = opening_card_duration_for_text(
-                    outro_line,
-                    work,
-                    voice=narr_voice_pro,
-                    cache_dir=TTS_CACHE_DIR,
-                )
-                outro_dur_pro = max(outro_cta_sec(), min(6.0, outro_dur_pro))
-            _card_to_video(
-                outro_img,
-                outro_mp4,
-                outro_dur_pro,
-                ken_burns=False,
-                narration_text=outro_line,
-                work_dir=work,
-                narration_voice=narr_voice_pro,
+            _, outro_dur_pro = opening_card_duration_for_text(
+                fixed_outro_line(),
+                work,
+                voice=narr_voice_pro,
+                cache_dir=TTS_CACHE_DIR,
             )
-            _normalize_segment(outro_mp4, outro_norm_pro, seconds=outro_dur_pro)
-            outro_mp4.unlink(missing_ok=True)
+            outro_dur_pro = max(outro_cta_sec(), min(6.0, outro_dur_pro))
 
         primary_output: Optional[Path] = None
 
@@ -2301,7 +2428,10 @@ async def generate_hook_video(
                 body_paths.append(clip_path)
                 if use_pro and index == 1 and golden_src is None:
                     golden_src = work / f"00_golden_src{file_tag}.mp4"
-                    _extract_leading_clip(clip_path, golden_src, golden_open_sec())
+                    golden_from = find_local_material(series_id, item_id) or clip_path
+                    _extract_leading_clip(
+                        golden_from, golden_src, golden_open_sec()
+                    )
 
             if use_pro:
                 from hook_pro_render import (
@@ -2323,6 +2453,12 @@ async def generate_hook_video(
                     )
                     pro_segments.append(golden_final)
                     intro_seconds = _probe_duration(golden_final) or golden_open_sec()
+                    logger.info(
+                        "片头口播（正片实拍）%.1fs → %dx%d",
+                        intro_seconds,
+                        WORK_WIDTH,
+                        WORK_HEIGHT,
+                    )
                     if body_paths:
                         golden_dur = intro_seconds
                         trimmed = work / f"01_body_nogolden{file_tag}.mp4"
@@ -2347,6 +2483,12 @@ async def generate_hook_video(
                     )
                     pro_segments.append(golden_final)
                     intro_seconds = _probe_duration(golden_final) or golden_open_sec()
+                    logger.info(
+                        "片头口播（正片实拍）%.1fs → %dx%d",
+                        intro_seconds,
+                        WORK_WIDTH,
+                        WORK_HEIGHT,
+                    )
                     golden_dur = intro_seconds
                     trimmed = work / f"01_body_nogolden{file_tag}.mp4"
                     _trim_leading_clip(body_paths[0], trimmed, golden_dur)
@@ -2357,11 +2499,47 @@ async def generate_hook_video(
                     )
 
                 pro_segments.extend(body_paths)
+
+                if body_paths:
+                    from hook_pro_render import enhance_outro_voiceover_clip
+
+                    outro_line = fixed_outro_line()
+                    outro_tail_take = max(
+                        outro_cta_sec(),
+                        outro_dur_pro,
+                        golden_open_sec(),
+                    )
+                    outro_src = work / f"99_outro_src{file_tag}.mp4"
+                    outro_norm_pro = work / f"99_outro_cta{file_tag}.mp4"
+                    outro_from = (
+                        find_local_material(series_id, episode_item_ids[-1])
+                        or body_paths[-1]
+                    )
+                    _extract_trailing_clip(outro_from, outro_src, outro_tail_take)
+                    enhance_outro_voiceover_clip(
+                        outro_src,
+                        outro_text=outro_line,
+                        work_dir=work,
+                        voice=narr_voice_pro,
+                        dest=outro_norm_pro,
+                    )
+                    outro_src.unlink(missing_ok=True)
+                    outro_dur_pro = (
+                        _probe_duration(outro_norm_pro) or outro_dur_pro
+                    )
+                    logger.info(
+                        "片尾口播（正片末段实拍）%.1fs → %dx%d",
+                        outro_dur_pro,
+                        WORK_WIDTH,
+                        WORK_HEIGHT,
+                    )
+
                 freeze_mp4 = work / f"98_fadeout{file_tag}.mp4"
                 from hook_duration_budget import hook_target_min_sec
                 from hook_timeline import (
                     body_outro_skip_transition,
                     body_outro_use_fade,
+                    body_tail_fade_sec,
                     freeze_hold_sec,
                 )
 
@@ -2394,7 +2572,17 @@ async def generate_hook_video(
                 ):
                     fade_dur = min(3.0, fade_dur + (min_total - projected))
                 if skip_tail:
-                    logger.info("正片尾跳过黑场/淡出，直接接片尾口播")
+                    tail_fade = body_tail_fade_sec()
+                    if tail_fade > 0.05 and body_paths:
+                        from hook_pro_render import apply_tail_fade_inplace
+
+                        apply_tail_fade_inplace(
+                            body_paths[-1],
+                            work,
+                            fade_sec=tail_fade,
+                        )
+                    else:
+                        logger.info("正片尾跳过黑场/淡出，直接接片尾口播")
                 else:
                     freeze_src = body_paths[-1] if body_paths else pro_segments[-1]
                     build_freeze_segment(
@@ -2487,6 +2675,14 @@ async def generate_hook_video(
                 )
 
             out_w, out_h = _probe_video_size(output)
+            from output_canvas import warn_if_output_aspect_mismatched_source
+
+            warn_if_output_aspect_mismatched_source(
+                output,
+                series_id,
+                episode_item_ids,
+                probe_fn=_probe_video_size,
+            )
             if out_w != WORK_WIDTH or out_h != WORK_HEIGHT:
                 fixed = work / f"hook_final_169{file_tag}.mp4"
                 _normalize_segment(
@@ -2494,8 +2690,10 @@ async def generate_hook_video(
                 )
                 output.unlink(missing_ok=True)
                 fixed.rename(output)
+                orient = "竖屏" if WORK_HEIGHT > WORK_WIDTH else "横屏"
                 logger.info(
-                    "成片已校正为横屏 %dx%d (%s)",
+                    "成片已校正为%s %dx%d (%s)",
+                    orient,
                     WORK_WIDTH,
                     WORK_HEIGHT,
                     ASPECT_LABEL,
@@ -2509,7 +2707,9 @@ async def generate_hook_video(
 
             if watermark_enabled():
                 wm_path = work / f"hook_watermarked{file_tag}.mp4"
-                if burn_corner_watermark(output, wm_path):
+                if burn_corner_watermark(
+                    output, wm_path, width=WORK_WIDTH, height=WORK_HEIGHT
+                ):
                     output.unlink(missing_ok=True)
                     wm_path.rename(output)
 
@@ -2543,33 +2743,38 @@ async def generate_hook_video(
                     if watermark_enabled()
                     else ""
                 )
+                _orient = "竖屏" if WORK_HEIGHT > WORK_WIDTH else "横屏"
                 warning = (
-                    f"横屏 {WORK_WIDTH}×{WORK_HEIGHT}（{ASPECT_LABEL}），"
+                    f"{_orient} {WORK_WIDTH}×{WORK_HEIGHT}（{ASPECT_LABEL}），"
                     f"{budget_tip}{wm_tip}"
                     f"正片原味（{body_playback_speed():g}x、原声对白、无正片解说条/meme），"
                     f"{light}像素去重"
                     f"{'+抖音合规片头（无站外导流）' if douyin_safe_enabled() else '+片头片尾引导'}。"
                 )
             elif meme_edit_enabled() and edit_plan.edit_style == "meme":
+                _orient = "竖屏" if WORK_HEIGHT > WORK_WIDTH else "横屏"
                 warning = (
-                    f"横屏 {WORK_WIDTH}×{WORK_HEIGHT}（{ASPECT_LABEL}），"
+                    f"{_orient} {WORK_WIDTH}×{WORK_HEIGHT}（{ASPECT_LABEL}），"
                     f"{tts_tip}"
                     "Meme 风剪辑（AI 梗字幕+卡点缩放+1.618倍速+去重解说）。"
                 )
             elif originality_enabled():
+                _orient = "竖屏" if WORK_HEIGHT > WORK_WIDTH else "横屏"
                 warning = (
-                    f"横屏 {WORK_WIDTH}×{WORK_HEIGHT}（{ASPECT_LABEL}），"
+                    f"{_orient} {WORK_WIDTH}×{WORK_HEIGHT}（{ASPECT_LABEL}），"
                     f"{tts_tip}"
                     "已启用抖音去重增强（解说字幕+微调色+片头片尾引导）。"
                 )
             elif tts_enabled() and edge_tts_available():
+                _orient = "竖屏" if WORK_HEIGHT > WORK_WIDTH else "横屏"
                 warning = (
-                    f"横屏 {WORK_WIDTH}×{WORK_HEIGHT}（{ASPECT_LABEL}），"
+                    f"{_orient} {WORK_WIDTH}×{WORK_HEIGHT}（{ASPECT_LABEL}），"
                     f"{tts_tip}正片含 AI 解说配音。"
                 )
             else:
+                _orient = "竖屏" if WORK_HEIGHT > WORK_WIDTH else "横屏"
                 warning = (
-                    f"横屏 {WORK_WIDTH}×{WORK_HEIGHT}（{ASPECT_LABEL}），"
+                    f"{_orient} {WORK_WIDTH}×{WORK_HEIGHT}（{ASPECT_LABEL}），"
                     "正片来自推广中心明文素材（含原声）。"
                 )
         elif body_notes:
@@ -2594,3 +2799,5 @@ async def generate_hook_video(
     except Exception:
         shutil.rmtree(work, ignore_errors=True)
         raise
+    finally:
+        stop_keep_awake(awake_guard)

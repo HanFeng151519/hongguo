@@ -137,10 +137,28 @@ def _app_id() -> str:
 
 
 def _create_url_override() -> str:
-    return (
+    raw = (
         os.getenv("HONGGUO_FQ_KOC_CREATE_URL", "").strip()
         or os.getenv("_HONGGUO_FQ_KOC_CREATE_URL_REQUEST", "").strip()
     )
+    if not raw:
+        return ""
+    try:
+        parsed = urlparse(raw)
+    except Exception:
+        return ""
+    host = (parsed.netloc or "").lower()
+    path = (parsed.path or "").lower()
+    # 仅接受达人中心 batch_download/create 接口 URL。
+    # 若误填了 fanqieopenvod 的 MP4 直链（常见），自动忽略，避免请求走错地址。
+    if "koc.fqopenplatform.com" not in host or CREATE_PATH not in path:
+        logger.warning(
+            "忽略无效 HONGGUO_FQ_KOC_CREATE_URL（应为 batch_download/create 接口，当前 host=%s path=%s）",
+            host or "<empty>",
+            path or "<empty>",
+        )
+        return ""
+    return raw
 
 
 def _apply_tokens_from_url(url: str) -> None:
@@ -491,15 +509,41 @@ def _episode_index_map(book_id: str) -> dict[str, int]:
     return mapping
 
 
+def material_sidecar_stem(book_id: str, item_id: str) -> str:
+    """ASR/画面轴缓存文件名前缀，按剧+集区分，避免「第1集.mp4」串剧。"""
+    bid = (book_id or "").strip()
+    iid = (item_id or "").strip()
+    if bid and iid:
+        return f"{bid}_{iid}"
+    return ""
+
+
+def _allow_shared_title_episode_files() -> bool:
+    v = os.getenv("HONGGUO_ALLOW_SHARED_TITLE_FILES", "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
 def _title_named_episode_paths(book_id: str, item_id: str) -> list[Path]:
-    """匹配手动下载的「第N集.mp4」。"""
-    out: list[Path] = []
+    """匹配「第N集.mp4」：须与当前剧的 {book_id}_{item_id}.mp4 为同一文件，或显式允许共享文件名。"""
     idx = _episode_index_map(book_id).get(item_id)
     if not idx:
-        return out
+        return []
+    standard = _cache_path(book_id, item_id)
     for name in (f"第{idx}集.mp4", f"第{idx:02d}集.mp4", f"第{idx}集.MP4"):
-        out.append(MATERIAL_DIR / name)
-    return out
+        title_path = MATERIAL_DIR / name
+        if not title_path.is_file():
+            continue
+        if standard.is_file():
+            try:
+                if standard.samefile(title_path):
+                    return [title_path]
+            except OSError:
+                pass
+            return []
+        if _allow_shared_title_episode_files():
+            return [title_path]
+        return []
+    return []
 
 
 def link_title_named_materials(book_id: str) -> list[str]:
@@ -533,18 +577,51 @@ def link_title_named_materials(book_id: str) -> list[str]:
 
 
 def _local_material_candidates(book_id: str, item_id: str) -> list[Path]:
+    """优先 {book_id}_{item_id}.mp4，避免误用其它剧的「第N集.mp4」。"""
     extra = os.getenv("HONGGUO_LOCAL_BODY_MP4", "").strip()
-    paths: list[Path] = []
+    paths: list[Path] = [
+        _cache_path(book_id, item_id),
+        MATERIAL_DIR / f"{item_id}.mp4",
+    ]
     if extra:
         paths.append(Path(extra))
-    paths.extend(_title_named_episode_paths(book_id, item_id))
-    paths.extend(
-        [
-            MATERIAL_DIR / f"{book_id}_{item_id}.mp4",
-            MATERIAL_DIR / f"{item_id}.mp4",
-        ]
-    )
+    for tp in _title_named_episode_paths(book_id, item_id):
+        if tp not in paths:
+            paths.append(tp)
     return paths
+
+
+def koc_request_timeout_sec() -> float:
+    """单次请求超时（秒）。默认偏保守，避免前端长时间无响应。"""
+    raw = os.getenv("HONGGUO_FQ_KOC_REQ_TIMEOUT", "").strip()
+    if raw:
+        try:
+            return max(8.0, min(90.0, float(raw)))
+        except ValueError:
+            pass
+    return 20.0
+
+
+def koc_request_attempts() -> int:
+    """单个接口重试次数。"""
+    raw = os.getenv("HONGGUO_FQ_KOC_REQ_ATTEMPTS", "").strip()
+    if raw:
+        try:
+            return max(1, min(5, int(raw)))
+        except ValueError:
+            pass
+    return 2
+
+
+def koc_resolve_deadline_sec() -> float:
+    """解析明文地址的总耗时上限（秒）。超过则快速返回 need_capture。"""
+    raw = os.getenv("HONGGUO_FQ_KOC_RESOLVE_TIMEOUT", "").strip()
+    if raw:
+        try:
+            return max(10.0, min(180.0, float(raw)))
+        except ValueError:
+            pass
+    return 35.0
 
 
 def _probe_local_duration(path: Path) -> float:
@@ -608,9 +685,32 @@ def local_material_decode_ok(path: Path) -> bool:
 def find_local_material(book_id: str, item_id: str) -> Optional[Path]:
     """达人中心浏览器下载的 MP4 可放到 public/materials/fq_koc/ 下复用。"""
     MATERIAL_DIR.mkdir(parents=True, exist_ok=True)
+    standard = _cache_path(book_id, item_id)
     for path in _local_material_candidates(book_id, item_id):
-        if path.is_file() and is_usable_video_file(path):
-            return path
+        if not (path.is_file() and is_usable_video_file(path)):
+            continue
+        if path.name.startswith("第") and "集" in path.name and not standard.is_file():
+            logger.warning(
+                "本地素材 %s 未与当前剧绑定（缺少 %s）；换剧后请覆盖第N集或运行 link-local",
+                path.name,
+                standard.name,
+            )
+        elif path.resolve() != standard.resolve() and standard.is_file():
+            logger.info(
+                "本地素材 book=%s item=%s → %s（标准名 %s）",
+                book_id,
+                item_id,
+                path.name,
+                standard.name,
+            )
+        else:
+            logger.info(
+                "本地素材 book=%s item=%s → %s",
+                book_id,
+                item_id,
+                path.name,
+            )
+        return path
     return None
 
 
@@ -867,14 +967,14 @@ async def create_batch_download(
                     "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
                 }
             resp = None
-            for attempt in range(3):
+            for attempt in range(koc_request_attempts()):
                 if form_body is not None:
                     resp = await client.post(
                         url,
                         params=params or None,
                         data=form_body,
                         headers=headers,
-                        timeout=60.0,
+                        timeout=koc_request_timeout_sec(),
                     )
                 else:
                     resp = await client.post(
@@ -882,7 +982,7 @@ async def create_batch_download(
                         params=params or None,
                         json=json_body,
                         headers=headers,
-                        timeout=60.0,
+                        timeout=koc_request_timeout_sec(),
                     )
                 new_ms = resp.headers.get("x-ms-token") or resp.headers.get(
                     "X-Ms-Token"
@@ -1007,8 +1107,8 @@ async def resolve_download_url(
     return _extract_download_url(create_result)
 
 
-def _direct_mp4_url(item_id: str) -> str:
-    """.env 中配置 CDN 直链时跳过 batch_download API。"""
+def _direct_mp4_url(book_id: str, item_id: str) -> str:
+    """.env 中配置 CDN 直链时跳过 batch_download API（须绑定 book_id / item_id，防换剧串素材）。"""
     req = os.getenv("_HONGGUO_FQ_KOC_DIRECT_MP4_URL_REQUEST", "").strip()
     if req.startswith("http"):
         return req
@@ -1018,8 +1118,17 @@ def _direct_mp4_url(item_id: str) -> str:
     url = os.getenv("HONGGUO_FQ_KOC_DIRECT_MP4_URL", "").strip()
     if not url.startswith("http"):
         return ""
-    bind = os.getenv("HONGGUO_FQ_KOC_DIRECT_ITEM_ID", "").strip()
-    if bind and bind != item_id:
+    bind_item = os.getenv("HONGGUO_FQ_KOC_DIRECT_ITEM_ID", "").strip()
+    bind_book = os.getenv("HONGGUO_FQ_KOC_DIRECT_BOOK_ID", "").strip()
+    if bind_item and bind_item != item_id:
+        return ""
+    if bind_book and bind_book != book_id:
+        return ""
+    if not bind_item:
+        logger.warning(
+            "HONGGUO_FQ_KOC_DIRECT_MP4_URL 未绑定 HONGGUO_FQ_KOC_DIRECT_ITEM_ID，"
+            "已忽略以免换剧误用旧 CDN"
+        )
         return ""
     return url
 
@@ -1048,7 +1157,7 @@ async def resolve_episode_download_url(
             "size": cached.stat().st_size,
         }
 
-    direct = _direct_mp4_url(item_id)
+    direct = _direct_mp4_url(book_id, item_id)
     if direct.startswith("http"):
         return {
             "ok": True,
@@ -1069,8 +1178,9 @@ async def resolve_episode_download_url(
         try:
             if not _ms_token() or not _a_bogus():
                 raise RuntimeError("缺少 msToken/a_bogus")
-            create_result = await create_batch_download(
-                client, book_id=book_id, item_id=item_id
+            create_result = await asyncio.wait_for(
+                create_batch_download(client, book_id=book_id, item_id=item_id),
+                timeout=koc_resolve_deadline_sec(),
             )
             play_url = await resolve_download_url(client, create_result)
             if play_url.startswith("http"):
@@ -1082,8 +1192,8 @@ async def resolve_episode_download_url(
                     "task_id": create_result.get("task_id", ""),
                 }
             last_err = "batch_download 未返回下载地址"
-        except RuntimeError as exc:
-            last_err = str(exc)
+        except (RuntimeError, TimeoutError) as exc:
+            last_err = str(exc) or "解析下载地址超时"
 
         if try_browser:
             from fq_koc_browser import browser_sync_available, sync_koc_auth_via_browser
@@ -1164,7 +1274,7 @@ async def fetch_fq_koc_episode(
             "caption": drama_title,
         }
 
-    direct_url = _direct_mp4_url(item_id)
+    direct_url = _direct_mp4_url(book_id, item_id)
     if direct_url:
         material_path = _cache_path(book_id, item_id)
         if material_path.is_file() and local_material_decode_ok(material_path):

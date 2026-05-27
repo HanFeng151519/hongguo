@@ -70,53 +70,13 @@ function getSplashFontSizes() {
 
 const useAiEditEl = document.getElementById("use-ai-edit");
 const useFqKocEl = document.getElementById("use-fq-koc");
-const useKuaishouEl = document.getElementById("use-kuaishou");
-const kuaishouUrlEl = document.getElementById("kuaishou-url");
-const fqKocUrlEl = document.getElementById("fq-koc-url");
-const fqKocCookieEl = document.getElementById("fq-koc-cookie");
-const fqKocDownloadBodyEl = document.getElementById("fq-koc-download-body");
-const fqKocMp4UrlEl = document.getElementById("fq-koc-mp4-url");
-const fqKocResolveUrlBtn = document.getElementById("fq-koc-resolve-url");
-const fqKocCacheUrlBtn = document.getElementById("fq-koc-cache-url");
 const episodeUrlStatus = new Map();
-const fqKocSyncBtn = document.getElementById("fq-koc-sync-browser");
-const fqKocImportBtn = document.getElementById("fq-koc-import-curl");
 const fqKocImportStatusEl = document.getElementById("fq-koc-import-status");
 const configStatusEl = document.getElementById("config-status");
 
-const KOC_LS_KEY = "hongguo_fq_koc_fields";
+// 防止同一集被并发重复缓存（点击过快/多次触发）。
+const cacheInProgress = new Set();
 
-function loadKocFieldsFromStorage() {
-  try {
-    const raw = localStorage.getItem(KOC_LS_KEY);
-    if (!raw) return;
-    const o = JSON.parse(raw);
-    if (o.create_url && fqKocUrlEl) fqKocUrlEl.value = o.create_url;
-    if (o.cookie && fqKocCookieEl) fqKocCookieEl.value = o.cookie;
-    if (o.download_body && fqKocDownloadBodyEl) fqKocDownloadBodyEl.value = o.download_body;
-    if (o.mp4_url && fqKocMp4UrlEl) fqKocMp4UrlEl.value = o.mp4_url;
-  } catch {
-    /* ignore */
-  }
-}
-
-function saveKocFieldsToStorage() {
-  try {
-    localStorage.setItem(
-      KOC_LS_KEY,
-      JSON.stringify({
-        create_url: (fqKocUrlEl?.value || "").trim(),
-        cookie: (fqKocCookieEl?.value || "").trim(),
-        download_body: (fqKocDownloadBodyEl?.value || "").trim(),
-        mp4_url: (fqKocMp4UrlEl?.value || "").trim(),
-      })
-    );
-  } catch {
-    /* ignore */
-  }
-}
-
-loadKocFieldsFromStorage();
 const episodeStatusEl = document.getElementById("episode-status");
 const episodeGridEl = document.getElementById("episode-grid");
 const btnGenerate = document.getElementById("btn-generate");
@@ -135,10 +95,8 @@ let lastDownloadUrl = "";
 let previewObjectUrl = "";
 
 titleEl.textContent = dramaTitle;
-const DEFAULT_KEYWORD = "这次可摊上事了";
-if (keywordEl) {
-  keywordEl.value = DEFAULT_KEYWORD;
-  keywordEl.placeholder = DEFAULT_KEYWORD;
+if (keywordEl && !keywordEl.value.trim()) {
+  keywordEl.value = "";
 }
 metaEl.textContent = dramaIntro
   ? dramaIntro.slice(0, 120) + (dramaIntro.length > 120 ? "…" : "")
@@ -179,17 +137,12 @@ async function loadServiceConfig(itemId = "") {
         `已自动加载抓包配置（${sess.updated_at || "已保存"}，msToken 请求后会刷新）`
       );
     }
-    const hints = data.fq_koc?.hints || [];
-    if (hints.length) {
-      parts.push(...hints);
-    } else if (data.fq_koc?.ready) {
-      parts.push("推广中心 Cookie 已配置");
-    } else {
-      parts.push(
-        "推广中心 Cookie 未配置：无法下载正片，请在 .env 或上方填写 HONGGUO_FQ_KOC_COOKIE"
-      );
-    }
-    configStatusEl.textContent = parts.join("；");
+    // 极简状态：不展示抓包细节/手动兜底指引（页面已移除相关功能）。
+    const fq = data.fq_koc || {};
+    const auto = fq.auto_sync ? "自动缓存：开" : "自动缓存：关";
+    const ready = fq.ready ? "Cookie：已配置" : "Cookie：未配置";
+    const browser = fq.browser_sync ? "浏览器：可用" : "浏览器：不可用";
+    configStatusEl.textContent = [auto, ready, browser].filter(Boolean).join("；");
   } catch {
     configStatusEl.textContent = "";
   }
@@ -206,7 +159,7 @@ keywordEl?.addEventListener("input", () => {
 
 let splashPreviewTimer = 0;
 function splashPreviewUrl() {
-  const kw = (keywordEl?.value || DEFAULT_KEYWORD).trim() || DEFAULT_KEYWORD;
+  const kw = (keywordEl?.value || "").trim();
   const { splash_title_font, splash_subtitle_font } = getSplashFontSizes();
   const badge = getSplashBadge();
   const q = new URLSearchParams({
@@ -221,6 +174,12 @@ function splashPreviewUrl() {
 
 function refreshSplashPreview() {
   if (!splashPreviewEl) return;
+  const kw = (keywordEl?.value || "").trim();
+  if (!kw) {
+    splashPreviewEl.classList.add("hidden");
+    splashPreviewEl.removeAttribute("src");
+    return;
+  }
   splashPreviewEl.src = splashPreviewUrl();
   splashPreviewEl.classList.remove("hidden");
 }
@@ -245,11 +204,20 @@ splashBadgeEl?.addEventListener("input", () => {
 });
 
 function updateGenerateState() {
-  const ready =
-    seriesId &&
-    selected.size > 0 &&
-    Boolean(keywordEl?.value.trim());
+  const hasKeyword = Boolean(keywordEl?.value.trim());
+  const hasEpisodes = selected.size > 0;
+  const ready = seriesId && hasEpisodes && hasKeyword;
   btnGenerate.disabled = !ready;
+  if (generateHint) {
+    if (!hasKeyword) {
+      generateHint.textContent = "请填写片头关键词（1 秒《关键词》片头）后再生成";
+    } else if (!hasEpisodes) {
+      generateHint.textContent = "请选择至少 1 集";
+    } else {
+      generateHint.textContent =
+        "AI 只留最精彩：片头 → 解说卡 → 多集快切正片（约2分30–3分30）→ 片尾";
+    }
+  }
 }
 
 function escapeHtml(str) {
@@ -423,21 +391,67 @@ function renderEpisodes() {
           : `已选 ${selected.size} 集：AI 只留最精彩，拼成约 2分30–3分30 钩子`;
       if (selected.size === 1) {
         loadServiceConfig(id);
-        resolveEpisodeUrl(id, { quiet: true });
+        // 选中 1 集时尝试自动把该集 CDN MP4 缓存到本地（失败则提示手动/导入）。
+        resolveEpisodeUrl(id, { quiet: false, autoCache: true });
       }
       updateGenerateState();
     });
   });
 }
 
-async function resolveEpisodeUrl(itemId, { quiet = false } = {}) {
+async function cacheEpisodeFromMp4Url(itemId, mp4Url) {
+  if (!seriesId || !itemId) return null;
+  if (!mp4Url || !mp4Url.startsWith("http")) return null;
+  if (episodeUrlStatus.get(itemId) === "local") return null;
+  if (cacheInProgress.has(itemId)) return null;
+
+  cacheInProgress.add(itemId);
+  try {
+    if (fqKocImportStatusEl) {
+      fqKocImportStatusEl.textContent = `正在缓存本集到本地（第 ${itemId} 集…）`;
+    }
+    const res = await fetch("/api/material/fq-koc/cache-url", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        series_id: seriesId,
+        item_id: itemId,
+        mp4_url: mp4Url,
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || data.message || "缓存失败");
+
+    episodeUrlStatus.set(itemId, "local");
+    renderEpisodes();
+    await loadServiceConfig(itemId);
+
+    if (fqKocImportStatusEl) {
+      const mb = data.size ? (data.size / (1024 * 1024)).toFixed(1) : "";
+      fqKocImportStatusEl.textContent = mb
+        ? `已缓存本集：${mb}MB，可直接生成`
+        : "已缓存本集，可直接生成";
+    }
+    return data;
+  } catch (e) {
+    if (fqKocImportStatusEl) {
+      fqKocImportStatusEl.textContent = String(e.message || e);
+    }
+    return null;
+  } finally {
+    cacheInProgress.delete(itemId);
+  }
+}
+
+async function resolveEpisodeUrl(itemId, { quiet = false, autoCache = false } = {}) {
   if (!seriesId || !itemId) return null;
   episodeUrlStatus.set(itemId, "pending");
   renderEpisodes();
   try {
-    const res = await fetch(
-      `/api/material/fq-koc/download-url?series_id=${encodeURIComponent(seriesId)}&item_id=${encodeURIComponent(itemId)}`
-    );
+    let url = `/api/material/fq-koc/download-url?series_id=${encodeURIComponent(seriesId)}&item_id=${encodeURIComponent(itemId)}`;
+    // autoCache 时，为了尽量“浏览器能下载就自动缓存”，允许接口失败后尝试 Playwright 抓取 CDN MP4 地址。
+    if (autoCache) url += `&try_browser=1`;
+    const res = await fetch(url);
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || "解析失败");
     if (data.ok && data.cached) {
@@ -445,20 +459,20 @@ async function resolveEpisodeUrl(itemId, { quiet = false } = {}) {
       if (!quiet && fqKocImportStatusEl) {
         fqKocImportStatusEl.textContent = "本集已有本地缓存，可直接生成";
       }
-      if (data.download_url?.startsWith("http") && fqKocMp4UrlEl) {
-        fqKocMp4UrlEl.value = data.download_url;
-      }
       await loadServiceConfig(itemId);
       renderEpisodes();
       return data;
     }
     if (data.ok && data.download_url) {
       episodeUrlStatus.set(itemId, "url");
-      if (fqKocMp4UrlEl) fqKocMp4UrlEl.value = data.download_url;
       if (!quiet && fqKocImportStatusEl) {
         fqKocImportStatusEl.textContent = `已获取下载地址（${data.source}）`;
       }
       renderEpisodes();
+      if (autoCache) {
+        // 直接把该集 CDN MP4 缓存到本地；后续生成会复用。
+        await cacheEpisodeFromMp4Url(itemId, data.download_url);
+      }
       return data;
     }
     episodeUrlStatus.delete(itemId);
@@ -466,7 +480,7 @@ async function resolveEpisodeUrl(itemId, { quiet = false } = {}) {
     if (!quiet && fqKocImportStatusEl) {
       fqKocImportStatusEl.textContent =
         data.message ||
-        "需在推广中心对该集点「下载」并加载助手脚本，或导入 F12 抓包";
+        "未拿到可用的 MP4 地址，请稍后重试";
     }
     return data;
   } catch (e) {
@@ -478,18 +492,6 @@ async function resolveEpisodeUrl(itemId, { quiet = false } = {}) {
     return null;
   }
 }
-
-fqKocResolveUrlBtn?.addEventListener("click", async () => {
-  const itemId =
-    selected.size === 1 ? [...selected][0] : [...selected][0] || "";
-  if (!itemId) {
-    alert("请先选择一集");
-    return;
-  }
-  fqKocResolveUrlBtn.disabled = true;
-  await resolveEpisodeUrl(itemId, { quiet: false });
-  fqKocResolveUrlBtn.disabled = false;
-});
 
 async function fetchEpisodeList() {
   const urls = [
@@ -519,6 +521,9 @@ async function loadEpisodes() {
     episodeStatusEl.innerHTML = "缺少短剧 ID，请从检索页点击「一键生成」进入";
     return;
   }
+
+  selected.clear();
+  episodeUrlStatus.clear();
 
   episodeStatusEl.textContent = "正在从红果拉取全部分集列表…";
   episodeGridEl.innerHTML = "";
@@ -585,107 +590,16 @@ downloadLink.addEventListener("click", (e) => {
   triggerFileDownload(lastDownloadUrl, `${dramaTitle}_钩子.mp4`);
 });
 
-fqKocCacheUrlBtn?.addEventListener("click", async () => {
-  const mp4Url = (fqKocMp4UrlEl?.value || "").trim();
-  const itemId =
-    selected.size === 1 ? [...selected][0] : [...selected][0] || "";
-  if (!seriesId || !itemId) {
-    alert("请先选择一集");
-    return;
-  }
-  if (!mp4Url.startsWith("http")) {
-    alert("请先粘贴该集 MP4 的 CDN 直链（F12 → 下载请求里的完整 URL）");
-    return;
-  }
-  fqKocCacheUrlBtn.disabled = true;
-  if (fqKocImportStatusEl) fqKocImportStatusEl.textContent = "正在下载并缓存本集…";
-  try {
-    const res = await fetch("/api/material/fq-koc/cache-url", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        series_id: seriesId,
-        item_id: itemId,
-        mp4_url: mp4Url,
-      }),
-    });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || "缓存失败");
-    const mb = ((data.size || 0) / (1024 * 1024)).toFixed(1);
-    if (fqKocImportStatusEl) {
-      fqKocImportStatusEl.textContent = `已缓存 ${mb}MB，可直接点生成`;
-    }
-    await loadServiceConfig(itemId);
-  } catch (e) {
-    if (fqKocImportStatusEl) fqKocImportStatusEl.textContent = String(e.message || e);
-  } finally {
-    fqKocCacheUrlBtn.disabled = false;
-  }
-});
-
-fqKocSyncBtn?.addEventListener("click", async () => {
-  const itemId =
-    selected.size === 1 ? [...selected][0] : [...selected][0] || "";
-  if (!seriesId || !itemId) {
-    alert("请先选择一集，再同步达人中心权限");
-    return;
-  }
-  if (fqKocImportStatusEl) fqKocImportStatusEl.textContent = "正在打开浏览器…";
-  fqKocSyncBtn.disabled = true;
-  try {
-    const res = await fetch("/api/fq-koc/session/sync", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        series_id: seriesId,
-        item_id: itemId,
-        open_browser: true,
-      }),
-    });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || "同步失败");
-    if (fqKocImportStatusEl) {
-      fqKocImportStatusEl.textContent = data.sync?.download_url
-        ? "权限已同步，且已拿到下载地址"
-        : "权限已同步，可重新生成";
-    }
-    await loadServiceConfig(itemId);
-  } catch (e) {
-    if (fqKocImportStatusEl) fqKocImportStatusEl.textContent = String(e.message || e);
-  } finally {
-    fqKocSyncBtn.disabled = false;
-  }
-});
-
-fqKocImportBtn?.addEventListener("click", async () => {
-  const text = window.prompt(
-    "请粘贴 Chrome F12 → Network → batch_download/create → 右键 Copy as cURL 的全文："
-  );
-  if (!text?.trim()) return;
-  if (fqKocImportStatusEl) fqKocImportStatusEl.textContent = "正在导入…";
-  try {
-    const res = await fetch("/api/fq-koc/session/import", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ curl_text: text.trim() }),
-    });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || "导入失败");
-    if (fqKocImportStatusEl) {
-      fqKocImportStatusEl.textContent = data.has_download_body
-        ? "已保存到服务器（含 Payload）"
-        : "已保存 URL/Cookie（建议再抓一次含 Payload 的请求）";
-    }
-    await loadServiceConfig(
-      selected.size === 1 ? [...selected][0] : ""
-    );
-  } catch (e) {
-    if (fqKocImportStatusEl) fqKocImportStatusEl.textContent = String(e.message || e);
-  }
-});
-
 btnGenerate.addEventListener("click", async () => {
   if (btnGenerate.disabled) return;
+
+  const keyword = (keywordEl?.value || "").trim();
+  if (!keyword) {
+    resultPanel.classList.remove("hidden");
+    resultMsg.textContent = "请先填写片头关键词（显示为《关键词》的 1 秒片头）";
+    keywordEl?.focus();
+    return;
+  }
 
   btnGenerate.disabled = true;
   btnGenerate.textContent = "正在生成，请稍候…";
@@ -707,18 +621,12 @@ btnGenerate.addEventListener("click", async () => {
         series_id: seriesId,
         drama_title: dramaTitle,
         cover_url: coverUrl,
-        keyword: (keywordEl?.value || DEFAULT_KEYWORD).trim(),
+        keyword,
         ...getSplashFontSizes(),
         episode_item_ids: Array.from(selected),
         use_ai_edit: Boolean(useAiEditEl?.checked),
         drama_intro: dramaIntro,
         use_fq_koc_material: useFqKocEl ? useFqKocEl.checked !== false : true,
-        fq_koc_create_url: (fqKocUrlEl?.value || "").trim(),
-        fq_koc_cookie: (fqKocCookieEl?.value || "").trim(),
-        fq_koc_download_body: (fqKocDownloadBodyEl?.value || "").trim(),
-        fq_koc_mp4_url: (fqKocMp4UrlEl?.value || "").trim(),
-        use_kuaishou_material: Boolean(useKuaishouEl?.checked),
-        kuaishou_share_url: (kuaishouUrlEl?.value || "").trim(),
       }),
     });
 
@@ -739,8 +647,6 @@ btnGenerate.addEventListener("click", async () => {
       startData.progress || "已提交生成任务，正在后台处理（请勿关闭页面）…";
 
     const data = await pollGenerateJob(startData.job_id);
-
-    saveKocFieldsToStorage();
 
     if (!data.ok || !data.preview_url) {
       throw new Error("服务器未返回预览地址，请重试");

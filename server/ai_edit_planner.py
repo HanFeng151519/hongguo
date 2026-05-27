@@ -106,6 +106,7 @@ MASTER_EDITOR_PERSONA = (
     "你是抖音全品类短剧「每集独立剪辑导演」（都市/甜宠/悬疑/玄幻/虐恋/家庭等均适用）："
     "结合本片对白/画面/音效轴自主构思，产出「流畅、开场高能、霸气叙事、反转、尾钩引流、完整闭环」的 JSON 分镜。"
     "选片优先级：画面动感/情绪张力 > 音效冲击 > 对白金句；禁止套用其他剧/其他集固定模板。"
+    "正片剪辑脚本须控制在 65 秒以内，50–60 秒为最佳。"
 )
 MASTER_EDITOR_REJECT = (
     "严禁 C 类：重复/长空镜/闲聊拖沓/慢日常/回忆注水/片头片尾/无关配角。"
@@ -137,10 +138,16 @@ def _hard_constraints_block(body_sec: float, *, has_visual: bool, has_transcript
         if has_transcript
         else ""
     )
+    try:
+        from hook_timeline import ai_script_duration_guidance
+
+        duration_cap = ai_script_duration_guidance()
+    except ImportError:
+        duration_cap = "正片 clips 合计不超过 65 秒，50–60 秒为最佳。"
     if story_first:
         return f"""
-【硬约束 · 故事完整优先（完整对白表已提供，勿卡秒数）】
-1. body duration_sec == sum(clips[].duration_sec)（±0.5）；时长由情节决定，**禁止**为控时长短句或删 A 类/反转/尾钩。
+【硬约束 · 故事完整优先（完整对白表已提供）】
+1. body duration_sec == sum(clips[].duration_sec)（±0.5）；{duration_cap} **禁止**为控时长短句或删 A 类/反转/尾钩。
 2. {visual_rule}
 3. {tx_rule}
 4. 须覆盖六步叙事各环节；大跳剪标「跳剪」或加 B| 过渡。
@@ -148,7 +155,7 @@ def _hard_constraints_block(body_sec: float, *, has_visual: bool, has_transcript
 """.strip()
     return f"""
 【硬约束 · 输出 JSON 前必须自检，不满足则重新分配 duration】
-1. sum(clips[].duration_sec) == body_segments[].duration_sec（误差 ≤0.5），参考约 {body_sec:.0f}s。
+1. sum(clips[].duration_sec) == body_segments[].duration_sec（误差 ≤0.5）；{duration_cap} 参考约 {body_sec:.0f}s。
 2. {visual_rule}
 3. {tx_rule}
 4. 按源片时间顺序；同场景连续高能尽量合并为较长 clip，减少碎切与空档跳剪。
@@ -161,6 +168,46 @@ def _opening_prompt_block() -> str:
     if ai_editor_autonomy_enabled():
         return creative_editor_autonomy_block()
     return opening_hook_pattern_block()
+
+
+def _clamp_body_segments_to_ai_script_max(segments: list[BodySegmentPlan]) -> None:
+    """专业 60s：多集正片合计超过 AI 上限时按比例缩 clips。"""
+    if not segments:
+        return
+    try:
+        from hook_timeline import ai_body_script_max_sec, pro_60_template_enabled
+    except ImportError:
+        return
+    if not pro_60_template_enabled():
+        return
+    mx = ai_body_script_max_sec()
+    total = sum(s.duration_sec for s in segments)
+    if total <= mx + 0.5:
+        logger.info(
+            "正片按 AI 分镜：%d 集 clips 合计 %.1fs（上限 %.0fs）",
+            len(segments),
+            total,
+            mx,
+        )
+        return
+    ratio = mx / max(total, 0.01)
+    for seg in segments:
+        seg.duration_sec = max(MIN_PROMO_BODY_SEC, seg.duration_sec * ratio)
+        if seg.clips:
+            scale_clips_to_episode_duration(seg.clips, seg.duration_sec)
+            _, seg_total, seg.clips = sync_segment_from_clips(
+                trim_start_sec=seg.trim_start_sec,
+                duration_sec=seg.duration_sec,
+                clips=seg.clips,
+            )
+            seg.duration_sec = seg_total
+    new_total = sum(s.duration_sec for s in segments)
+    logger.warning(
+        "AI 正片合计 %.1fs 超过上限 %.0fs，已缩至 %.1fs",
+        total,
+        mx,
+        new_total,
+    )
 
 
 def _log_ai_clip_duration_check(
@@ -553,6 +600,13 @@ def _normalize_plan(
             max_allowed = max(MIN_PROMO_BODY_SEC, max_source / speed)
             min_body = MIN_MEME_BODY_SEC if meme_edit_enabled() else MIN_PROMO_BODY_SEC
             max_body = MAX_MEME_BODY_SEC if meme_edit_enabled() else MAX_PROMO_BODY_SEC
+            try:
+                from hook_timeline import ai_body_script_max_sec, pro_60_template_enabled
+
+                if pro_60_template_enabled() and not meme_edit_enabled():
+                    max_body = min(max_body, ai_body_script_max_sec())
+            except ImportError:
+                pass
             duration = _clamp(duration, min_body, min(max_body, max_allowed))
             label = str(item.get("label") or "")
             if not label and idx - 1 < len(episode_labels):
@@ -824,11 +878,7 @@ def _normalize_plan(
                     clips=seg.clips,
                 )
                 seg.duration_sec = total
-        logger.info(
-            "正片按 AI 分镜：%d 集 clips 合计 %.1fs（未压至 body_main_sec 配方）",
-            len(segments),
-            sum(s.duration_sec for s in segments),
-        )
+        _clamp_body_segments_to_ai_script_max(segments)
 
     if not fixed_opening_text():
         opening_text = sanitize_promo_copy(opening_text, max_len=60) or opening_text
@@ -914,11 +964,18 @@ def _build_authentic_prompt(
     n = len(episode_labels)
     per = per_episode_target_sec(n) if hook_budget_enabled(n) else 45.0
     try:
-        from hook_timeline import body_main_sec, pro_60_template_enabled, timeline_summary
+        from hook_timeline import (
+            ai_script_duration_guidance,
+            body_main_sec,
+            pro_60_template_enabled,
+            timeline_summary,
+        )
 
         pro_tpl = pro_60_template_enabled()
+        script_duration_line = ai_script_duration_guidance()
     except ImportError:
         pro_tpl = False
+        script_duration_line = "正片 clips 合计不超过 65 秒，50–60 秒为最佳。"
 
     type_hint = drama_type_hint_for_prompt(drama_title, drama_intro)
     if hook_budget_enabled(n):
@@ -938,15 +995,16 @@ def _build_authentic_prompt(
                 duration_rule = (
                     "2. 专业60s：片头黄金口播+片尾 CTA 由系统固定；"
                     "**正片只输出 clips 分镜表**，body duration_sec 必须等于 clips 时长之和（±0.5）。\n"
+                    f"{script_duration_line}\n"
                     f"{abc_block}\n"
                     f"{type_hint}\n"
                     f"每集 clips 约 {clip_n} 段；按你判断写 trim_start_sec/duration_sec，"
-                    "勿为凑满固定秒数压短对白；整条可 55~75s。\n"
+                    "勿为凑满固定秒数压短对白。\n"
                     f"硬切无转场；原速 {speed:g}x；commentary_lines 为空。"
                 )
             else:
                 duration_rule = (
-                    f"2. 专业60秒：{timeline_summary()}；正片精华约 {body_main_sec():.0f}s（5–50s 位）。\n"
+                    f"2. 专业60秒：{timeline_summary()}；{script_duration_line}\n"
                     f"{abc_block}\n"
                     f"{type_hint}\n"
                     f"每集 clips 约 {clip_n} 段（"
@@ -1014,7 +1072,8 @@ def _build_authentic_prompt(
             if story_first_edit_enabled() and has_tx:
                 duration_rule = (
                     "2. **故事完整优先**：从完整对白表+画面轴选出六步叙事所需的全部好情节；"
-                    "body duration_sec = clips 之和（±0.5），时长是结果不是目标。\n"
+                    "body duration_sec = clips 之和（±0.5）。\n"
+                    f"{script_duration_line}\n"
                     f"{type_hint}\n"
                     "禁止为控时长短句/删反转/删尾钩；每条 clip duration 覆盖对白 end_sec。\n"
                     f"{hard_block}"
@@ -1028,9 +1087,10 @@ def _build_authentic_prompt(
                 duration_rule = (
                     "2. 正片以 AI clips 为准：结合画面/音效轴+对白表选点；"
                     "body duration_sec = clips 之和（±0.5）。\n"
+                    f"{script_duration_line}\n"
                     f"{type_hint}\n"
                     f"{autonomy_note} "
-                    "每条 clip duration 须覆盖对白 end_sec；为故事完整可长于模板参考。\n"
+                    "每条 clip duration 须覆盖对白 end_sec。\n"
                     f"{hard_block}"
                 )
         else:
@@ -1042,7 +1102,7 @@ def _build_authentic_prompt(
                 f"{int(early_body_budget_ratio() * 100)}% 内）**，"
                 f"后段仍须冲突/铺垫/悬念（合计约 {min_late_body_sec():.0f}–{max_late_body_sec():.0f}s，"
                 "避免长身世回忆抢戏）；"
-                "**台词必须说完整**（duration 须覆盖对白 end_sec），完整度优先于卡死 60s。\n"
+                "**台词必须说完整**（duration 须覆盖对白 end_sec），并遵守正片时长上限。\n"
                 f"{hard_block}"
             )
     return f"""{MASTER_EDITOR_PERSONA}
@@ -1074,8 +1134,8 @@ def _build_authentic_prompt(
   "body_segments": [
     {{
       "episode_index": 1,
-      "duration_sec": 52,
-      "reason": "须等于 clips.duration_sec 之和（故事完整优先，勿凑固定秒数）",
+      "duration_sec": 55,
+      "reason": "须等于 clips.duration_sec 之和；正片 50–60s 最佳，不超过 65s",
       "clips": [
         {{"trim_start_sec": 0.0, "duration_sec": 10.0, "reason": "A|开场高能 tags=... start_sec=... end_sec=..."}},
         {{"trim_start_sec": 0.0, "duration_sec": 12.0, "reason": "A|霸气叙事/对峙（秒数按本集轴填写）"}},
@@ -1284,10 +1344,14 @@ async def plan_hook_edit(
         try:
             from hook_timeline import story_first_edit_enabled
 
+            from hook_timeline import ai_script_duration_guidance
+
+            duration_cap = ai_script_duration_guidance()
             if story_first_edit_enabled():
                 clip_hint = (
                     " 已提供完整对白表+画面/音效轴："
                     "**故事完整优先**，选出六步叙事所需的全部好情节；"
+                    f"{duration_cap} "
                     "body duration_sec = clips 之和，勿为控时长短句或删反转/尾钩；"
                     "每条 duration 覆盖对白 end_sec；reason 写 tags 与 start_sec/end_sec。"
                 )
@@ -1295,7 +1359,8 @@ async def plan_hook_edit(
                 clip_hint = (
                     f" 已提供画面/音效高能轴"
                     f"{' + 对白表' if has_transcript else ''}：按本集自主选高光与简版叙事，"
-                    f"参考约 {body_pick_sec:.0f}s（可略长保对白完整）；"
+                    f"{duration_cap} "
+                    f"参考约 {body_pick_sec:.0f}s；"
                     "clips.duration_sec 之和 = body duration_sec（±0.5）；"
                     "须覆盖六步叙事：流畅·开场高能·霸气·反转·尾钩·闭环；"
                     "reason 建议标环节并写 tags、start_sec/end_sec。"

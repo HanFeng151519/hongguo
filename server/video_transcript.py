@@ -271,16 +271,38 @@ def transcribe_video_audio(video: Path, work_dir: Path) -> list[TranscriptCue]:
     return []
 
 
-def transcript_cache_path(video: Path) -> Path:
-    return video.parent / f".{video.stem}_transcript.json"
+def transcript_cache_path(
+    video: Path,
+    *,
+    book_id: str = "",
+    item_id: str = "",
+) -> Path:
+    from fq_koc_material import material_sidecar_stem
+
+    stem = material_sidecar_stem(book_id, item_id) or video.stem
+    return video.parent / f".{stem}_transcript.json"
 
 
-def load_transcript_cache(video: Path) -> Optional[list[TranscriptCue]]:
-    path = transcript_cache_path(video)
+def _transcript_cache_ok(
+    raw: dict,
+    *,
+    book_id: str,
+    item_id: str,
+) -> bool:
+    if book_id and raw.get("book_id") and str(raw["book_id"]) != book_id:
+        return False
+    if item_id and raw.get("item_id") and str(raw["item_id"]) != item_id:
+        return False
+    return True
+
+
+def _load_transcript_cache_file(path: Path, *, book_id: str, item_id: str) -> Optional[list[TranscriptCue]]:
     if not path.is_file():
         return None
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(raw, dict) and not _transcript_cache_ok(raw, book_id=book_id, item_id=item_id):
+            return None
         items = raw.get("cues") if isinstance(raw, dict) else raw
         if not isinstance(items, list):
             return None
@@ -298,20 +320,61 @@ def load_transcript_cache(video: Path) -> Optional[list[TranscriptCue]]:
         return None
 
 
-def save_transcript_cache(video: Path, cues: list[TranscriptCue]) -> None:
-    path = transcript_cache_path(video)
-    payload = {
+def load_transcript_cache(
+    video: Path,
+    *,
+    book_id: str = "",
+    item_id: str = "",
+) -> Optional[list[TranscriptCue]]:
+    path = transcript_cache_path(video, book_id=book_id, item_id=item_id)
+    cues = _load_transcript_cache_file(path, book_id=book_id, item_id=item_id)
+    if cues:
+        return cues
+    if book_id and item_id:
+        legacy = video.parent / f".{video.stem}_transcript.json"
+        if legacy != path:
+            cues = _load_transcript_cache_file(legacy, book_id=book_id, item_id=item_id)
+            if cues:
+                save_transcript_cache(video, cues, book_id=book_id, item_id=item_id)
+    return None
+
+
+def save_transcript_cache(
+    video: Path,
+    cues: list[TranscriptCue],
+    *,
+    book_id: str = "",
+    item_id: str = "",
+) -> None:
+    path = transcript_cache_path(video, book_id=book_id, item_id=item_id)
+    payload: dict = {
         "source": video.name,
         "cues": [c.to_dict() for c in cues],
     }
+    if book_id:
+        payload["book_id"] = book_id
+    if item_id:
+        payload["item_id"] = item_id
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=0), encoding="utf-8")
 
 
-def build_transcript_for_video(video: Path, work_dir: Path) -> list[TranscriptCue]:
-    """字幕优先，其次 ASR；结果写入素材旁缓存。"""
-    cached = load_transcript_cache(video)
+def build_transcript_for_video(
+    video: Path,
+    work_dir: Path,
+    *,
+    book_id: str = "",
+    item_id: str = "",
+) -> list[TranscriptCue]:
+    """字幕优先，其次 ASR；结果写入素材旁缓存（按 book_id+item_id 区分）。"""
+    cached = load_transcript_cache(video, book_id=book_id, item_id=item_id)
     if cached:
-        logger.info("使用对白缓存 %d 条：%s", len(cached), video.name)
+        logger.info(
+            "使用对白缓存 %d 条：%s (book=%s item=%s)",
+            len(cached),
+            video.name,
+            book_id or "-",
+            item_id or "-",
+        )
         return cached
 
     cues = _extract_embedded_subtitle(video, work_dir)
@@ -323,7 +386,7 @@ def build_transcript_for_video(video: Path, work_dir: Path) -> list[TranscriptCu
             cues = []
 
     if cues:
-        save_transcript_cache(video, cues)
+        save_transcript_cache(video, cues, book_id=book_id, item_id=item_id)
     return cues
 
 
@@ -342,10 +405,17 @@ def gather_episode_transcripts(
         label = episode_labels[idx - 1] if idx - 1 < len(episode_labels) else f"第{idx}集"
         path = find_local_material(series_id, item_id)
         if not path:
-            logger.info("%s 无本地 MP4，跳过对白抽取", label)
+            logger.info(
+                "%s 无本地 MP4（%s_%s.mp4），跳过对白抽取",
+                label,
+                series_id,
+                item_id,
+            )
             continue
         ep_work = work_dir / f"transcript_ep{idx:02d}"
-        cues = build_transcript_for_video(path, ep_work)
+        cues = build_transcript_for_video(
+            path, ep_work, book_id=series_id, item_id=item_id
+        )
         if cues:
             out[idx] = cues
             logger.info("%s 对白时间轴 %d 条", label, len(cues))

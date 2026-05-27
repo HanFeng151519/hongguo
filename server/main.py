@@ -934,7 +934,12 @@ async def tts_voice_test_batch(
 
 @app.get("/api/generate/splash-preview.png")
 async def splash_preview(
-    keyword: str = Query(default="", description="片头关键词，显示为《关键词》"),
+    keyword: str = Query(
+        ...,
+        min_length=1,
+        max_length=40,
+        description="片头关键词，显示为《关键词》",
+    ),
     title_font: Optional[int] = Query(default=None, ge=48, le=220),
     subtitle_font: Optional[int] = Query(default=None, ge=32, le=180),
     badge: str = Query(default="", max_length=24, description="封面下方文字，如 1-5"),
@@ -946,7 +951,7 @@ async def splash_preview(
         path = Path(td) / "splash.png"
         render_keyword_splash_card(
             path,
-            keyword.strip() or "短剧",
+            keyword.strip(),
             title_font_px=title_font,
             subtitle_font_px=subtitle_font,
             badge_text=badge.strip(),

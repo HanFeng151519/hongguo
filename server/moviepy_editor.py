@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Optional
 
 from edge_tts_narration import (
+    body_entry_volume,
+    card_narration_volume,
     edge_tts_available,
     mix_narration_on_clip,
     pick_voice_for_episode,
@@ -32,9 +34,16 @@ from video_originality import (
 
 logger = logging.getLogger(__name__)
 
-# 与 hook_generator 保持一致，避免循环导入运行时从环境读取
+# 默认横屏；生成任务开始时由 output_canvas.activate_canvas 按源片覆盖
 WORK_WIDTH = int(os.getenv("HONGGUO_OUTPUT_WIDTH", "1920"))
 WORK_HEIGHT = int(os.getenv("HONGGUO_OUTPUT_HEIGHT", "1080"))
+
+
+def output_size() -> tuple[int, int]:
+    return (
+        int(os.getenv("HONGGUO_OUTPUT_WIDTH", str(WORK_WIDTH))),
+        int(os.getenv("HONGGUO_OUTPUT_HEIGHT", str(WORK_HEIGHT))),
+    )
 OUTPUT_FPS = int(os.getenv("HONGGUO_OUTPUT_FPS", "30"))
 OUTPUT_CRF = int(os.getenv("HONGGUO_OUTPUT_CRF", "20"))
 ENCODE_PRESET = os.getenv("HONGGUO_ENCODE_PRESET", "fast")
@@ -124,8 +133,12 @@ def _write_clip(
         clip.close()
 
 
-def letterbox_fit(clip, width: int = WORK_WIDTH, height: int = WORK_HEIGHT):
-    """等比缩小并居中铺黑边（16:9 画布）。"""
+def letterbox_fit(clip, width: int | None = None, height: int | None = None):
+    """等比缩小并居中铺黑边（横屏/竖屏画布由 output_canvas 决定）。"""
+    if width is None or height is None:
+        ow, oh = output_size()
+        width = ow if width is None else width
+        height = oh if height is None else height
     from moviepy import ColorClip, CompositeVideoClip
 
     cw, ch = clip.size
@@ -148,7 +161,45 @@ def letterbox_fit(clip, width: int = WORK_WIDTH, height: int = WORK_HEIGHT):
     ).with_duration(clip.duration)
 
 
-def cover_fit(clip, width: int = WORK_WIDTH, height: int = WORK_HEIGHT, *, seed_str: str = ""):
+def fit_clip_to_canvas(
+    clip,
+    width: int | None = None,
+    height: int | None = None,
+    *,
+    seed_str: str = "voiceover",
+):
+    """口播/正片：与画布同比例时铺满（无黑边），否则 letterbox。"""
+    if width is None or height is None:
+        ow, oh = output_size()
+        width = ow if width is None else width
+        height = oh if height is None else height
+    cw, ch = float(clip.size[0]), float(clip.size[1])
+    if cw <= 1 or ch <= 1:
+        return letterbox_fit(clip, width, height)
+    try:
+        from output_canvas import _use_native_source_size
+
+        native = _use_native_source_size()
+    except ImportError:
+        native = True
+    src_ar = cw / ch
+    dst_ar = width / height
+    if native or abs(src_ar - dst_ar) / max(dst_ar, 0.01) < 0.08:
+        return cover_fit(clip, width, height, seed_str=seed_str)
+    return letterbox_fit(clip, width, height)
+
+
+def cover_fit(
+    clip,
+    width: int | None = None,
+    height: int | None = None,
+    *,
+    seed_str: str = "",
+):
+    if width is None or height is None:
+        ow, oh = output_size()
+        width = ow if width is None else width
+        height = oh if height is None else height
     """等比放大居中裁剪填满画布（去重增强用，减少黑边）。"""
     cw, ch = clip.size
     scale = max(width / cw, height / ch)
@@ -179,13 +230,12 @@ def add_timed_commentary(
     if not cleaned or clip.duration <= 0.5:
         return clip
 
+    ow, oh = output_size()
     layers = [clip]
     slot = clip.duration / len(cleaned)
     for i, line in enumerate(cleaned):
         png = work_dir / f"{prefix}_{i}.png"
-        render_subtitle_overlay_png(
-            png, line, width=WORK_WIDTH, height=WORK_HEIGHT
-        )
+        render_subtitle_overlay_png(png, line, width=ow, height=oh)
         ov = (
             ImageClip(str(png))
             .with_duration(min(slot + 0.02, clip.duration - i * slot))
@@ -193,9 +243,7 @@ def add_timed_commentary(
             .with_position((0, 0))
         )
         layers.append(ov)
-    return CompositeVideoClip(layers, size=(WORK_WIDTH, WORK_HEIGHT)).with_duration(
-        clip.duration
-    )
+    return CompositeVideoClip(layers, size=(ow, oh)).with_duration(clip.duration)
 
 
 def process_body_clip(
@@ -252,10 +300,13 @@ def process_body_clip(
             end = None
         sub = clip.subclipped(trim_start, end)
 
+        ow, oh = output_size()
         if need_originality:
-            sub = cover_fit(sub, WORK_WIDTH, WORK_HEIGHT, seed_str=originality_seed or label)
+            sub = cover_fit(sub, ow, oh, seed_str=originality_seed or label)
         else:
-            sub = letterbox_fit(sub, WORK_WIDTH, WORK_HEIGHT)
+            sub = fit_clip_to_canvas(
+                sub, ow, oh, seed_str=originality_seed or label
+            )
 
         if use_speed:
             sub = sub.with_speed_scaled(speed)
@@ -266,8 +317,16 @@ def process_body_clip(
 
                 effects = []
                 if soft_audio_fade_in:
-                    fade_in = min(0.4, max(0.08, float(sub.duration) * 0.08))
+                    fade_in = min(
+                        0.65,
+                        max(0.12, float(sub.duration) * 0.12),
+                    )
                     effects.append(afx.AudioFadeIn(fade_in))
+                    entry_vol = body_entry_volume()
+                    if entry_vol < 0.999 and sub.audio is not None:
+                        sub = sub.with_audio(
+                            sub.audio.with_volume_scaled(entry_vol)
+                        )
                 if soft_audio_fade_out:
                     fade_out = min(0.35, max(0.12, float(sub.duration) * 0.12))
                     effects.append(afx.AudioFadeOut(fade_out))
@@ -368,8 +427,9 @@ def image_to_video(
     from moviepy import AudioClip, ImageClip
 
     dest.unlink(missing_ok=True)
+    ow, oh = output_size()
     clip = ImageClip(str(image)).with_duration(duration)
-    clip = letterbox_fit(clip, WORK_WIDTH, WORK_HEIGHT)
+    clip = letterbox_fit(clip, ow, oh)
 
     narr = (narration_text or "").strip()
     if narr and work_dir and tts_enabled() and edge_tts_available():
@@ -380,6 +440,7 @@ def image_to_video(
             prefix=f"{dest.stem}_card",
             voice=narration_voice,
             narration_only=True,
+            narr_volume=card_narration_volume(),
         )
     else:
 
@@ -398,13 +459,14 @@ def normalize_video_file(
     *,
     seconds: float = 0.0,
 ) -> None:
-    """统一为 WORK_WIDTH×WORK_HEIGHT H.264。"""
+    """统一为当前成片画布（与 output_canvas / 环境变量一致）。"""
     from moviepy import VideoFileClip
 
+    ow, oh = output_size()
     dest.unlink(missing_ok=True)
     clip = _open_video_clip_safe(src)
     try:
-        fitted = letterbox_fit(clip, WORK_WIDTH, WORK_HEIGHT)
+        fitted = letterbox_fit(clip, ow, oh)
         _write_clip(fitted, dest, preset=ENCODE_PRESET, audio=clip.audio is not None)
     finally:
         clip.close()
@@ -430,6 +492,14 @@ def merge_video_files(
             clips.append(_open_video_clip_safe(p))
         if not clips:
             raise RuntimeError("无片段可拼接")
+        ow, oh = output_size()
+        fitted_clips = []
+        for c in clips:
+            cw, ch = c.size
+            if int(cw) != ow or int(ch) != oh:
+                c = fit_clip_to_canvas(c, ow, oh, seed_str=str(p))
+            fitted_clips.append(c)
+        clips = fitted_clips
         if cf > 0.02 and len(clips) > 1:
             prepared = []
             for i, c in enumerate(clips):
