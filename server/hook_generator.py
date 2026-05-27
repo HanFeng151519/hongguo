@@ -1041,6 +1041,8 @@ def _clip_with_plan(
     commentary_lines: Optional[list[str]] = None,
     originality_seed: str = "",
     work_dir: Optional[Path] = None,
+    book_id: str = "",
+    item_id: str = "",
 ) -> None:
     meme_caps = segment_plan.meme_captions if segment_plan else []
     meme_beats = segment_plan.meme_beats if segment_plan else []
@@ -1071,6 +1073,8 @@ def _clip_with_plan(
             work_dir=work_dir,
             meme_captions=meme_caps,
             meme_beats=meme_beats,
+            book_id=book_id,
+            item_id=item_id,
         )
         return
 
@@ -1105,6 +1109,8 @@ def _clip_with_plan(
                 clip_tail_pad=clip_tail_pad_sec(),
                 soft_audio_fade_out=True,
                 soft_audio_fade_in=(i == 0),
+                book_id=book_id,
+                item_id=item_id,
             )
             return i, part
 
@@ -1214,9 +1220,15 @@ def _process_body_clip(
     clip_tail_pad: Optional[float] = None,
     soft_audio_fade_out: bool = False,
     soft_audio_fade_in: bool = False,
+    book_id: str = "",
+    item_id: str = "",
 ) -> None:
     """裁剪正片；开启去重增强时强制重编码并烧录解说字幕。"""
-    trim_start = max(0.0, float(trim_start_sec or 0))
+    from video_intro_strip import offset_trim_start
+
+    trim_start = offset_trim_start(
+        trim_start_sec, raw, book_id=book_id, item_id=item_id
+    )
     speed = body_playback_speed()
     need_originality = originality_enabled()
     logger.info(
@@ -1558,6 +1570,8 @@ async def _download_episode_segment_from_fq_koc(
         commentary_lines=commentary_lines,
         originality_seed=originality_seed,
         work_dir=work_dir,
+        book_id=series_id,
+        item_id=item_id,
     )
     _ensure_segment_h264(dest, label)
     src = "本地缓存" if from_local else "达人中心"

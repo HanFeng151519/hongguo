@@ -243,6 +243,17 @@ def build_visual_profile(
 ) -> list[VisualMoment]:
     cached = _load_cache(video, book_id=book_id, item_id=item_id)
     if cached:
+        from video_intro_strip import (
+            compliance_intro_strip_enabled,
+            compliance_intro_skip_sec,
+            shift_visual_moments,
+        )
+
+        if compliance_intro_strip_enabled():
+            skip = compliance_intro_skip_sec(
+                video, book_id=book_id, item_id=item_id
+            )
+            cached = shift_visual_moments(cached, skip)
         logger.info(
             "使用画面/音效缓存 %d 段：%s (book=%s item=%s)",
             len(cached),
@@ -335,6 +346,16 @@ def build_visual_profile(
     if merged:
         _save_cache(video, merged, book_id=book_id, item_id=item_id)
         logger.info("画面/音效轴 %d 段：%s", len(merged), video.name)
+
+    from video_intro_strip import (
+        compliance_intro_strip_enabled,
+        compliance_intro_strip_sec,
+        shift_visual_moments,
+    )
+
+    if merged and compliance_intro_strip_enabled():
+        skip = compliance_intro_skip_sec(video, book_id=book_id, item_id=item_id)
+        return shift_visual_moments(merged, skip)
     return merged
 
 

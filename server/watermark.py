@@ -17,7 +17,7 @@ _FFMPEG = os.getenv("FFMPEG", "ffmpeg")
 
 
 def watermark_enabled() -> bool:
-    v = os.getenv("HONGGUO_WATERMARK", "1").strip().lower()
+    v = os.getenv("HONGGUO_WATERMARK", "0").strip().lower()
     return v not in ("0", "false", "no", "off")
 
 

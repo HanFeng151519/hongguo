@@ -31,10 +31,97 @@ KOC_BASE = "https://koc.fqopenplatform.com"
 CREATE_PATH = "/api/platform/content/batch_download/create/v1"
 
 
-def build_koc_book_detail_url(book_id: str, item_id: str) -> str:
+def book_detail_meta_path(book_id: str) -> Path:
+    return MATERIAL_DIR / f"{book_id.strip()}_koc_page.json"
+
+
+def load_book_detail_meta(book_id: str) -> dict[str, str]:
+    """浏览器检索后缓存的 book-detail 查询参数（genre 等）。"""
+    path = book_detail_meta_path(book_id)
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return {}
+        return {
+            str(k): str(v).strip()
+            for k, v in data.items()
+            if v is not None and str(v).strip()
+        }
+    except Exception as exc:
+        logger.debug("读取 %s 失败: %s", path.name, exc)
+        return {}
+
+
+def save_book_detail_meta(book_id: str, meta: dict[str, str]) -> None:
+    bid = (book_id or "").strip()
+    if not bid:
+        return
+    payload = {
+        **{k: str(v).strip() for k, v in meta.items() if v},
+        "book_id": bid,
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    path = book_detail_meta_path(bid)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    genre = payload.get("genre", "")
+    if genre:
+        os.environ[f"HONGGUO_FQ_KOC_GENRE_{bid}"] = genre
+    logger.info("已缓存 book-detail 参数 → %s（genre=%s）", path.name, genre or "—")
+
+
+def parse_book_detail_from_url(url: str) -> dict[str, str]:
+    parsed = urlparse(url)
+    if "book-detail" not in (parsed.path or ""):
+        return {}
+    qs = {k: v[0] for k, v in parse_qs(parsed.query).items()}
+    out: dict[str, str] = {}
+    for key in (
+        "book_id",
+        "genre",
+        "key",
+        "tab_type",
+        "top_tab_genre",
+        "invite_user_share_token",
+    ):
+        if qs.get(key):
+            out[key] = qs[key]
+    return out
+
+
+def _koc_genre_for_book(book_id: str) -> str:
+    """不同剧 genre 不同（如 203/205）；优先浏览器缓存，其次 .env。"""
+    bid = (book_id or "").strip()
+    if bid:
+        cached = load_book_detail_meta(bid).get("genre", "")
+        if cached:
+            return cached
+        specific = os.getenv(f"HONGGUO_FQ_KOC_GENRE_{bid}", "").strip()
+        if specific:
+            return specific
+    return os.getenv("HONGGUO_FQ_KOC_GENRE", "").strip()
+
+
+def koc_content_hub_url() -> str:
+    """推广中心内容库首页（用于浏览器内检索 book_id）。"""
+    invite = os.getenv("HONGGUO_FQ_KOC_INVITE_TOKEN", "").strip()
+    if not invite:
+        raise RuntimeError("未配置 HONGGUO_FQ_KOC_INVITE_TOKEN")
+    q = {
+        "tab_type": os.getenv("HONGGUO_FQ_KOC_TAB_TYPE", "6"),
+        "top_tab_genre": os.getenv("HONGGUO_FQ_KOC_TOP_TAB_GENRE", "-1"),
+        "invite_user_share_token": invite,
+    }
+    return f"{KOC_BASE}/page/member/content?{urlencode(q)}"
+
+
+def build_koc_book_detail_url(book_id: str, item_id: str = "") -> str:
     """
-    机构/邀请链接下的分集详情页（Playwright 须打开此页才能完成认证与下载）。
-    参数与浏览器地址栏一致：invite_user_share_token、key、genre、book_id、item_id。
+    机构/邀请链接下的 book-detail 页（与浏览器地址栏一致）。
+    示例：.../book-detail?tab_type=6&top_tab_genre=-1&invite_user_share_token=...&book_id=...&genre=203
+    key / item_id 仅在实际需要时附带（勿硬编码 205_0，换剧易错）。
     """
     invite = os.getenv("HONGGUO_FQ_KOC_INVITE_TOKEN", "").strip()
     if not invite:
@@ -42,15 +129,22 @@ def build_koc_book_detail_url(book_id: str, item_id: str) -> str:
             "未配置 HONGGUO_FQ_KOC_INVITE_TOKEN：从推广中心 book-detail 地址栏复制 "
             "invite_user_share_token=... 整段值到 .env"
         )
-    q = {
+    q: dict[str, str] = {
         "tab_type": os.getenv("HONGGUO_FQ_KOC_TAB_TYPE", "6"),
         "top_tab_genre": os.getenv("HONGGUO_FQ_KOC_TOP_TAB_GENRE", "-1"),
         "invite_user_share_token": invite,
-        "key": os.getenv("HONGGUO_FQ_KOC_DETAIL_KEY", "205_0"),
-        "genre": os.getenv("HONGGUO_FQ_KOC_GENRE", "205"),
         "book_id": book_id,
-        "item_id": item_id,
     }
+    meta = load_book_detail_meta(book_id)
+    genre = meta.get("genre") or _koc_genre_for_book(book_id)
+    if genre:
+        q["genre"] = genre
+    detail_key = meta.get("key") or os.getenv("HONGGUO_FQ_KOC_DETAIL_KEY", "").strip()
+    if detail_key:
+        q["key"] = detail_key
+    iid = (item_id or "").strip()
+    if iid:
+        q["item_id"] = iid
     return f"{KOC_BASE}/page/member/content/book-detail?{urlencode(q)}"
 
 

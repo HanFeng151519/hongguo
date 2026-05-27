@@ -14,7 +14,13 @@ from urllib.parse import parse_qs, urlparse
 
 import httpx
 
-from fq_koc_material import build_koc_book_detail_url
+from fq_koc_material import (
+    build_koc_book_detail_url,
+    koc_content_hub_url,
+    load_book_detail_meta,
+    parse_book_detail_from_url,
+    save_book_detail_meta,
+)
 from fq_koc_session import save_koc_session
 from material_common import apply_fanqie_vod_query, download_http_video
 
@@ -275,6 +281,105 @@ async def _launch_context(p: Any, *, headless: bool) -> Any:
     ) from last_err
 
 
+async def _discover_book_detail_url(
+    page: Any,
+    book_id: str,
+    item_id: str,
+    *,
+    timeout_ms: int = 60_000,
+) -> str:
+    """
+    在推广中心内容库检索 book_id，从真实跳转后的地址栏解析 genre 等参数并缓存。
+    避免手填 HONGGUO_FQ_KOC_GENRE。
+    """
+    bid = (book_id or "").strip()
+    if not bid:
+        return build_koc_book_detail_url(book_id, item_id)
+
+    cached = load_book_detail_meta(bid)
+    if cached.get("genre"):
+        url = build_koc_book_detail_url(bid, item_id)
+        logger.info(
+            "复用已检索的 book-detail（genre=%s）",
+            cached.get("genre"),
+        )
+        return url
+
+    hub = koc_content_hub_url()
+    logger.info("浏览器检索 book_id=%s：打开内容库", bid)
+    await page.goto(hub, wait_until="domcontentloaded", timeout=timeout_ms)
+    await page.wait_for_timeout(2500)
+
+    navigated = await page.evaluate(
+        """async (bookId) => {
+          const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+          const hasBook = (href) =>
+            href && (href.includes('book_id=' + bookId) || href.includes(bookId));
+          for (const a of document.querySelectorAll('a[href]')) {
+            const href = a.getAttribute('href') || '';
+            if (hasBook(href)) {
+              a.click();
+              return { via: 'link', href: a.href || href };
+            }
+          }
+          const inputs = [...document.querySelectorAll('input')].filter((el) => {
+            const hint =
+              (el.placeholder || '') +
+              (el.getAttribute('aria-label') || '') +
+              (el.className || '');
+            return /搜|查询|关键|search/i.test(hint) || el.type === 'search';
+          });
+          if (inputs.length) {
+            const inp = inputs[0];
+            inp.focus();
+            inp.value = bookId;
+            inp.dispatchEvent(new Event('input', { bubbles: true }));
+            inp.dispatchEvent(
+              new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })
+            );
+            await sleep(2500);
+            for (const a of document.querySelectorAll('a[href]')) {
+              const href = a.getAttribute('href') || '';
+              if (hasBook(href)) {
+                a.click();
+                return { via: 'search', href: a.href || href };
+              }
+            }
+          }
+          return { via: 'none' };
+        }""",
+        bid,
+    )
+    logger.info("内容库检索结果: %s", navigated.get("via"))
+
+    if navigated.get("via") != "none":
+        try:
+            await page.wait_for_url("**/book-detail**", timeout=15_000)
+        except Exception:
+            await page.wait_for_timeout(3000)
+    else:
+        seed = build_koc_book_detail_url(bid, item_id)
+        logger.info("内容库未命中链接，尝试直达: %s", seed[:100])
+        await page.goto(seed, wait_until="domcontentloaded", timeout=timeout_ms)
+        await page.wait_for_timeout(3000)
+
+    final = page.url or ""
+    if "book-detail" in final and bid in final:
+        meta = parse_book_detail_from_url(final)
+        if meta.get("genre"):
+            save_book_detail_meta(bid, meta)
+        if item_id and f"item_id={item_id}" not in final:
+            target = build_koc_book_detail_url(bid, item_id)
+            if target != final:
+                await page.goto(
+                    target, wait_until="domcontentloaded", timeout=timeout_ms
+                )
+            return target
+        return final
+
+    return build_koc_book_detail_url(bid, item_id)
+
+
 async def _run_in_browser(
     book_id: str,
     item_id: str,
@@ -302,8 +407,6 @@ async def _run_in_browser(
     captured: dict[str, Any] = {}
     vod_urls: list[str] = []
     evaluate_result: dict[str, Any] = {}
-    page_url = build_koc_book_detail_url(book_id, item_id)
-    logger.info("Playwright 打开: %s", page_url)
 
     PROFILE_DIR.mkdir(parents=True, exist_ok=True)
     context = await _acquire_persistent_context(want_headless=want_headless)
@@ -319,6 +422,14 @@ async def _run_in_browser(
                 )
             except Exception as exc:
                 logger.debug("inject env cookie: %s", exc)
+
+        page_url = await _discover_book_detail_url(
+            page,
+            book_id,
+            item_id,
+            timeout_ms=timeout_sec * 1000,
+        )
+        logger.info("Playwright 使用 book-detail: %s", page_url)
 
         def on_request(request: Any) -> None:
             if (
@@ -344,12 +455,16 @@ async def _run_in_browser(
         page.on("request", on_request)
         page.on("response", on_response)
 
-        await page.goto(
-            page_url,
-            wait_until="domcontentloaded",
-            timeout=timeout_sec * 1000,
-        )
-        await page.wait_for_timeout(2500)
+        if "book-detail" not in (page.url or "") or book_id not in (page.url or ""):
+            await page.goto(
+                page_url,
+                wait_until="domcontentloaded",
+                timeout=timeout_sec * 1000,
+            )
+            await page.wait_for_timeout(2500)
+            meta = parse_book_detail_from_url(page.url or "")
+            if meta.get("genre"):
+                save_book_detail_meta(book_id, meta)
 
         cookies = await context.cookies(KOC_BASE)
         names = {c.get("name") for c in cookies}

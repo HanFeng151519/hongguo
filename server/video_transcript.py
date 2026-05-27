@@ -329,6 +329,17 @@ def load_transcript_cache(
     path = transcript_cache_path(video, book_id=book_id, item_id=item_id)
     cues = _load_transcript_cache_file(path, book_id=book_id, item_id=item_id)
     if cues:
+        from video_intro_strip import (
+            compliance_intro_strip_enabled,
+            compliance_intro_skip_sec,
+            shift_transcript_cues,
+        )
+
+        if compliance_intro_strip_enabled():
+            skip = compliance_intro_skip_sec(
+                video, book_id=book_id, item_id=item_id
+            )
+            cues = shift_transcript_cues(cues, skip)
         return cues
     if book_id and item_id:
         legacy = video.parent / f".{video.stem}_transcript.json"
@@ -387,6 +398,16 @@ def build_transcript_for_video(
 
     if cues:
         save_transcript_cache(video, cues, book_id=book_id, item_id=item_id)
+
+    from video_intro_strip import (
+        compliance_intro_strip_enabled,
+        compliance_intro_skip_sec,
+        shift_transcript_cues,
+    )
+
+    if cues and compliance_intro_strip_enabled():
+        skip = compliance_intro_skip_sec(video, book_id=book_id, item_id=item_id)
+        return shift_transcript_cues(cues, skip)
     return cues
 
 
