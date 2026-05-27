@@ -239,13 +239,18 @@ def _probe_duration(path: Path) -> float:
     return _parse_ffmpeg_duration(proc.stderr or "")
 
 
-def _extract_leading_clip(src: Path, dest: Path, seconds: float) -> None:
+def _extract_leading_clip(
+    src: Path, dest: Path, seconds: float, *, start_sec: float = 0.0
+) -> None:
     """截取片头若干秒（用于黄金口播），并缩放到当前成片画布。"""
     dest.unlink(missing_ok=True)
     dur = max(0.5, float(seconds))
-    _run_ffmpeg(
+    start = max(0.0, float(start_sec or 0))
+    args = ["-hide_banner"]
+    if start > 0.05:
+        args.extend(["-ss", f"{start:.3f}"])
+    args.extend(
         [
-            "-hide_banner",
             "-i",
             str(src),
             "-t",
@@ -265,9 +270,9 @@ def _extract_leading_clip(src: Path, dest: Path, seconds: float) -> None:
             "-movflags",
             "+faststart",
             str(dest),
-        ],
-        timeout=120,
+        ]
     )
+    _run_ffmpeg(args, timeout=120)
 
 
 def _extract_trailing_clip(src: Path, dest: Path, seconds: float) -> None:
@@ -2443,8 +2448,16 @@ async def generate_hook_video(
                 if use_pro and index == 1 and golden_src is None:
                     golden_src = work / f"00_golden_src{file_tag}.mp4"
                     golden_from = find_local_material(series_id, item_id) or clip_path
+                    from video_intro_strip import compliance_intro_skip_sec
+
+                    intro_skip = compliance_intro_skip_sec(
+                        golden_from, book_id=series_id, item_id=item_id
+                    )
                     _extract_leading_clip(
-                        golden_from, golden_src, golden_open_sec()
+                        golden_from,
+                        golden_src,
+                        golden_open_sec(),
+                        start_sec=intro_skip,
                     )
 
             if use_pro:
@@ -2484,8 +2497,20 @@ async def generate_hook_video(
                         )
                 elif body_paths:
                     golden_src = work / f"00_golden_src{file_tag}.mp4"
+                    from video_intro_strip import compliance_intro_skip_sec
+
+                    first_iid = episode_item_ids[0] if episode_item_ids else ""
+                    golden_from = (
+                        find_local_material(series_id, first_iid) or body_paths[0]
+                    )
+                    intro_skip = compliance_intro_skip_sec(
+                        golden_from, book_id=series_id, item_id=first_iid
+                    )
                     _extract_leading_clip(
-                        body_paths[0], golden_src, golden_open_sec()
+                        golden_from,
+                        golden_src,
+                        golden_open_sec(),
+                        start_sec=intro_skip,
                     )
                     golden_final = work / f"00_golden{file_tag}.mp4"
                     enhance_golden_opening_clip(

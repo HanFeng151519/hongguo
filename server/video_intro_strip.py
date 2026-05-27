@@ -58,6 +58,8 @@ def _load_intro_cache(
             return None
         if item_id and str(data.get("item_id") or "") not in ("", item_id):
             return None
+        if int(data.get("version") or 1) < 3:
+            return None
         return max(0.0, float(data.get("skip_sec") or 0))
     except Exception as exc:
         logger.debug("读取 intro_skip 缓存失败: %s", exc)
@@ -77,6 +79,7 @@ def _save_intro_cache(
     payload = {
         "skip_sec": round(max(0.0, skip_sec), 3),
         "method": method,
+        "version": 3,
         "book_id": book_id,
         "item_id": item_id,
         "video": video.name,
@@ -121,7 +124,8 @@ def _scene_cuts_in_head(video: Path, max_sec: float) -> list[float]:
 def detect_compliance_intro_skip_sec(video: Path) -> float:
     """
     检测片头备案卡结束位置（秒）。无备案画面时返回 0。
-    策略：片头 12s 内首个有效切镜点（常见为「网络视听」卡后进入正片）。
+    网络视听等备案卡通常只在片头 2~4 秒，取该短窗口内最后一刀切镜，
+    避免误跳到十几秒后正片。
     """
     if not video.is_file():
         return 0.0
@@ -134,10 +138,10 @@ def detect_compliance_intro_skip_sec(video: Path) -> float:
             pass
 
     try:
-        max_scan = float(os.getenv("HONGGUO_COMPLIANCE_INTRO_MAX_SEC", "12"))
+        max_scan = float(os.getenv("HONGGUO_COMPLIANCE_INTRO_MAX_SEC", "8"))
     except ValueError:
-        max_scan = 12.0
-    max_scan = max(4.0, min(20.0, max_scan))
+        max_scan = 8.0
+    max_scan = max(4.0, min(12.0, max_scan))
 
     try:
         min_cut = float(os.getenv("HONGGUO_COMPLIANCE_INTRO_MIN_CUT_SEC", "2.0"))
@@ -145,25 +149,38 @@ def detect_compliance_intro_skip_sec(video: Path) -> float:
         min_cut = 2.0
 
     try:
-        max_cut = float(os.getenv("HONGGUO_COMPLIANCE_INTRO_MAX_CUT_SEC", "10.0"))
+        max_cut = float(os.getenv("HONGGUO_COMPLIANCE_INTRO_MAX_CUT_SEC", "5.0"))
     except ValueError:
-        max_cut = 10.0
+        max_cut = 5.0
+
+    try:
+        pad = float(os.getenv("HONGGUO_COMPLIANCE_INTRO_PAD_SEC", "0.15"))
+    except ValueError:
+        pad = 0.15
 
     cuts = _scene_cuts_in_head(video, max_scan)
     if not cuts:
         return 0.0
 
-    # 双卡备案：先短切再正片切（如 0.8s + 4.2s）
-    if len(cuts) >= 2 and cuts[0] < min_cut and min_cut <= cuts[1] <= max_cut:
-        return cuts[1]
+    # 备案区：片头前几秒内的切镜（常见 0.9 → 1.7 → 2.9 → 3.6）
+    early = [t for t in cuts if t <= max_cut]
+    if early:
+        in_window = [t for t in early if min_cut <= t <= max_cut]
+        if in_window:
+            skip = max(in_window) + pad
+        else:
+            # 仅很早的切镜：取首个 >= min_cut
+            for t in early:
+                if t >= min_cut:
+                    skip = t + pad
+                    break
+            else:
+                skip = 0.0
+        return min(max(skip, 0.0), max_cut + pad)
 
     for t in cuts:
         if min_cut <= t <= max_cut:
-            return t
-
-    # 仅一处很早的切镜：可能是单卡备案结束
-    if len(cuts) == 1 and min_cut * 0.75 <= cuts[0] <= max_cut:
-        return cuts[0]
+            return min(t + pad, max_cut + pad)
 
     return 0.0
 
