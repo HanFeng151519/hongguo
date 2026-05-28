@@ -1169,6 +1169,28 @@ async def _resolve_direct_url_from_content_list(
     return ""
 
 
+async def _resolve_via_hongguo_public_api(
+    client: httpx.AsyncClient,
+    *,
+    book_id: str,
+    item_id: str,
+) -> str:
+    """
+    最后兜底：走公开红果 video 接口拿直链（不依赖达人中心 Cookie / Playwright）。
+    """
+    try:
+        from hongguo_api import fetch_episode_video_info
+
+        info = await fetch_episode_video_info(client, item_id, book_id=book_id)
+        url = str(info.get("url") or "").strip()
+        if _looks_like_media_url(url):
+            logger.info("公开 video 接口命中直链: item=%s", item_id)
+            return url
+    except Exception as exc:
+        logger.debug("公开 video 接口兜底失败 item=%s: %s", item_id, exc)
+    return ""
+
+
 async def create_batch_download(
     client: httpx.AsyncClient,
     *,
@@ -1423,8 +1445,13 @@ async def resolve_episode_download_url(
                     "task_id": create_result.get("task_id", ""),
                 }
             last_err = "batch_download 未返回下载地址"
-        except (RuntimeError, TimeoutError) as exc:
+        except asyncio.CancelledError as exc:
+            # DNS 抖动/请求取消时不应直接 500，继续走后续兜底。
+            last_err = f"请求被取消: {exc or 'cancelled'}"
+        except (RuntimeError, TimeoutError, asyncio.TimeoutError) as exc:
             last_err = str(exc) or "解析下载地址超时"
+        except Exception as exc:
+            last_err = str(exc) or "解析下载地址失败"
 
         if try_browser:
             from fq_koc_browser import browser_sync_available, sync_koc_auth_via_browser
@@ -1447,7 +1474,42 @@ async def resolve_episode_download_url(
                         }
                 except Exception as exc:
                     last_err = str(exc)
-        break
+        # 再尝试下一轮（可用新的 msToken/a_bogus）
+
+    # 兜底 1：内容列表直接抽取媒体直链（不依赖页面自动化）。
+    try:
+        list_url = await _resolve_direct_url_from_content_list(
+            client,
+            book_id=book_id,
+            item_id=item_id,
+            drama_title="",
+        )
+        if list_url.startswith("http"):
+            return {
+                "ok": True,
+                "source": "list_fallback",
+                "download_url": apply_fanqie_vod_query(list_url),
+                "cached": False,
+            }
+    except Exception as exc:
+        if not last_err:
+            last_err = f"内容列表兜底失败: {exc}"
+
+    # 兜底 2：公开 video 接口（无需 .env 配置）。
+    try:
+        api_url = await _resolve_via_hongguo_public_api(
+            client, book_id=book_id, item_id=item_id
+        )
+        if api_url.startswith("http"):
+            return {
+                "ok": True,
+                "source": "public_api",
+                "download_url": apply_fanqie_vod_query(api_url),
+                "cached": False,
+            }
+    except Exception as exc:
+        if not last_err:
+            last_err = f"公开接口兜底失败: {exc}"
 
     return {
         "ok": False,
@@ -1532,19 +1594,27 @@ async def fetch_fq_koc_episode(
             "caption": drama_title,
         }
 
+    play_url = ""
+    last_api_errors: list[str] = []
+    no_navigate_mode = (
+        os.getenv("HONGGUO_FQ_KOC_NO_NAVIGATE", "1").strip().lower()
+        not in ("0", "false", "no", "off")
+    )
+
     create_url = _create_url_override()
     _apply_tokens_from_url(create_url)
 
-    if not _cookie_effective():
-        raise_material_download_error(book_id=book_id, item_id=item_id)
-
-    # 用户开启自动浏览器同步时，直接走浏览器下载，避免无效的
-    # batch_download/create 多轮重试刷日志。
-    from fq_koc_browser import _auto_sync_enabled, auto_download_episode_to_cache, browser_sync_available
+    # 1) 恢复为 Playwright 优先（你实测这条链路命中率更高）。
+    from fq_koc_browser import (
+        KocLoginRequiredError,
+        _auto_sync_enabled,
+        auto_download_episode_to_cache,
+        browser_sync_available,
+    )
 
     if _auto_sync_enabled() and browser_sync_available():
         cache = _cache_path(book_id, item_id)
-        logger.info("AUTO_SYNC=1：跳过 batch_download 轮询，直接浏览器自动下载: %s", item_id)
+        logger.info("AUTO_SYNC=1：优先浏览器自动下载: %s", item_id)
         try:
             await auto_download_episode_to_cache(
                 client,
@@ -1563,52 +1633,42 @@ async def fetch_fq_koc_episode(
                 "source": "fq_koc_auto",
                 "caption": drama_title,
             }
+        except KocLoginRequiredError:
+            # 登录未完成时必须立即终止，不再继续任何下载兜底。
+            raise
         except RuntimeError as exc:
-            logger.info("浏览器自动下载跳过/失败，回退后续流程: %s", exc)
+            last_api_errors.append(f"浏览器链路失败: {exc}")
 
-    if not _ms_token() or not _a_bogus():
-        raise_material_download_error(book_id=book_id, item_id=item_id)
-
+    # 2) 再走达人 batch 接口。
     create_result: dict[str, Any] | None = None
-    play_url = ""
-    last_api_errors: list[str] = []
+    if _cookie_effective() and _ms_token() and _a_bogus():
+        try:
+            create_result = await asyncio.wait_for(
+                create_batch_download(client, book_id=book_id, item_id=item_id),
+                timeout=koc_resolve_deadline_sec(),
+            )
+            play_url = await resolve_download_url(client, create_result)
+        except asyncio.CancelledError as exc:
+            last_api_errors.append(f"batch 请求被取消: {exc or 'cancelled'}")
+        except (RuntimeError, TimeoutError, asyncio.TimeoutError) as exc:
+            last_api_errors.append(str(exc))
+        except Exception as exc:
+            last_api_errors.append(f"batch 请求异常: {exc}")
 
-    try:
-        create_result = await create_batch_download(
-            client, book_id=book_id, item_id=item_id
+    # 3) 再走接口直链兜底（内容列表 / 公开接口）。
+    # 无跳转模式下，禁止再走接口兜底：否则会触发大量 404/403，且与当前页登录态不一致。
+    if not play_url.startswith("http") and no_navigate_mode:
+        raise_material_download_error(
+            book_id=book_id,
+            item_id=item_id,
+            api_errors=last_api_errors
+            + [
+                "当前为无跳转模式：仅复用当前达人页面检索下载；"
+                "未命中下载按钮时不再走公开接口兜底。请先在页面确认该集可下载后重试。"
+            ],
         )
-        play_url = await resolve_download_url(client, create_result)
-    except RuntimeError as exc:
-        last_api_errors.append(str(exc))
 
-    if not play_url.startswith("http"):
-        from fq_koc_browser import _auto_sync_enabled, auto_download_episode_to_cache, browser_sync_available
-
-        if browser_sync_available() and _auto_sync_enabled():
-            cache = _cache_path(book_id, item_id)
-            logger.info("在线签名失败，改用浏览器自动下载: %s", item_id)
-            try:
-                await auto_download_episode_to_cache(
-                    client,
-                    book_id=book_id,
-                    item_id=item_id,
-                    cache_path=cache,
-                    drama_title=drama_title,
-                )
-                validate_local_material(book_id, item_id)
-                _link_or_copy(cache, dest)
-                return {
-                    "local_path": dest,
-                    "play_url": "",
-                    "book_id": book_id,
-                    "item_id": item_id,
-                    "source": "fq_koc_auto",
-                    "caption": drama_title,
-                }
-            except RuntimeError as exc:
-                last_api_errors.append(str(exc))
-
-        # 页面法失败后，尝试纯接口直链兜底（不依赖 Playwright 页面搜索）。
+    if not play_url.startswith("http") and _cookie_effective():
         try:
             list_url = await _resolve_direct_url_from_content_list(
                 client,
@@ -1618,9 +1678,19 @@ async def fetch_fq_koc_episode(
             )
             if list_url.startswith("http"):
                 play_url = apply_fanqie_vod_query(list_url)
-                logger.info("已切换到内容列表直链下载兜底: %s", item_id)
+                logger.info("命中内容列表直链兜底: %s", item_id)
         except Exception as exc:
-            last_api_errors.append(f"内容列表直链兜底失败: {exc}")
+            last_api_errors.append(f"内容列表直链失败: {exc}")
+    if not play_url.startswith("http"):
+        try:
+            api_url = await _resolve_via_hongguo_public_api(
+                client, book_id=book_id, item_id=item_id
+            )
+            if api_url.startswith("http"):
+                play_url = apply_fanqie_vod_query(api_url)
+                logger.info("命中公开接口直链兜底: %s", item_id)
+        except Exception as exc:
+            last_api_errors.append(f"公开接口直链失败: {exc}")
 
     if not play_url.startswith("http"):
         raise_material_download_error(

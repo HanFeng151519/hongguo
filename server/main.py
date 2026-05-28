@@ -7,6 +7,7 @@ from env_loader import load_project_env
 from fq_koc_browser import (
     browser_sync_available,
     close_koc_browser,
+    ensure_koc_login,
     sync_koc_auth_via_browser,
 )
 from fq_koc_session import import_curl_text, load_koc_session, session_public_status
@@ -65,6 +66,7 @@ from ai_edit_schemas import AiEditPlanRequest
 from schemas import (
     FqKocCaptureRequest,
     FqKocCacheUrlRequest,
+    FqKocLoginRequest,
     FqKocMaterialRequest,
     FqKocSessionImportRequest,
     FqKocSessionSyncRequest,
@@ -423,6 +425,8 @@ async def _run_generate_job(job_id: str, body: GenerateHookRequest) -> None:
         download_body=body.fq_koc_download_body.strip(),
         direct_mp4_url=body.fq_koc_mp4_url.strip(),
     )
+    prev_session_mutable = os.getenv("HONGGUO_FQ_KOC_SESSION_MUTABLE", "")
+    os.environ["HONGGUO_FQ_KOC_SESSION_MUTABLE"] = "0"
     try:
         ep_count = len(body.episode_item_ids)
         await _set_job(
@@ -498,6 +502,10 @@ async def _run_generate_job(job_id: str, body: GenerateHookRequest) -> None:
             error=str(exc),
         )
     finally:
+        if prev_session_mutable:
+            os.environ["HONGGUO_FQ_KOC_SESSION_MUTABLE"] = prev_session_mutable
+        else:
+            os.environ.pop("HONGGUO_FQ_KOC_SESSION_MUTABLE", None)
         clear_request_koc_options()
 
 
@@ -610,6 +618,31 @@ async def sync_fq_koc_session(body: FqKocSessionSyncRequest):
     }
 
 
+@app.post("/api/fq-koc/session/login-only")
+async def login_only_fq_koc_session(body: FqKocLoginRequest):
+    """
+    仅打开浏览器等待用户完成达人中心登录，不触发下载动作。
+    """
+    book_id = body.series_id.strip() or os.getenv(
+        "HONGGUO_FQ_KOC_SYNC_BOOK_ID", ""
+    ).strip()
+    if not book_id:
+        raise HTTPException(
+            status_code=400,
+            detail="请先选择剧集，或在 .env 配置 HONGGUO_FQ_KOC_SYNC_BOOK_ID",
+        )
+    try:
+        result = await ensure_koc_login(book_id, timeout_sec=body.timeout_sec)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "ok": True,
+        "message": "已登录",
+        "session": session_public_status(),
+        "sync": result,
+    }
+
+
 @app.get("/api/material/fq-koc/download-url")
 async def get_fq_koc_download_url(
     series_id: str = Query(..., min_length=1),
@@ -626,9 +659,22 @@ async def get_fq_koc_download_url(
                 try_browser=try_browser,
             )
     except RuntimeError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        # 前端按业务文案处理，不抛 4xx 打断自动兜底。
+        return {"ok": False, "source": "need_capture", "message": str(exc)}
     except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        return {"ok": False, "source": "need_capture", "message": f"网络请求失败: {exc}"}
+    except asyncio.TimeoutError:
+        return {
+            "ok": False,
+            "source": "need_capture",
+            "message": "解析下载地址超时，已自动跳过并继续后续兜底流程",
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "source": "need_capture",
+            "message": f"解析下载地址异常: {exc}",
+        }
     return {"ok": result.get("ok", False), **result}
 
 

@@ -49,8 +49,9 @@
     </section>
 
     <section class="generate-actions">
+      <button type="button" id="btn-login-sync" class="btn-ghost">仅登录同步（先完成登录）</button>
       <button type="button" id="btn-generate" class="btn-primary" disabled>生成钩子视频</button>
-      <p id="generate-hint" class="generate-hint">两段高光直剪：每集取 2 段最高光，成片约 30 秒，原声 1x（默认不调用 AI）。</p>
+      <p id="generate-hint" class="generate-hint">请先点击“仅登录同步”并在浏览器完成登录，再点生成。两段高光直剪：每集取 2 段最高光，成片约 30 秒，原声 1x（默认不调用 AI）。</p>
     </section>
 
     <section id="result-panel" class="result-panel hidden">
@@ -65,6 +66,6 @@
       <a id="download-link" class="btn-download hidden" href="#" download="hook_video.mp4">下载推广视频（MP4）</a>
     </section>
   </div>
-  <script src="/generate.js?v=38"></script>
+  <script src="/generate.js?v=39"></script>
 </body>
 </html>

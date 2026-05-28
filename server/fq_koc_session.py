@@ -29,9 +29,18 @@ _ENV_MAP = {
     "download_body": "HONGGUO_FQ_KOC_DOWNLOAD_BODY",
 }
 
+_RUNTIME_SESSION: dict[str, Any] = {}
+
 
 def _auto_persist_env() -> bool:
-    v = os.getenv("HONGGUO_FQ_KOC_AUTO_PERSIST", "1").strip().lower()
+    # 默认不再频繁写 .env，避免运行期 token 抖动导致会话不稳定。
+    v = os.getenv("HONGGUO_FQ_KOC_AUTO_PERSIST", "0").strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
+def _session_mutable() -> bool:
+    """生成期间可临时冻结会话 token，避免把已登录态抖掉。"""
+    v = os.getenv("HONGGUO_FQ_KOC_SESSION_MUTABLE", "1").strip().lower()
     return v not in ("0", "false", "no", "off")
 
 
@@ -66,10 +75,20 @@ def apply_session_to_env(data: dict[str, Any]) -> None:
         )
 
 
+def _runtime_session_get() -> dict[str, Any]:
+    return dict(_RUNTIME_SESSION) if _RUNTIME_SESSION else {}
+
+
+def _runtime_session_set(data: dict[str, Any]) -> None:
+    _RUNTIME_SESSION.clear()
+    _RUNTIME_SESSION.update(data)
+
+
 def load_koc_session() -> dict[str, Any]:
     """启动时加载上次抓包（覆盖 .env 中同名字段）。"""
     data = _read_session_file()
     if data:
+        _runtime_session_set(data)
         apply_session_to_env(data)
         logger.info(
             "已加载达人中心会话 %s（更新于 %s）",
@@ -80,7 +99,7 @@ def load_koc_session() -> dict[str, Any]:
 
 
 def session_public_status() -> dict[str, Any]:
-    data = _read_session_file()
+    data = _runtime_session_get() or _read_session_file()
     return {
         "loaded": bool(data),
         "path": str(SESSION_PATH.relative_to(SESSION_PATH.parent.parent.parent)),
@@ -106,10 +125,13 @@ def save_koc_session(
     last_working_body: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """合并保存会话，并可选写回 .env 中的 msToken / a_bogus。"""
-    data = _read_session_file()
+    data = _runtime_session_get() or _read_session_file()
+    old_data = dict(data)
     updates: dict[str, Any] = {}
 
-    if create_url.strip():
+    mutable = _session_mutable()
+
+    if create_url.strip() and mutable:
         updates["create_url"] = create_url.strip()
         parsed = urlparse(create_url.strip())
         qs = parse_qs(parsed.query)
@@ -119,9 +141,9 @@ def save_koc_session(
             updates["a_bogus"] = qs["a_bogus"][0]
     if cookie.strip():
         updates["cookie"] = cookie.strip()
-    if ms_token.strip():
+    if ms_token.strip() and mutable:
         updates["ms_token"] = ms_token.strip()
-    if a_bogus.strip():
+    if a_bogus.strip() and mutable:
         updates["a_bogus"] = a_bogus.strip()
     if download_body.strip():
         updates["download_body"] = download_body.strip()
@@ -133,7 +155,22 @@ def save_koc_session(
         return data
 
     data.update(updates)
+    meaningful_keys = (
+        "cookie",
+        "ms_token",
+        "a_bogus",
+        "create_url",
+        "download_body",
+        "last_working_body",
+    )
+    unchanged = all(old_data.get(k) == data.get(k) for k in meaningful_keys)
+    if unchanged:
+        _runtime_session_set(data)
+        apply_session_to_env(data)
+        return data
+
     data["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    _runtime_session_set(data)
     _write_session_file(data)
     apply_session_to_env(data)
 

@@ -79,6 +79,7 @@ const cacheInProgress = new Set();
 const episodeStatusEl = document.getElementById("episode-status");
 const episodeGridEl = document.getElementById("episode-grid");
 const btnGenerate = document.getElementById("btn-generate");
+const btnLoginSync = document.getElementById("btn-login-sync");
 const generateHint = document.getElementById("generate-hint");
 const resultPanel = document.getElementById("result-panel");
 const resultMsg = document.getElementById("result-msg");
@@ -371,8 +372,6 @@ function renderEpisodes() {
           : `已选 ${selected.size} 集：每集 2 段高光，拼成约 30 秒`;
       if (selected.size === 1) {
         loadServiceConfig(id);
-        // 选中 1 集时尝试自动把该集 CDN MP4 缓存到本地（失败则提示手动/导入）。
-        resolveEpisodeUrl(id, { quiet: false, autoCache: true });
       }
       updateGenerateState();
     });
@@ -531,6 +530,51 @@ async function loadEpisodes() {
   }
 }
 
+async function runLoginOnlySync() {
+  if (!btnLoginSync) return;
+  if (!seriesId) {
+    if (generateHint) {
+      generateHint.textContent = "缺少短剧 ID，请从检索页进入后再点“仅登录同步”。";
+    }
+    return;
+  }
+  btnLoginSync.disabled = true;
+  btnGenerate.disabled = true;
+  btnLoginSync.textContent = "请在浏览器完成登录…";
+  resultPanel.classList.remove("hidden");
+  resultMsg.textContent =
+    "已打开达人中心登录页，请先完成登录；未登录完成前不会继续任何下载。";
+  try {
+    const res = await fetch("/api/fq-koc/session/login-only", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        series_id: seriesId,
+        timeout_sec: 600,
+      }),
+    });
+    const { data } = await readJsonResponse(res);
+    if (!res.ok || !data?.ok) {
+      throw new Error(data?.detail || data?.message || "登录同步失败");
+    }
+    resultMsg.textContent = "已登录。你现在可以点击“生成钩子视频”。";
+    if (generateHint) {
+      generateHint.textContent = "已登录，可直接生成。";
+    }
+    await loadServiceConfig();
+  } catch (err) {
+    const msg = err?.message || "登录同步失败";
+    resultMsg.textContent = msg;
+    if (generateHint) {
+      generateHint.textContent = `请先完成登录：${msg}`;
+    }
+  } finally {
+    btnLoginSync.disabled = false;
+    btnLoginSync.textContent = "仅登录同步（先完成登录）";
+    updateGenerateState();
+  }
+}
+
 document.getElementById("select-all").addEventListener("click", () => {
   selected.clear();
   const limit = Math.min(episodes.length, MAX_SELECT);
@@ -578,7 +622,7 @@ btnGenerate.addEventListener("click", async () => {
   resultPanel.classList.remove("hidden");
   postCaptionBox?.classList.add("hidden");
   resultMsg.textContent =
-    "AI 正在写 Meme 梗字幕与裁剪正片，请耐心等待…";
+    "正在生成；如提示等待下载地址，请在已登录达人页面手动点击目标集“下载”一次。";
   previewEl.classList.add("hidden");
   previewEl.removeAttribute("src");
   downloadLink.classList.add("hidden");
@@ -661,5 +705,7 @@ btnGenerate.addEventListener("click", async () => {
     updateGenerateState();
   }
 });
+
+btnLoginSync?.addEventListener("click", runLoginOnlySync);
 
 loadEpisodes();

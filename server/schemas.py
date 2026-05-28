@@ -85,6 +85,16 @@ class FqKocSessionSyncRequest(BaseModel):
     )
 
 
+class FqKocLoginRequest(BaseModel):
+    series_id: str = Field(default="", description="短剧 book_id")
+    timeout_sec: int = Field(
+        default=600,
+        ge=60,
+        le=3600,
+        description="登录等待秒数（默认 600）",
+    )
+
+
 class KuaishouMaterialRequest(BaseModel):
     keyword: str = Field(default="", description="搜索关键词，默认用 drama_title")
     drama_title: str = Field(default="")
