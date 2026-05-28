@@ -349,7 +349,7 @@ def build_visual_profile(
 
     from video_intro_strip import (
         compliance_intro_strip_enabled,
-        compliance_intro_strip_sec,
+        compliance_intro_skip_sec,
         shift_visual_moments,
     )
 

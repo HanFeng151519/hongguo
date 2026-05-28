@@ -1,4 +1,4 @@
-"""多集钩子时长预算：支持 1 分钟专业推荐钩子（60±2s）与长钩子模式。"""
+"""多集钩子时长预算：支持 30s / 60s 专业钩子与长钩子模式。"""
 
 from __future__ import annotations
 
@@ -35,6 +35,9 @@ _ONE_MIN_TARGET_TOTAL = 60.0
 _ONE_MIN_COMPLETE_MIN = 54.0
 _ONE_MIN_COMPLETE_MAX = 72.0
 _ONE_MIN_COMPLETE_TOTAL = 62.0
+_THIRTY_SEC_TARGET_MIN = 28.0
+_THIRTY_SEC_TARGET_MAX = 32.0
+_THIRTY_SEC_TARGET_TOTAL = 30.0
 
 
 def completeness_first_enabled() -> bool:
@@ -52,6 +55,8 @@ def _hook_preset() -> str:
 
 def _preset_defaults() -> tuple[float, float, float]:
     """(min, max, target) 默认值。"""
+    if _hook_preset() in ("30s", "30", "thirty", "half_minute", "half-minute", "半分钟"):
+        return _THIRTY_SEC_TARGET_MIN, _THIRTY_SEC_TARGET_MAX, _THIRTY_SEC_TARGET_TOTAL
     if _hook_preset() in ("1min", "one_minute", "one-minute", "一分钟", "60s", "60"):
         if completeness_first_enabled():
             return (
@@ -76,7 +81,21 @@ def hook_target_max_sec() -> float:
     _, dmax, _ = _preset_defaults()
     mx = _read_sec_env("HONGGUO_HOOK_MAX_SEC", dmax) if env else dmax
     mn = hook_target_min_sec()
-    min_gap = 2.0 if _hook_preset() in ("1min", "one_minute", "one-minute", "一分钟", "60s", "60") else 15.0
+    short_presets = {
+        "30s",
+        "30",
+        "thirty",
+        "half_minute",
+        "half-minute",
+        "半分钟",
+        "1min",
+        "one_minute",
+        "one-minute",
+        "一分钟",
+        "60s",
+        "60",
+    }
+    min_gap = 2.0 if _hook_preset() in short_presets else 15.0
     return max(mn + min_gap, mx)
 
 
@@ -180,7 +199,21 @@ def body_budget_seconds(
         return body_main_sec()
     total = hook_target_max_sec() if total_sec is None else float(total_sec)
     body = total - overhead
-    floor = 8.0 if is_one_minute_hook_preset() else 60.0
+    short_presets = {
+        "30s",
+        "30",
+        "thirty",
+        "half_minute",
+        "half-minute",
+        "半分钟",
+        "1min",
+        "one_minute",
+        "one-minute",
+        "一分钟",
+        "60s",
+        "60",
+    }
+    floor = 8.0 if _hook_preset() in short_presets else 60.0
     return max(floor, body)
 
 

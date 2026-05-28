@@ -1,6 +1,6 @@
 from typing import Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field
 
 
 class GenerateHookRequest(BaseModel):
@@ -9,19 +9,10 @@ class GenerateHookRequest(BaseModel):
     cover_url: str = Field(default="", description="短剧海报图 URL")
     opening: str = Field(default="", description="已废弃，由 AI 自动生成片头文案")
     keyword: str = Field(
-        ...,
-        min_length=1,
+        default="",
         max_length=40,
-        description="片头 1 秒标题卡关键词，显示为《关键词》（必填）",
+        description="已废弃：片头关键词（留空即可）",
     )
-
-    @field_validator("keyword")
-    @classmethod
-    def keyword_nonempty(cls, v: str) -> str:
-        s = (v or "").strip()
-        if not s:
-            raise ValueError("请填写片头关键词")
-        return s
     episode_item_ids: list[str] = Field(..., min_length=1, max_length=6)
     use_fq_koc_material: bool = Field(
         default=True,
@@ -36,8 +27,8 @@ class GenerateHookRequest(BaseModel):
         description="可选：快手或抖音作品/分享链接，优先于关键词搜索",
     )
     use_ai_edit: bool = Field(
-        default=True,
-        description="使用 LLM（默认 LM Studio gemma-4-e4b-it）生成剪辑方案",
+        default=False,
+        description="使用 LLM 生成剪辑方案；默认关闭，走两段高光直剪",
     )
     drama_intro: str = Field(
         default="",

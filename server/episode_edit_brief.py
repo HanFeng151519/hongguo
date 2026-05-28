@@ -1740,6 +1740,271 @@ def repair_clip_durations_in_raw(
     return fixes
 
 
+def _ai_hook_only_enabled() -> bool:
+    v = os.getenv("HONGGUO_AI_HOOK_ONLY", "1").strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
+def _hook_plan_max_clips() -> int:
+    raw = os.getenv("HONGGUO_HOOK_PLAN_MAX_CLIPS", "7").strip()
+    try:
+        return max(3, min(12, int(raw)))
+    except ValueError:
+        return 7
+
+
+def _hook_plan_clip_bounds() -> tuple[float, float]:
+    lo = float(os.getenv("HONGGUO_HOOK_CLIP_MIN_SEC", "2.5").strip() or "2.5")
+    hi = float(os.getenv("HONGGUO_HOOK_CLIP_MAX_SEC", "5.5").strip() or "5.5")
+    return max(1.5, lo), max(lo + 0.5, hi)
+
+
+def _truncate_reason(reason: str, *, max_len: int = 36) -> str:
+    r = re.sub(r"\s+", " ", (reason or "").strip())
+    if len(r) <= max_len:
+        return r
+    return r[: max_len - 1].rstrip() + "…"
+
+
+def _reason_signature(reason: str) -> str:
+    r = (reason or "").strip()
+    r = re.sub(r"^A[|｜]\s*", "", r)
+    r = re.sub(r"^B[|｜]\s*", "", r)
+    r = re.sub(r"tags\s*=\s*[\w/,]+", "", r, flags=re.I)
+    r = re.sub(r"start_sec\s*=\s*[0-9.]+", "", r, flags=re.I)
+    r = re.sub(r"end_sec\s*=\s*[0-9.]+", "", r, flags=re.I)
+    return re.sub(r"\s+", "", r)[:18]
+
+
+def _hook_clip_dict_score(clip: dict[str, Any]) -> float:
+    dur = float(clip.get("duration_sec") or 0)
+    reason = str(clip.get("reason") or "")
+    score = 0.0
+    if reason.startswith(("A|", "A｜")):
+        score += 4.0
+    elif reason.startswith(("B|", "B｜")):
+        score += 1.5
+    lo, hi = _hook_plan_clip_bounds()
+    if lo <= dur <= hi:
+        score += 3.0
+    elif dur > hi + 2.0:
+        score -= min(6.0, (dur - hi) * 0.8)
+    elif dur < lo:
+        score -= 4.0
+    for kw in ("反转", "冲突", "对峙", "打脸", "悬念", "高能", "尾钩"):
+        if kw in reason:
+            score += 0.6
+    tags = clip.get("tags")
+    if isinstance(tags, list) and tags:
+        score += min(1.5, 0.25 * len(tags))
+    return score
+
+
+def _normalize_clip_dict_times(clip: dict[str, Any], *, dur_avail: float) -> bool:
+    """补齐 trim/duration；无效段返回 False。"""
+    if not isinstance(clip, dict):
+        return False
+    start = float(clip.get("trim_start_sec") or clip.get("start_sec") or 0)
+    dur = float(clip.get("duration_sec") or clip.get("duration") or 0)
+    end_raw = clip.get("end_sec")
+    if end_raw is not None:
+        try:
+            end_v = float(end_raw)
+            if end_v > start + 0.35 and dur < 0.45:
+                dur = end_v - start
+        except (TypeError, ValueError):
+            pass
+    if dur < 0.45:
+        return False
+    avail = max(5.0, float(dur_avail) - 0.5)
+    start = max(0.0, min(start, avail - 0.5))
+    dur = max(0.45, min(dur, avail - start))
+    clip["trim_start_sec"] = round(start, 2)
+    clip.pop("start_sec", None)
+    clip["duration_sec"] = round(dur, 2)
+    clip.pop("end_sec", None)
+    clip["reason"] = _truncate_reason(str(clip.get("reason") or ""))
+    return True
+
+
+def coerce_llm_edit_raw(
+    raw: dict[str, Any],
+    *,
+    episode_count: int = 1,
+    body_target_sec: float = 23.0,
+    dur_avail: float = 600.0,
+) -> int:
+    """将模型常见非标 JSON 转为 body_segments 结构。返回修正项数。"""
+    fixes = 0
+    if not isinstance(raw, dict):
+        return 0
+
+    hs = raw.get("hook_summary")
+    if isinstance(hs, list):
+        raw["hook_summary"] = "；".join(
+            str(x).strip() for x in hs if str(x).strip()
+        )[:240]
+        fixes += 1
+    elif hs is not None and not isinstance(hs, str):
+        raw["hook_summary"] = str(hs).strip()[:240]
+        fixes += 1
+
+    segments = raw.get("body_segments")
+    root_clips = raw.get("clips")
+    if (not isinstance(segments, list) or not segments) and isinstance(
+        root_clips, list
+    ):
+        body_dur = float(
+            raw.get("body_duration_sec")
+            or raw.get("duration_sec")
+            or body_target_sec
+        )
+        raw["body_segments"] = [
+            {
+                "episode_index": 1,
+                "duration_sec": body_dur,
+                "clips": root_clips,
+                "reason": "全钩子快切",
+            }
+        ]
+        fixes += 1
+        segments = raw["body_segments"]
+
+    if isinstance(segments, list):
+        for i, seg in enumerate(segments):
+            if not isinstance(seg, dict):
+                continue
+            if not seg.get("episode_index"):
+                seg["episode_index"] = min(i + 1, max(1, episode_count))
+                fixes += 1
+            clips = seg.get("clips")
+            if not isinstance(clips, list):
+                continue
+            cleaned: list[dict[str, Any]] = []
+            for c in clips:
+                if not isinstance(c, dict):
+                    continue
+                if _normalize_clip_dict_times(c, dur_avail=dur_avail):
+                    cleaned.append(c)
+                else:
+                    fixes += 1
+            seg["clips"] = cleaned
+            if cleaned:
+                total = sum(float(x.get("duration_sec") or 0) for x in cleaned)
+                seg["duration_sec"] = round(total, 2)
+    return fixes
+
+
+def sanitize_hook_only_plan_raw(
+    raw: dict[str, Any],
+    *,
+    body_target_sec: float,
+    dur_avail: float,
+) -> int:
+    """钩子模式：裁段数/单段时长/总时长，去重 reason，不信模型原值。"""
+    if not _ai_hook_only_enabled():
+        return 0
+    try:
+        from hook_timeline import story_first_edit_enabled
+
+        if story_first_edit_enabled():
+            return 0
+    except ImportError:
+        pass
+
+    try:
+        from hook_timeline import ai_body_script_max_sec
+
+        cap_total = min(body_target_sec, ai_body_script_max_sec())
+    except ImportError:
+        cap_total = body_target_sec
+
+    max_clips = _hook_plan_max_clips()
+    lo, hi = _hook_plan_clip_bounds()
+    avail = max(lo + 1.0, float(dur_avail) - 0.5)
+    fixes = 0
+
+    for seg in raw.get("body_segments") or []:
+        if not isinstance(seg, dict):
+            continue
+        clips = seg.get("clips") or []
+        if not isinstance(clips, list):
+            continue
+        normed: list[dict[str, Any]] = []
+        seen_pairs: list[tuple[str, float]] = []
+        for c in clips:
+            if not isinstance(c, dict):
+                continue
+            if not _normalize_clip_dict_times(c, dur_avail=avail):
+                fixes += 1
+                continue
+            sig = _reason_signature(str(c.get("reason") or ""))
+            trim = float(c.get("trim_start_sec") or 0)
+            if sig and any(
+                abs(trim - t) < 4.0 and sig == s for s, t in seen_pairs
+            ):
+                fixes += 1
+                continue
+            if any(abs(trim - t) < 1.0 for _, t in seen_pairs):
+                fixes += 1
+                continue
+            dur = float(c.get("duration_sec") or 0)
+            if dur > hi:
+                c["duration_sec"] = round(hi, 2)
+                fixes += 1
+            elif dur < lo:
+                c["duration_sec"] = round(lo, 2)
+                fixes += 1
+            if sig:
+                seen_pairs.append((sig, trim))
+            normed.append(c)
+
+        if len(normed) > max_clips:
+            normed = sorted(
+                normed,
+                key=lambda x: (
+                    -_hook_clip_dict_score(x),
+                    float(x.get("trim_start_sec") or 0),
+                ),
+            )[:max_clips]
+            normed = sorted(normed, key=lambda x: float(x.get("trim_start_sec") or 0))
+            fixes += 1
+
+        total = sum(float(c.get("duration_sec") or 0) for c in normed)
+        if total < cap_total * 0.88 and normed:
+            ratio = min(1.45, cap_total / max(total, 0.01))
+            for c in normed:
+                d = float(c.get("duration_sec") or lo)
+                c["duration_sec"] = round(min(hi, max(lo, d * ratio)), 2)
+            fixes += 1
+            total = sum(float(c.get("duration_sec") or 0) for c in normed)
+        if total > cap_total + 0.35 and normed:
+            ratio = cap_total / max(total, 0.01)
+            for c in normed:
+                d = float(c.get("duration_sec") or lo)
+                c["duration_sec"] = round(max(lo, min(hi, d * ratio)), 2)
+            fixes += 1
+            total = sum(float(c.get("duration_sec") or 0) for c in normed)
+            while total > cap_total + 0.35 and len(normed) > 3:
+                drop = min(normed, key=_hook_clip_dict_score)
+                normed.remove(drop)
+                fixes += 1
+                total = sum(float(c.get("duration_sec") or 0) for c in normed)
+
+        seg["clips"] = normed
+        seg["duration_sec"] = round(total, 2)
+        if normed:
+            logger.info(
+                "钩子模式硬裁：保留 %d 段，正片 %.1fs（上限 %.0fs，单段 %.1f–%.1fs）",
+                len(normed),
+                total,
+                cap_total,
+                lo,
+                hi,
+            )
+    return fixes
+
+
 def validate_ai_edit_raw(
     raw: dict[str, Any],
     *,

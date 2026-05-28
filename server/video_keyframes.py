@@ -55,6 +55,24 @@ def vision_front_ratio() -> float:
         return 0.6
 
 
+def vision_quota_triplet() -> tuple[int, int, int]:
+    """
+    前/中/后分层配额，默认 7/4/5。
+    可用 HONGGUO_VISION_QUOTA=7/4/5 或 7,4,5 覆盖。
+    """
+    raw = os.getenv("HONGGUO_VISION_QUOTA", "7/4/5").strip()
+    parts = [p for p in raw.replace(",", "/").split("/") if p]
+    if len(parts) != 3:
+        return (7, 4, 5)
+    try:
+        a, b, c = [max(0, int(x)) for x in parts]
+    except ValueError:
+        return (7, 4, 5)
+    if a + b + c <= 0:
+        return (7, 4, 5)
+    return (a, b, c)
+
+
 def vision_frame_width() -> int:
     try:
         return max(256, min(1024, int(os.getenv("HONGGUO_VISION_FRAME_WIDTH", "512"))))
@@ -133,8 +151,53 @@ def _pick_timestamps(
             score += 1.5
         scored.append((score, t))
 
-    scored.sort(key=lambda x: (-x[0], x[1]))
-    picked = sorted(t for _, t in scored[:max_frames])
+    def _pick_bucket(lo: float, hi: float, n: int, used: set[float]) -> list[float]:
+        if n <= 0:
+            return []
+        pool = [(s, t) for s, t in scored if lo <= t < hi and t not in used]
+        pool.sort(key=lambda x: (-x[0], x[1]))
+        out: list[float] = []
+        for _, t in pool:
+            if all(abs(t - x) > 1.6 for x in out):
+                out.append(t)
+            if len(out) >= n:
+                break
+        if len(out) < n:
+            step = (hi - lo) / max(1, n)
+            for i in range(n):
+                t = round(lo + step * (i + 0.5), 2)
+                t = max(0.2, min(dur - 0.3, t))
+                if t in used:
+                    continue
+                if all(abs(t - x) > 1.2 for x in out):
+                    out.append(t)
+                if len(out) >= n:
+                    break
+        return out[:n]
+
+    qa, qb, qc = vision_quota_triplet()
+    qsum = max(1, qa + qb + qc)
+    qa = max(0, int(round(max_frames * qa / qsum)))
+    qb = max(0, int(round(max_frames * qb / qsum)))
+    qc = max(0, max_frames - qa - qb)
+    b1, b2 = dur / 3.0, dur * 2.0 / 3.0
+
+    used: set[float] = set()
+    picked: list[float] = []
+    for lo, hi, n in ((0.0, b1, qa), (b1, b2, qb), (b2, dur, qc)):
+        chunk = _pick_bucket(lo, hi, n, used)
+        picked.extend(chunk)
+        used.update(chunk)
+    if len(picked) < max_frames:
+        scored.sort(key=lambda x: (-x[0], x[1]))
+        for _, t in scored:
+            if t in used:
+                continue
+            picked.append(t)
+            used.add(t)
+            if len(picked) >= max_frames:
+                break
+    picked = sorted(picked[:max_frames])
 
     # 填补最大时间空档：在空档中点补 1 帧（替换得分最低且非前段必留的帧）
     max_gap = max(18.0, dur / max(max_frames, 1))

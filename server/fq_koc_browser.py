@@ -305,7 +305,7 @@ async def _discover_book_detail_url(
         )
         return url
 
-    hub = koc_content_hub_url()
+    hub = koc_content_hub_url(bid)
     logger.info("浏览器检索 book_id=%s：打开内容库", bid)
     await page.goto(hub, wait_until="domcontentloaded", timeout=timeout_ms)
     await page.wait_for_timeout(2500)
@@ -578,7 +578,7 @@ async def _run_in_browser(
                 # 推广中心有时会延迟返回 CDN 地址；之前默认只等 20s
                 # 容易导致仍在等待时就返回 400。
                 wait_sec = int(
-                    os.getenv("HONGGUO_FQ_KOC_SYNC_WAIT_SEC", "60").strip() or "60"
+                    os.getenv("HONGGUO_FQ_KOC_SYNC_WAIT_SEC", "120").strip() or "120"
                 )
             logger.info(
                 "接口未返回地址，等待浏览器产生 MP4 请求（最多 %s 秒）…",

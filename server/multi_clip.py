@@ -276,7 +276,15 @@ def normalize_clip_fragment(item: Any) -> ClipFragment | None:
         return None
     start = float(item.get("trim_start_sec") or item.get("start_sec") or 0)
     dur = float(item.get("duration_sec") or item.get("duration") or 0)
-    if dur < 1.0:
+    end_raw = item.get("end_sec")
+    if end_raw is not None:
+        try:
+            end_v = float(end_raw)
+            if end_v > start + 0.35 and dur < 1.0:
+                dur = end_v - start
+        except (TypeError, ValueError):
+            pass
+    if dur < 0.45:
         return None
     reason = str(item.get("reason") or item.get("label") or "").strip()
     return ClipFragment(
@@ -295,6 +303,123 @@ def normalize_clip_list(raw: Any) -> list[ClipFragment]:
         if frag:
             out.append(frag)
     return _dedupe_and_sort_clips(out)
+
+
+def enforce_hook_only_clips(
+    clips: list[ClipFragment],
+    *,
+    target_sec: float,
+    dur_avail: float,
+) -> list[ClipFragment]:
+    """钩子快切：限段数/单段时长/总时长，去重 reason（本地裁决）。"""
+    if not clips:
+        return clips
+    try:
+        from episode_edit_brief import (
+            _ai_hook_only_enabled,
+            _hook_clip_dict_score,
+            _hook_plan_clip_bounds,
+            _hook_plan_max_clips,
+            _normalize_clip_dict_times,
+            _reason_signature,
+            _truncate_reason,
+        )
+    except ImportError:
+        return clips
+    if not _ai_hook_only_enabled():
+        return clips
+    try:
+        from hook_timeline import story_first_edit_enabled
+
+        if story_first_edit_enabled():
+            return clips
+    except ImportError:
+        pass
+    try:
+        from hook_timeline import ai_body_script_max_sec
+
+        cap_total = min(float(target_sec), ai_body_script_max_sec())
+    except ImportError:
+        cap_total = float(target_sec)
+
+    lo, hi = _hook_plan_clip_bounds()
+    max_clips = _hook_plan_max_clips()
+    avail = max(lo + 1.0, float(dur_avail) - 0.5)
+    out: list[ClipFragment] = []
+    seen_pairs: list[tuple[str, float]] = []
+    for c in clips:
+        d: dict[str, Any] = {
+            "trim_start_sec": c.trim_start_sec,
+            "duration_sec": c.duration_sec,
+            "reason": c.reason,
+        }
+        if not _normalize_clip_dict_times(d, dur_avail=avail):
+            continue
+        sig = _reason_signature(str(d.get("reason") or ""))
+        trim = float(d["trim_start_sec"])
+        if sig and any(abs(trim - t) < 4.0 and sig == s for s, t in seen_pairs):
+            continue
+        if any(abs(trim - t) < 1.0 for _, t in seen_pairs):
+            continue
+        dur = float(d["duration_sec"])
+        if dur > hi:
+            dur = hi
+        elif dur < lo:
+            dur = lo
+        if sig:
+            seen_pairs.append((sig, trim))
+        out.append(
+            ClipFragment(
+                trim_start_sec=trim,
+                duration_sec=dur,
+                reason=_truncate_reason(str(d.get("reason") or "")),
+            )
+        )
+
+    if len(out) > max_clips:
+        ranked = sorted(
+            out,
+            key=lambda x: (
+                -_hook_clip_dict_score(
+                    {
+                        "duration_sec": x.duration_sec,
+                        "reason": x.reason,
+                    }
+                ),
+                x.trim_start_sec,
+            ),
+        )
+        out = sorted(ranked[:max_clips], key=lambda x: x.trim_start_sec)
+
+    total = sum(c.duration_sec for c in out)
+    if total < cap_total * 0.88 and out:
+        ratio = min(1.45, cap_total / max(total, 0.01))
+        for c in out:
+            c.duration_sec = _clamp(c.duration_sec * ratio, lo, hi)
+        total = sum(c.duration_sec for c in out)
+    if total > cap_total + 0.35 and out:
+        ratio = cap_total / max(total, 0.01)
+        for c in out:
+            c.duration_sec = _clamp(c.duration_sec * ratio, lo, hi)
+        total = sum(c.duration_sec for c in out)
+        while total > cap_total + 0.35 and len(out) > 3:
+            drop_i = min(
+                range(len(out)),
+                key=lambda i: _hook_clip_dict_score(
+                    {"duration_sec": out[i].duration_sec, "reason": out[i].reason}
+                ),
+            )
+            out.pop(drop_i)
+            total = sum(c.duration_sec for c in out)
+
+    if out:
+        logger.info(
+            "钩子 clips 本地裁决：%d 段合计 %.1fs（≤%.0fs）",
+            len(out),
+            total,
+            cap_total,
+        )
+    return out
 
 
 def _dedupe_and_sort_clips(clips: list[ClipFragment]) -> list[ClipFragment]:

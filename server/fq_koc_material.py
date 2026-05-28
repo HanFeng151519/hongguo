@@ -69,6 +69,9 @@ def save_book_detail_meta(book_id: str, meta: dict[str, str]) -> None:
     genre = payload.get("genre", "")
     if genre:
         os.environ[f"HONGGUO_FQ_KOC_GENRE_{bid}"] = genre
+    top_tab_genre = payload.get("top_tab_genre", "")
+    if top_tab_genre:
+        os.environ[f"HONGGUO_FQ_KOC_TOP_TAB_GENRE_{bid}"] = top_tab_genre
     logger.info("已缓存 book-detail 参数 → %s（genre=%s）", path.name, genre or "—")
 
 
@@ -104,14 +107,35 @@ def _koc_genre_for_book(book_id: str) -> str:
     return os.getenv("HONGGUO_FQ_KOC_GENRE", "").strip()
 
 
-def koc_content_hub_url() -> str:
+def _koc_top_tab_genre_for_book(book_id: str = "") -> str:
+    """
+    内容库顶部分类参数：
+    优先复用真实 book-detail 的 top_tab_genre；其次按单剧/全局配置；
+    再退回该剧 genre（很多剧两者一致，如 203）。
+    """
+    bid = (book_id or "").strip()
+    if bid:
+        meta = load_book_detail_meta(bid)
+        v = (meta.get("top_tab_genre") or "").strip()
+        if v:
+            return v
+        v = os.getenv(f"HONGGUO_FQ_KOC_TOP_TAB_GENRE_{bid}", "").strip()
+        if v:
+            return v
+        v = (meta.get("genre") or _koc_genre_for_book(bid)).strip()
+        if v:
+            return v
+    return os.getenv("HONGGUO_FQ_KOC_TOP_TAB_GENRE", "").strip() or "-1"
+
+
+def koc_content_hub_url(book_id: str = "") -> str:
     """推广中心内容库首页（用于浏览器内检索 book_id）。"""
     invite = os.getenv("HONGGUO_FQ_KOC_INVITE_TOKEN", "").strip()
     if not invite:
         raise RuntimeError("未配置 HONGGUO_FQ_KOC_INVITE_TOKEN")
     q = {
         "tab_type": os.getenv("HONGGUO_FQ_KOC_TAB_TYPE", "6"),
-        "top_tab_genre": os.getenv("HONGGUO_FQ_KOC_TOP_TAB_GENRE", "-1"),
+        "top_tab_genre": _koc_top_tab_genre_for_book(book_id),
         "invite_user_share_token": invite,
     }
     return f"{KOC_BASE}/page/member/content?{urlencode(q)}"
@@ -131,7 +155,7 @@ def build_koc_book_detail_url(book_id: str, item_id: str = "") -> str:
         )
     q: dict[str, str] = {
         "tab_type": os.getenv("HONGGUO_FQ_KOC_TAB_TYPE", "6"),
-        "top_tab_genre": os.getenv("HONGGUO_FQ_KOC_TOP_TAB_GENRE", "-1"),
+        "top_tab_genre": _koc_top_tab_genre_for_book(book_id),
         "invite_user_share_token": invite,
         "book_id": book_id,
     }

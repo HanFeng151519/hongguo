@@ -83,7 +83,7 @@ OFFICIAL_URL_BASE = os.getenv(
 PAGE_SIZE = 10
 HOT_TOP_LIMIT = 10
 # 红果搜索 tab_type=12 为漫剧（motion comic），11 为真人短剧
-HOT_TAB_TYPE = 12
+HOT_TAB_TYPES = (11, 12)
 HOT_SEED_QUERIES = (
     "漫剧",
     "AI漫剧",
@@ -182,28 +182,35 @@ def _merge_dramas_by_play_count(items: list[dict[str, Any]]) -> list[dict[str, A
 
 
 async def _fetch_hot_top_from_upstream() -> list[dict[str, Any]]:
-    """多关键词搜索漫剧 tab（tab_type=12），按播放量汇总今日热门。"""
+    """多关键词搜索短剧+漫剧（tab_type=11/12），按播放量汇总今日热门。"""
     merged: list[dict[str, Any]] = []
-    params_base = {
-        "api": "search",
-        "ts": "漫剧",
-        "tab_type": str(HOT_TAB_TYPE),
-        "offset": "0",
+    base_by_tab = {
+        11: {"api": "search", "ts": "短剧", "tab_type": "11", "offset": "0"},
+        12: {"api": "search", "ts": "漫剧", "tab_type": "12", "offset": "0"},
     }
     async with httpx.AsyncClient(timeout=25.0) as client:
-        for keyword in HOT_SEED_QUERIES:
-            try:
-                resp = await client.get(
-                    API_BASE, params={**params_base, "query": keyword}
-                )
-                resp.raise_for_status()
-                data = resp.json()
-            except httpx.HTTPError as exc:
-                logging.warning("热门种子词「%s」请求失败: %s", keyword, exc)
+        for tab_type in HOT_TAB_TYPES:
+            params_base = base_by_tab.get(tab_type, {})
+            if not params_base:
                 continue
-            if data.get("success") is False:
-                continue
-            merged.extend(_extract_dramas(data, tab_type=HOT_TAB_TYPE))
+            for keyword in HOT_SEED_QUERIES:
+                try:
+                    resp = await client.get(
+                        API_BASE, params={**params_base, "query": keyword}
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+                except httpx.HTTPError as exc:
+                    logging.warning(
+                        "热门种子词「%s」请求失败(tab=%s): %s",
+                        keyword,
+                        tab_type,
+                        exc,
+                    )
+                    continue
+                if data.get("success") is False:
+                    continue
+                merged.extend(_extract_dramas(data, tab_type=tab_type))
 
     ranked = _merge_dramas_by_play_count(merged)
     ranked.sort(
@@ -214,7 +221,7 @@ async def _fetch_hot_top_from_upstream() -> list[dict[str, Any]]:
 
 
 async def get_today_hot_dramas(*, force_refresh: bool = False) -> list[dict[str, Any]]:
-    today = f"{date.today().isoformat()}:comic"
+    today = f"{date.today().isoformat()}:mixed"
     async with _hot_lock:
         if (
             not force_refresh
@@ -272,8 +279,8 @@ async def today_hot_dramas(
 
     return {
         "date": date.today().isoformat(),
-        "kind": "comic_drama",
-        "kind_label": "漫剧",
+        "kind": "mixed_drama",
+        "kind_label": "短剧+漫剧",
         "count": len(items),
         "items": items,
     }

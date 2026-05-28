@@ -24,33 +24,10 @@
 
     <section class="generate-panel">
       <h2 class="panel-title">AI 推广剪辑</h2>
-      <label class="field">
-        <span>片头关键词（1 秒品牌封面，白字《关键词》+ 副标题；抖音合规模式无站外搜索引导）</span>
-        <input id="keyword" type="text" placeholder="例：这次可摊上事了" />
-      </label>
-      <div class="splash-font-row">
-        <label class="field field-compact">
-          <span>《关键词》字号 (px)</span>
-          <input id="splash-title-font" type="number" min="48" max="220" step="2" value="120" />
-        </label>
-        <label class="field field-compact">
-          <span>片头副标题字号 (px)</span>
-          <input id="splash-subtitle-font" type="number" min="32" max="180" step="2" value="70" />
-        </label>
-      </div>
-      <div class="splash-preview-panel">
-        <button type="button" id="btn-preview-splash" class="btn-ghost">刷新片头预览</button>
-        <p class="episode-status">改字号后自动刷新；生成成片使用相同字号</p>
-        <img id="splash-preview" class="splash-preview-img" alt="片头标题卡预览" width="480" height="270" />
-        <label class="field field-compact splash-badge-field">
-          <span>封面下方文字（可选，留空不显示）</span>
-          <input id="splash-badge" type="text" maxlength="24" placeholder="例如：1-5、6-30" />
-        </label>
-      </div>
-      <p class="episode-status"><strong>AI 剪辑大师</strong>：从每集正片里只留最精彩片段，快切成约 2分30–3分30 钩子（冲突→打脸→反转→悬念），原声 1x。</p>
+      <p class="episode-status"><strong>两段高光直剪</strong>：本集已剪好的正片里自动取 2 段最高光（音画分析），拼成约 30 秒钩子，原声 1x，不调用 AI。</p>
       <label class="field field-checkbox">
-        <input id="use-ai-edit" type="checkbox" checked />
-        <span>AI 剪辑大师（LM Studio：自动挑最精彩镜头 + 快切；需本机已启动）</span>
+        <input id="use-ai-edit" type="checkbox" />
+        <span>改用 AI 剪辑大师（需 LM Studio；关闭时默认两段高光直剪）</span>
       </label>
       <label class="field field-checkbox">
         <input id="use-fq-koc" type="checkbox" checked />
@@ -73,7 +50,7 @@
 
     <section class="generate-actions">
       <button type="button" id="btn-generate" class="btn-primary" disabled>生成钩子视频</button>
-      <p id="generate-hint" class="generate-hint">AI 只留最精彩：片头 → 解说卡 → 多集快切正片（约2分30–3分30）→ 片尾</p>
+      <p id="generate-hint" class="generate-hint">两段高光直剪：每集取 2 段最高光，成片约 30 秒，原声 1x（默认不调用 AI）。</p>
     </section>
 
     <section id="result-panel" class="result-panel hidden">

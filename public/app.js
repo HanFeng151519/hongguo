@@ -172,7 +172,7 @@ function renderHotItem(item, rank) {
 async function loadTodayHot() {
   if (!hotListEl || !hotStatusEl) return;
 
-  hotStatusEl.textContent = "正在加载热门漫剧…";
+  hotStatusEl.textContent = "正在加载热门榜单…";
   hotStatusEl.classList.remove("error", "hidden");
   hotListEl.classList.add("hidden");
 
@@ -195,7 +195,7 @@ async function loadTodayHot() {
     bindVoiceHintButtons(hotListEl);
 
     if (hotDateEl && data.date) {
-      const label = data.kind_label || "漫剧";
+      const label = data.kind_label || "短剧+漫剧";
       hotDateEl.textContent = `${label} · 更新 ${data.date}`;
     }
   } catch (err) {

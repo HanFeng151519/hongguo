@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import random
+import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -52,6 +53,8 @@ from episode_edit_brief import (
     min_late_body_sec,
     rebalance_clips_front_heavy,
     repair_clip_durations_in_raw,
+    coerce_llm_edit_raw,
+    sanitize_hook_only_plan_raw,
     validate_ai_edit_raw,
 )
 from hook_edit_methodology import (
@@ -73,6 +76,7 @@ from multi_clip import (
     clips_per_episode,
     ai_clip_strict_enabled,
     apply_ai_clips_strict,
+    enforce_hook_only_clips,
     cohesive_edit_enabled,
     ensure_clips_count,
     hook_arc_hint_text,
@@ -104,9 +108,9 @@ logger = logging.getLogger(__name__)
 # 产品定位：AI 输出对人最友好、最有冲击力的可执行剪辑脚本
 MASTER_EDITOR_PERSONA = (
     "你是抖音全品类短剧「每集独立剪辑导演」（都市/甜宠/悬疑/玄幻/虐恋/家庭等均适用）："
-    "结合本片对白/画面/音效轴自主构思，产出「流畅、开场高能、霸气叙事、反转、尾钩引流、完整闭环」的 JSON 分镜。"
+    "结合本片对白/画面/音效轴自主构思，产出「纯钩子、高刺激、快切」的 JSON 分镜。"
     "选片优先级：画面动感/情绪张力 > 音效冲击 > 对白金句；禁止套用其他剧/其他集固定模板。"
-    "正片剪辑脚本须控制在 65 秒以内，50–60 秒为最佳。"
+    "正片剪辑脚本须控制在 23 秒以内，并集中冲突/对峙/反转高光台词。"
 )
 MASTER_EDITOR_REJECT = (
     "严禁 C 类：重复/长空镜/闲聊拖沓/慢日常/回忆注水/片头片尾/无关配角。"
@@ -115,11 +119,36 @@ MASTER_EDITOR_REJECT = (
 )
 
 
+def _prompt_char_cap() -> int:
+    raw = os.getenv("HONGGUO_LLM_PROMPT_MAX_CHARS", "").strip()
+    if not raw:
+        return 2600
+    try:
+        return max(800, min(6000, int(raw)))
+    except ValueError:
+        return 2600
+
+
+def _compact_prompt_text(text: str, *, cap: int) -> str:
+    s = (text or "").strip()
+    if len(s) <= cap:
+        return s
+    head = int(cap * 0.7)
+    tail = max(120, cap - head - 16)
+    return s[:head].rstrip() + "\n\n...(省略)...\n\n" + s[-tail:].lstrip()
+
+
 def _hard_constraints_block(body_sec: float, *, has_visual: bool, has_transcript: bool) -> str:
+    hook_only = os.getenv("HONGGUO_AI_HOOK_ONLY", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
     try:
         from hook_timeline import story_first_edit_enabled
 
-        story_first = story_first_edit_enabled() and has_transcript
+        story_first = (not hook_only) and story_first_edit_enabled() and has_transcript
     except ImportError:
         story_first = False
     visual_rule = (
@@ -143,7 +172,7 @@ def _hard_constraints_block(body_sec: float, *, has_visual: bool, has_transcript
 
         duration_cap = ai_script_duration_guidance()
     except ImportError:
-        duration_cap = "正片 clips 合计不超过 65 秒，50–60 秒为最佳。"
+        duration_cap = "正片 clips 合计不超过 23 秒，21–23 秒为最佳。"
     if story_first:
         return f"""
 【硬约束 · 故事完整优先（完整对白表已提供）】
@@ -154,13 +183,13 @@ def _hard_constraints_block(body_sec: float, *, has_visual: bool, has_transcript
 5. 每条 reason 以 A| 或 B| 开头；hook_summary 写全六步闭环。
 """.strip()
     return f"""
-【硬约束 · 输出 JSON 前必须自检，不满足则重新分配 duration】
+【硬约束 · 全钩子剪辑（不追求剧情完整）】
 1. sum(clips[].duration_sec) == body_segments[].duration_sec（误差 ≤0.5）；{duration_cap} 参考约 {body_sec:.0f}s。
 2. {visual_rule}
 3. {tx_rule}
-4. 按源片时间顺序；同场景连续高能尽量合并为较长 clip，减少碎切与空档跳剪。
-5. 每条 reason 以 A| 或 B| 开头，写清观众会看到/听到什么（打斗/快切/音效峰/打脸/反转等）。
-6. hook_summary 须覆盖六步：叙事线、开场高能、霸气立势、反转、尾钩、闭环说明。
+4. 只保留：诱惑/擦边/悬念/反转/眼神/冲突/高光；其余铺垫、交代、日常对白一律删除。
+5. clips 最多 7 段，每段 2.5–5.5s，正片合计不得超过上限；禁止 0 秒段与超长单段。
+6. 每条 reason 以 A| 或 B| 开头（≤36 字），并写 tags；hook_summary 必须为**一句话**字符串。
 """.strip()
 
 
@@ -168,6 +197,13 @@ def _opening_prompt_block() -> str:
     if ai_editor_autonomy_enabled():
         return creative_editor_autonomy_block()
     return opening_hook_pattern_block()
+
+
+def _hook_summary_from_raw(raw: dict[str, Any]) -> str:
+    hs = raw.get("hook_summary") or raw.get("summary") or ""
+    if isinstance(hs, list):
+        return "；".join(str(x).strip() for x in hs if str(x).strip())[:240]
+    return str(hs).strip()[:240]
 
 
 def _clamp_body_segments_to_ai_script_max(segments: list[BodySegmentPlan]) -> None:
@@ -403,6 +439,75 @@ def apply_fixed_opening_to_plan(plan: HookEditPlan) -> None:
         plan.commentary_lines = []
 
 
+def _enforce_head_keep_tail_ai(segments: list[BodySegmentPlan]) -> None:
+    """
+    固定首段结构：前 keep_sec 秒保留原片，后 ai_sec 秒交给 AI/程序高光。
+    默认关闭（keep=0）；开启后主要用于 30 秒强钩子（10+20）。
+    """
+    try:
+        keep_sec = max(0.0, float(os.getenv("HONGGUO_KEEP_HEAD_SEC", "0") or 0))
+    except ValueError:
+        keep_sec = 0.0
+    if keep_sec < 0.2 or not segments:
+        return
+    try:
+        ai_sec = max(0.0, float(os.getenv("HONGGUO_AI_TAIL_SEC", "20") or 20))
+    except ValueError:
+        ai_sec = 20.0
+    total_target = max(keep_sec, keep_sec + ai_sec)
+
+    seg = segments[0]
+    content_start = 0.0
+    if os.getenv("HONGGUO_KEEP_HEAD_FROM_CONTENT", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    ):
+        # 优先从首句有效对白开始，避开片头 logo/过渡。
+        cues = (os.getenv("_HONGGUO_EP1_FIRST_CUE_START", "") or "").strip()
+        if cues:
+            try:
+                content_start = max(0.0, float(cues) - 0.15)
+            except ValueError:
+                content_start = 0.0
+    tail_target = max(0.6, total_target - keep_sec)
+    tail_clips = [c for c in (seg.clips or [])]
+    if not tail_clips:
+        tail_clips = [
+            ClipFragment(
+                trim_start_sec=content_start + keep_sec,
+                duration_sec=tail_target,
+                reason="A|后段AI高光",
+            )
+        ]
+    for c in tail_clips:
+        c.trim_start_sec = max(float(c.trim_start_sec), content_start + keep_sec)
+    tail_total = sum(max(0.1, float(c.duration_sec)) for c in tail_clips)
+    ratio = tail_target / max(0.1, tail_total)
+    for c in tail_clips:
+        c.duration_sec = max(0.4, float(c.duration_sec) * ratio)
+    head = ClipFragment(
+        trim_start_sec=content_start,
+        duration_sec=keep_sec,
+        reason=f"A|保留开场前{int(round(keep_sec))}秒正片内容",
+    )
+    merged = [head] + sorted(tail_clips, key=lambda x: x.trim_start_sec)
+    trim, dur, merged = sync_segment_from_clips(
+        trim_start_sec=0.0,
+        duration_sec=total_target,
+        clips=merged,
+    )
+    seg.trim_start_sec = trim
+    seg.duration_sec = dur
+    seg.clips = merged
+    logger.info(
+        "首段结构固定：前%.1fs保留原片 + 后%.1fs AI高光",
+        keep_sec,
+        tail_target,
+    )
+
+
 def _title_short(drama_title: str, max_len: int = 14) -> str:
     title = (drama_title or "短剧").strip()
     return title[:max_len] if len(title) > max_len else title
@@ -534,6 +639,7 @@ def default_plan(
         commentary_lines=commentary,
         edit_style=edit_style,
     )
+    _enforce_head_keep_tail_ai(plan.body_segments)
     apply_fixed_opening_to_plan(plan)
     return plan
 
@@ -614,6 +720,12 @@ def _normalize_plan(
             raw_clips = normalize_clip_list(
                 item.get("clips") or item.get("fragments") or item.get("cuts")
             )
+            if raw_clips:
+                raw_clips = enforce_hook_only_clips(
+                    raw_clips,
+                    target_sec=duration,
+                    dur_avail=dur_avail,
+                )
             if raw_clips:
                 raw_clips = dedupe_narrative_clips(raw_clips)
             ep_cues_pre = (episode_transcripts or {}).get(idx) or []
@@ -897,13 +1009,17 @@ def _normalize_plan(
     for cap in plan_caps:
         cap.text = sanitize_promo_copy(cap.text, max_len=24) or cap.text
 
+    _keep_first_dialogue_line(segments, episode_transcripts=episode_transcripts)
+    _keep_flirt_dialogue_lines(segments, episode_transcripts=episode_transcripts)
+    _enforce_head_keep_tail_ai(segments)
+
     plan = HookEditPlan(
         opening_text=opening_text,
         opening_seconds=opening_seconds,
         outro_keyword=outro_keyword,
         outro_seconds=outro_seconds,
         body_segments=segments,
-        hook_summary=str(raw.get("hook_summary") or raw.get("summary") or ""),
+        hook_summary=_hook_summary_from_raw(raw),
         subtitle_hint=subtitle_hint,
         post_caption=post_caption,
         commentary_lines=commentary_lines,
@@ -944,6 +1060,157 @@ def _snap_clips_to_transcript(
             )
         )
     return out
+
+
+def _keep_first_dialogue_line(
+    segments: list[BodySegmentPlan],
+    *,
+    episode_transcripts: Optional[dict[int, list]] = None,
+) -> None:
+    """保留主视频第一句台词：首段首刀锚定到第一句对白起点。"""
+    v = os.getenv("HONGGUO_KEEP_FIRST_LINE", "1").strip().lower()
+    if v in ("0", "false", "no", "off"):
+        return
+    if not segments or not episode_transcripts:
+        return
+
+    def _cue_start(c: Any) -> float:
+        if hasattr(c, "start_sec"):
+            return float(c.start_sec)
+        if isinstance(c, dict):
+            return float(c.get("start_sec") or 0.0)
+        return 0.0
+
+    def _cue_end(c: Any) -> float:
+        if hasattr(c, "end_sec"):
+            return float(c.end_sec)
+        if isinstance(c, dict):
+            return float(c.get("end_sec") or 0.0)
+        return 0.0
+
+    for seg in segments:
+        cues = (episode_transcripts or {}).get(seg.episode_index) or []
+        if not cues or not seg.clips:
+            continue
+        first_cue = None
+        for cue in cues:
+            st = _cue_start(cue)
+            en = _cue_end(cue)
+            if en > st + 0.05:
+                first_cue = (st, en)
+                break
+        if not first_cue:
+            continue
+        st, en = first_cue
+        if seg.episode_index == 1:
+            os.environ["_HONGGUO_EP1_FIRST_CUE_START"] = f"{st:.3f}"
+        first = seg.clips[0]
+        if float(first.trim_start_sec) <= st + 0.25:
+            continue
+        first.trim_start_sec = round(max(0.0, st - 0.15), 2)
+        first.duration_sec = round(max(float(first.duration_sec), en - st + 0.55), 2)
+        first.reason = (
+            f"A|保留首句台词 start_sec={st:.2f} end_sec={en:.2f} "
+            + (first.reason or "")
+        ).strip()
+        trim, duration, synced = sync_segment_from_clips(
+            trim_start_sec=seg.trim_start_sec,
+            duration_sec=seg.duration_sec,
+            clips=seg.clips,
+        )
+        seg.trim_start_sec = trim
+        seg.duration_sec = duration
+        seg.clips = synced
+        logger.info(
+            "第%d集 已锚定首句台词：%.2fs-%.2fs",
+            seg.episode_index,
+            st,
+            en,
+        )
+
+
+def _keep_flirt_dialogue_lines(
+    segments: list[BodySegmentPlan],
+    *,
+    episode_transcripts: Optional[dict[int, list]] = None,
+) -> None:
+    """保留调戏/暧昧台词片段：若未命中则补一刀进 clips。"""
+    v = os.getenv("HONGGUO_KEEP_FLIRT_LINE", "1").strip().lower()
+    if v in ("0", "false", "no", "off"):
+        return
+    if not segments or not episode_transcripts:
+        return
+    kws = ("调戏", "撩", "勾引", "暧昧", "亲", "宝贝", "姐姐", "哥哥")
+    force_raw = os.getenv("HONGGUO_FORCE_KEEP_LINES", "").strip()
+    force_lines = [x.strip() for x in re.split(r"[,\n|;；]+", force_raw) if x.strip()]
+
+    def _cue_span(c: Any) -> tuple[float, float, str]:
+        if hasattr(c, "start_sec"):
+            st = float(getattr(c, "start_sec", 0.0) or 0.0)
+            en = float(getattr(c, "end_sec", 0.0) or 0.0)
+            txt = str(getattr(c, "text", "") or "")
+        elif isinstance(c, dict):
+            st = float(c.get("start_sec") or 0.0)
+            en = float(c.get("end_sec") or 0.0)
+            txt = str(c.get("text") or "")
+        else:
+            return 0.0, 0.0, ""
+        return st, en, txt
+
+    for seg in segments:
+        cues = (episode_transcripts or {}).get(seg.episode_index) or []
+        if not cues or not seg.clips:
+            continue
+        flirt = None
+        # 先命中“强制保留台词白名单”
+        if force_lines:
+            for cue in cues:
+                st, en, txt = _cue_span(cue)
+                if en <= st + 0.05:
+                    continue
+                if any(k in txt for k in force_lines):
+                    flirt = (st, en, txt.strip())
+                    break
+        for cue in cues:
+            if flirt:
+                break
+            st, en, txt = _cue_span(cue)
+            if en <= st + 0.05:
+                continue
+            if any(k in txt for k in kws):
+                flirt = (st, en, txt.strip())
+                break
+        if not flirt:
+            continue
+        st, en, txt = flirt
+        hit = False
+        for c in seg.clips:
+            cst = float(c.trim_start_sec)
+            ced = cst + float(c.duration_sec)
+            if not (ced <= st + 0.02 or cst >= en - 0.02):
+                hit = True
+                break
+        if hit:
+            continue
+        insert = ClipFragment(
+            trim_start_sec=round(max(0.0, st - 0.2), 2),
+            duration_sec=round(max(1.2, en - st + 0.7), 2),
+            reason=f"A|保留调戏台词 start_sec={st:.2f} end_sec={en:.2f}",
+        )
+        seg.clips = [insert] + list(seg.clips)
+        trim, duration, synced = sync_segment_from_clips(
+            trim_start_sec=seg.trim_start_sec,
+            duration_sec=seg.duration_sec,
+            clips=seg.clips,
+        )
+        seg.trim_start_sec = trim
+        seg.duration_sec = duration
+        seg.clips = synced
+        logger.info(
+            "第%d集 已补调戏台词：%s",
+            seg.episode_index,
+            txt[:20],
+        )
 
 
 def _build_authentic_prompt(
@@ -1069,7 +1336,13 @@ def _build_authentic_prompt(
         if ai_body_faithful_enabled() and pro_tpl:
             from hook_timeline import story_first_edit_enabled
 
-            if story_first_edit_enabled() and has_tx:
+            hook_only = os.getenv("HONGGUO_AI_HOOK_ONLY", "1").strip().lower() not in (
+                "0",
+                "false",
+                "no",
+                "off",
+            )
+            if (not hook_only) and story_first_edit_enabled() and has_tx:
                 duration_rule = (
                     "2. **故事完整优先**：从完整对白表+画面轴选出六步叙事所需的全部好情节；"
                     "body duration_sec = clips 之和（±0.5）。\n"
@@ -1089,6 +1362,8 @@ def _build_authentic_prompt(
                     "body duration_sec = clips 之和（±0.5）。\n"
                     f"{script_duration_line}\n"
                     f"{type_hint}\n"
+                    "仅使用已提供的本地素材时间轴（禁止臆测外部片段）；"
+                    "只剪诱惑/擦边/悬念/反转/眼神/冲突/高光。"
                     f"{autonomy_note} "
                     "每条 clip duration 须覆盖对白 end_sec。\n"
                     f"{hard_block}"
@@ -1126,21 +1401,21 @@ def _build_authentic_prompt(
 请只输出 JSON（不要 markdown）：
 {{
   "edit_style": "authentic",
-  "opening_text": "1 句短钩子，≤24 字，仅用于 1 秒解说卡配音",
+    "opening_text": "1 句短钩子，≤24 字，仅用于片头口播",
   "outro_keyword": "搜索词 8-16 字",
   "post_caption": "发布文案 2-4 行 + 话题",
-  "hook_summary": "①叙事线 ②开场高能 ③霸气立势 ④反转 ⑤尾钩 ⑥闭环（为何看懂且想追）",
+  "hook_summary": "一句话说明刺激点组合（诱惑/擦边/悬念/反转/眼神/冲突）与尾钩",
   "commentary_lines": [],
   "body_segments": [
     {{
       "episode_index": 1,
-      "duration_sec": 55,
-      "reason": "须等于 clips.duration_sec 之和；正片 50–60s 最佳，不超过 65s",
+      "duration_sec": 23,
+      "reason": "须等于 clips.duration_sec 之和；正片聚焦 21–23s 冲突高光台词",
       "clips": [
-        {{"trim_start_sec": 0.0, "duration_sec": 10.0, "reason": "A|开场高能 tags=... start_sec=... end_sec=..."}},
-        {{"trim_start_sec": 0.0, "duration_sec": 12.0, "reason": "A|霸气叙事/对峙（秒数按本集轴填写）"}},
-        {{"trim_start_sec": 0.0, "duration_sec": 10.0, "reason": "A|反转（跳剪须标注）"}},
-        {{"trim_start_sec": 0.0, "duration_sec": 6.0, "reason": "A|尾钩引流"}}
+        {{"trim_start_sec": 0.0, "duration_sec": 6.0, "reason": "A|开场冲突台词 tags=conflict/dialogue_hit start_sec=... end_sec=..."}},
+        {{"trim_start_sec": 0.0, "duration_sec": 7.0, "reason": "A|对峙升级/情绪爆发（秒数按本集轴填写）"}},
+        {{"trim_start_sec": 0.0, "duration_sec": 6.0, "reason": "A|打脸反转（跳剪须标注）"}},
+        {{"trim_start_sec": 0.0, "duration_sec": 4.0, "reason": "A|尾钩悬念/追更点"}}
       ],
       "meme_captions": [],
       "meme_beats": []
@@ -1152,7 +1427,7 @@ def _build_authentic_prompt(
 1. commentary_lines 必须为空数组；meme_captions、meme_beats 必须为空数组。
 {duration_rule}
 {ai_compliance_rule_block()}
-3. opening_text ≤ 24 字；hook_summary 按六步叙事写全。
+3. opening_text ≤ 24 字；hook_summary 只写刺激点与尾钩，不要求剧情完整。
 4. clips 按时间顺序；reason 以 A|/B| 开头；秒数必须来自本集数据表，勿照抄示例里的 0.0；{
         "自检：各段 duration 相加必须精确等于 body duration_sec"
         if (has_tx or has_vis)
@@ -1271,7 +1546,7 @@ def _build_prompt(
 
 规则：
 1. commentary_lines 必须 3-5 条，每条 8-18 字，像真人解说，不要与 thousands 账号相同的套话。
-2. 正片单集成片 30-75 秒；trim_start_sec 常 5-25 秒，保留爽点/反转。
+2. 正片单集成片 23 秒左右；trim_start_sec 常 5-25 秒，删除铺垫，仅保留冲突/反转高光。
 3. 成片正片默认 1.618 倍速：duration_sec 指成片时长；源片取用约为 duration_sec×1.618。
 4. opening_text ≤ 60 字；outro_keyword ≤ 16 字；post_caption ≤ 200 字。
 5. body_segments 须覆盖 episode_index 1 到 {len(episode_labels)}。"""
@@ -1361,8 +1636,9 @@ async def plan_hook_edit(
                     f"{' + 对白表' if has_transcript else ''}：按本集自主选高光与简版叙事，"
                     f"{duration_cap} "
                     f"参考约 {body_pick_sec:.0f}s；"
+                    "只从本地素材中选诱惑/擦边/悬念/反转/眼神/冲突/高光片段；"
                     "clips.duration_sec 之和 = body duration_sec（±0.5）；"
-                    "须覆盖六步叙事：流畅·开场高能·霸气·反转·尾钩·闭环；"
+                    "不要求剧情完整与叙事闭环，只追求钩子强度；"
                     "reason 建议标环节并写 tags、start_sec/end_sec。"
                 )
         except ImportError:
@@ -1401,14 +1677,27 @@ async def plan_hook_edit(
             "（打斗、表情、特效、构图）与对白/音效表写 clips，禁止只靠台词臆测。"
         )
 
+    prompt_cap = _prompt_char_cap()
+    compact_mode = os.getenv("HONGGUO_LLM_COMPACT_PROMPT", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+    prompt_for_user = (
+        _compact_prompt_text(prompt, cap=prompt_cap) if compact_mode else prompt
+    )
+    sys_extra = human_impact_script_brief(body_sec=body_pick_sec) + _opening_prompt_block()
+    if compact_mode:
+        sys_extra = _compact_prompt_text(sys_extra, cap=max(500, prompt_cap // 2))
+
     messages: list[dict] = [
         {
             "role": "system",
             "content": (
                 MASTER_EDITOR_PERSONA
                 + " 你只输出合法 JSON；产出对人最友好、最有冲击力的剪辑脚本（非剧情摘要）。"
-                + human_impact_script_brief(body_sec=body_pick_sec)
-                + _opening_prompt_block()
+                + sys_extra
                 + clip_hint
                 + system_extra
                 + (" meme 方案须含 meme_captions、meme_beats。" if meme_edit_enabled() else "")
@@ -1424,13 +1713,13 @@ async def plan_hook_edit(
                 "content": build_edit_vision_user_content(
                     episode_keyframes,
                     episode_labels,
-                    task_prompt=prompt,
+                    task_prompt=prompt_for_user,
                     max_images=vision_cap,
                 ),
             }
         )
     else:
-        messages.append({"role": "user", "content": prompt})
+        messages.append({"role": "user", "content": prompt_for_user})
 
     dur0 = episode_durations[0] if episode_durations else 120.0
 
@@ -1460,7 +1749,7 @@ async def plan_hook_edit(
                         "content": build_edit_vision_user_content(
                             episode_keyframes,
                             episode_labels,
-                            task_prompt=prompt,
+                            task_prompt=prompt_for_user,
                             max_images=half,
                         ),
                     },
@@ -1471,7 +1760,7 @@ async def plan_hook_edit(
                     pass
             logger.warning("多模态仍失败，改用对白+画面轴纯文本: %s", exc)
             return await _complete(
-                [messages[0], {"role": "user", "content": prompt}]
+                [messages[0], {"role": "user", "content": prompt_for_user}]
             )
 
     raw_text = ""
@@ -1479,6 +1768,15 @@ async def plan_hook_edit(
     try:
         raw_text = await _complete_with_vision_fallback()
         raw = extract_json_object(raw_text)
+        coerce_llm_edit_raw(
+            raw,
+            episode_count=len(episode_labels) or 1,
+            body_target_sec=body_pick_sec,
+            dur_avail=dur0,
+        )
+        sanitize_hook_only_plan_raw(
+            raw, body_target_sec=body_pick_sec, dur_avail=dur0
+        )
         repaired = repair_clip_durations_in_raw(
             raw, dur_avail=dur0, body_target_sec=body_pick_sec
         )
@@ -1511,6 +1809,15 @@ async def plan_hook_edit(
                 ]
             )
             raw = extract_json_object(raw_text)
+            coerce_llm_edit_raw(
+                raw,
+                episode_count=len(episode_labels) or 1,
+                body_target_sec=body_pick_sec,
+                dur_avail=dur0,
+            )
+            sanitize_hook_only_plan_raw(
+                raw, body_target_sec=body_pick_sec, dur_avail=dur0
+            )
             repair_clip_durations_in_raw(
                 raw, dur_avail=dur0, body_target_sec=body_pick_sec
             )
@@ -1564,6 +1871,15 @@ async def plan_hook_edit(
             json_mode=True,
         )
         raw = extract_json_object(raw_text)
+        coerce_llm_edit_raw(
+            raw,
+            episode_count=len(episode_labels) or 1,
+            body_target_sec=body_pick_sec,
+            dur_avail=dur0,
+        )
+        sanitize_hook_only_plan_raw(
+            raw, body_target_sec=body_pick_sec, dur_avail=dur0
+        )
         return _normalize_plan(
             raw,
             drama_title=drama_title,

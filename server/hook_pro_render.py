@@ -37,6 +37,46 @@ def _safe_video_subclip(clip, end_sec: float):
     return clip.subclipped(0, end)
 
 
+def voiceover_subtitle_enabled() -> bool:
+    """口播字幕开关：默认关闭，仅保留配音与原声混音。"""
+    v = os.getenv("HONGGUO_VOICEOVER_SUBTITLE", "0").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def outro_flash_enabled() -> bool:
+    """片尾高光闪帧开关：默认开。"""
+    v = os.getenv("HONGGUO_OUTRO_FLASH", "1").strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
+def _build_outro_flash_clip(clip, *, flash_frames: int = 12, flash_sec: float = 3.0):
+    """将片尾改为高光闪帧（默认 12 帧 / 3 秒）。"""
+    from moviepy import ColorClip, ImageClip, concatenate_videoclips
+
+    total = float(clip.duration or 0.0)
+    if total <= 0.1:
+        return clip
+    n = max(4, int(flash_frames))
+    dur = max(1.0, float(flash_sec))
+    frame_slot = dur / n
+    # 每个槽位做“画面+黑帧”闪切，视觉上更明显（不再像正常播放）
+    pic_dur = max(0.05, min(frame_slot * 0.72, frame_slot - 0.04))
+    gap_dur = max(0.01, frame_slot - pic_dur)
+    if total < pic_dur:
+        return clip
+    # 在尾段均匀抽帧，做“闪过”效果
+    start = max(0.0, total - dur)
+    times = [start + (dur * i / max(1, n - 1)) for i in range(n)]
+    imgs = []
+    for t in times:
+        imgs.append(ImageClip(clip.get_frame(t)).with_duration(pic_dur))
+        imgs.append(
+            ColorClip(size=clip.size, color=(0, 0, 0)).with_duration(gap_dur)
+        )
+    out = concatenate_videoclips(imgs, method="chain").with_duration(dur)
+    return out
+
+
 def render_center_subtitle_png(
     path: Path,
     text: str,
@@ -203,19 +243,22 @@ def enhance_golden_opening_clip(
         if bgm:
             fitted = _mix_bgm_under_voice(fitted, Path(bgm))
 
-        sub_png = work_dir / "golden_center_sub.png"
-        render_center_subtitle_png(sub_png, line, width=ow, height=oh)
-
-        ov = (
-            ImageClip(str(sub_png))
-            .with_duration(float(fitted.duration))
-            .with_position((0, 0))
-        )
-        final = CompositeVideoClip([fitted, ov], size=(ow, oh)).with_duration(
-            float(fitted.duration)
-        )
+        if voiceover_subtitle_enabled():
+            sub_png = work_dir / "golden_center_sub.png"
+            render_center_subtitle_png(sub_png, line, width=ow, height=oh)
+            ov = (
+                ImageClip(str(sub_png))
+                .with_duration(float(fitted.duration))
+                .with_position((0, 0))
+            )
+            final = CompositeVideoClip([fitted, ov], size=(ow, oh)).with_duration(
+                float(fitted.duration)
+            )
+        else:
+            final = fitted
         _write_clip(final, out, preset="fast", audio=final.audio is not None)
-        final.close()
+        if final is not fitted:
+            final.close()
         fitted.close()
     finally:
         clip.close()
@@ -260,6 +303,18 @@ def enhance_outro_voiceover_clip(
         if fitted.duration and fitted.duration > max_dur + 0.05:
             fitted = _safe_video_subclip(fitted, max_dur)
 
+        if outro_flash_enabled():
+            frames = max(
+                4, int(float(os.getenv("HONGGUO_OUTRO_FLASH_FRAMES", "12") or 12))
+            )
+            sec = max(1.0, float(os.getenv("HONGGUO_OUTRO_FLASH_SEC", "3") or 3.0))
+            fitted = _build_outro_flash_clip(
+                fitted,
+                flash_frames=frames,
+                flash_sec=sec,
+            )
+            logger.info("片尾高光闪帧：%d 帧 / %.1fs", frames, sec)
+
         if tts_enabled() and edge_tts_available() and line:
             voice_id = voice or resolve_voice()
             pairs = synthesize_lines_sync(
@@ -296,19 +351,22 @@ def enhance_outro_voiceover_clip(
                 fitted.audio.with_volume_scaled(golden_opening_duck_volume())
             )
 
-        sub_png = work_dir / "outro_center_sub.png"
-        render_center_subtitle_png(sub_png, line, width=ow, height=oh)
-
-        ov = (
-            ImageClip(str(sub_png))
-            .with_duration(float(fitted.duration))
-            .with_position((0, 0))
-        )
-        final = CompositeVideoClip([fitted, ov], size=(ow, oh)).with_duration(
-            float(fitted.duration)
-        )
+        if voiceover_subtitle_enabled():
+            sub_png = work_dir / "outro_center_sub.png"
+            render_center_subtitle_png(sub_png, line, width=ow, height=oh)
+            ov = (
+                ImageClip(str(sub_png))
+                .with_duration(float(fitted.duration))
+                .with_position((0, 0))
+            )
+            final = CompositeVideoClip([fitted, ov], size=(ow, oh)).with_duration(
+                float(fitted.duration)
+            )
+        else:
+            final = fitted
         _write_clip(final, out, preset="fast", audio=final.audio is not None)
-        final.close()
+        if final is not fitted:
+            final.close()
         fitted.close()
     finally:
         clip.close()

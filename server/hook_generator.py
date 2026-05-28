@@ -62,6 +62,7 @@ from hook_timeline import (
     fixed_opening_line,
     fixed_outro_line,
     golden_open_sec,
+    opening_voiceover_enabled,
     outro_cta_sec,
     pro_60_template_enabled,
     timeline_summary,
@@ -1044,6 +1045,7 @@ def _clip_with_plan(
     *,
     prefer_stream_copy: bool = False,
     commentary_lines: Optional[list[str]] = None,
+    transcript_cues: Optional[list] = None,
     originality_seed: str = "",
     work_dir: Optional[Path] = None,
     book_id: str = "",
@@ -1057,14 +1059,74 @@ def _clip_with_plan(
     clips = segment_plan.resolved_clips() if segment_plan else []
     use_multi = multi_clip_enabled() and len(clips) > 1
 
+    def _reason_preview(text: str, max_len: int = 72) -> str:
+        s = re.sub(r"\s+", " ", str(text or "")).strip()
+        if not s:
+            return ""
+        return s[:max_len] + ("…" if len(s) > max_len else "")
+
+    def _first_cue_span() -> Optional[tuple[float, float]]:
+        if not transcript_cues:
+            return None
+        for cue in transcript_cues:
+            if hasattr(cue, "start_sec"):
+                st = float(getattr(cue, "start_sec", 0.0) or 0.0)
+                en = float(getattr(cue, "end_sec", 0.0) or 0.0)
+            elif isinstance(cue, dict):
+                st = float(cue.get("start_sec") or 0.0)
+                en = float(cue.get("end_sec") or 0.0)
+            else:
+                continue
+            if en > st + 0.05:
+                return st, en
+        return None
+
+    def _cue_range_text(start_sec: float, end_sec: float, max_len: int = 88) -> str:
+        if not transcript_cues:
+            return ""
+        texts: list[str] = []
+        for cue in transcript_cues:
+            if hasattr(cue, "start_sec"):
+                c_start = float(getattr(cue, "start_sec", 0.0) or 0.0)
+                c_end = float(getattr(cue, "end_sec", 0.0) or 0.0)
+                c_text = str(getattr(cue, "text", "") or "").strip()
+            elif isinstance(cue, dict):
+                c_start = float(cue.get("start_sec") or 0.0)
+                c_end = float(cue.get("end_sec") or 0.0)
+                c_text = str(cue.get("text") or "").strip()
+            else:
+                continue
+            if c_end <= start_sec + 0.02 or c_start >= end_sec - 0.02:
+                continue
+            if c_text:
+                texts.append(c_text)
+        if not texts:
+            return ""
+        merged = re.sub(r"\s+", " ", " / ".join(texts))
+        return merged[:max_len] + ("…" if len(merged) > max_len else "")
+
     if not use_multi:
         trim = segment_plan.trim_start_sec if segment_plan else 0.0
+        max_d = segment_plan.duration_sec if segment_plan else None
+        keep_first = os.getenv("HONGGUO_KEEP_FIRST_LINE", "1").strip().lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+        )
+        cue_span = _first_cue_span() if keep_first else None
+        if cue_span:
+            st, en = cue_span
+            if trim > st + 0.2:
+                trim = max(0.0, st - 0.15)
+            need = max(1.0, en - st + 0.8)
+            if max_d and max_d > 0:
+                max_d = max(max_d, need)
         if originality_enabled():
             trim = max(
                 0.0,
                 trim + trim_jitter_seconds(f"{originality_seed}:{label}:{trim:.1f}"),
             )
-        max_d = segment_plan.duration_sec if segment_plan else None
         _process_body_clip(
             raw,
             dest,
@@ -1089,6 +1151,33 @@ def _clip_with_plan(
         def _encode_fragment(i: int, frag) -> tuple[int, Path]:
             part = work / f"{dest.stem}_f{i:02d}.mp4"
             trim = frag.trim_start_sec
+            frag_dur = float(getattr(frag, "duration_sec", fallback_seconds) or fallback_seconds)
+            keep_first = os.getenv("HONGGUO_KEEP_FIRST_LINE", "1").strip().lower() not in (
+                "0",
+                "false",
+                "no",
+                "off",
+            )
+            if i == 0 and keep_first:
+                cue_span = _first_cue_span()
+                if cue_span:
+                    st, en = cue_span
+                    if trim > st + 0.2:
+                        trim = max(0.0, st - 0.15)
+                    frag_dur = max(frag_dur, max(1.0, en - st + 0.8))
+            reason = _reason_preview(getattr(frag, "reason", ""))
+            if reason:
+                logger.info(
+                    "%s·段%d 台词/钩子: %s",
+                    label,
+                    i + 1,
+                    reason,
+                )
+            speed = max(0.1, float(body_playback_speed()))
+            src_len = max(0.1, float(getattr(frag, "duration_sec", 0.0) or 0.0) * speed)
+            spoken = _cue_range_text(trim, trim + src_len)
+            if spoken:
+                logger.info("%s·段%d 台词片段: %s", label, i + 1, spoken)
             if originality_enabled():
                 trim = max(
                     0.0,
@@ -1104,7 +1193,7 @@ def _clip_with_plan(
                 f"{label}·段{i + 1}",
                 fallback_seconds,
                 trim_start_sec=trim,
-                max_duration_sec=frag.duration_sec,
+                max_duration_sec=frag_dur,
                 prefer_stream_copy=False,
                 commentary_lines=[],
                 originality_seed=f"{originality_seed}:f{i}",
@@ -1538,6 +1627,7 @@ async def _download_episode_segment_from_fq_koc(
     work_dir: Path,
     segment_plan: Optional[BodySegmentPlan] = None,
     commentary_lines: Optional[list[str]] = None,
+    transcript_cues: Optional[list] = None,
     originality_seed: str = "",
 ) -> str:
     meta = await fetch_fq_koc_episode(
@@ -1573,6 +1663,7 @@ async def _download_episode_segment_from_fq_koc(
         segment_plan,
         prefer_stream_copy=from_local or _video_codec(local) in ("hevc", "h265"),
         commentary_lines=commentary_lines,
+        transcript_cues=transcript_cues,
         originality_seed=originality_seed,
         work_dir=work_dir,
         book_id=series_id,
@@ -1601,6 +1692,7 @@ async def _download_episode_segment_from_external(
     work_dir: Path,
     segment_plan: Optional[BodySegmentPlan] = None,
     commentary_lines: Optional[list[str]] = None,
+    transcript_cues: Optional[list] = None,
     originality_seed: str = "",
 ) -> str:
     meta = await fetch_external_body_source(
@@ -1621,6 +1713,7 @@ async def _download_episode_segment_from_external(
         clip_seconds,
         segment_plan,
         commentary_lines=commentary_lines,
+        transcript_cues=transcript_cues,
         originality_seed=originality_seed,
         work_dir=work_dir,
     )
@@ -1963,8 +2056,6 @@ async def generate_hook_video(
     if len(episode_item_ids) > MAX_EPISODES:
         raise ValueError(f"最多选择 {MAX_EPISODES} 集")
     splash_keyword_required = (keyword or "").strip()
-    if not splash_keyword_required:
-        raise ValueError("请填写片头关键词（片头 1 秒标题卡《关键词》）")
 
     work = Path(tempfile.mkdtemp(prefix="hongguo_hook_"))
     tts_note = ""
@@ -1976,7 +2067,7 @@ async def generate_hook_video(
         episode_labels_pre.append(
             (episode_titles or {}).get(item_id) or f"第{index}集"
         )
-    if use_fq_koc_material and use_ai_edit:
+    if use_fq_koc_material:
         await _prefetch_fq_koc_for_planning(
             client,
             series_id=series_id,
@@ -2014,6 +2105,9 @@ async def generate_hook_video(
 
     episode_transcripts: dict = {}
     episode_visual_profiles: dict = {}
+    from simple_highlight_plan import plan_simple_two_highlight, simple_highlight_enabled
+
+    use_simple_highlight = (not use_ai_edit) and simple_highlight_enabled()
     if use_ai_edit:
         import asyncio
 
@@ -2154,6 +2248,41 @@ async def generate_hook_video(
             episode_keyframes=episode_keyframes or None,
             episode_edit_briefs=episode_edit_briefs or None,
         )
+    elif use_simple_highlight:
+        import asyncio
+
+        from video_moment_profile import (
+            gather_episode_visual_profiles,
+            visual_profile_enabled,
+        )
+
+        episode_visual_profiles: dict = {}
+        if visual_profile_enabled():
+            episode_visual_profiles = await asyncio.to_thread(
+                gather_episode_visual_profiles,
+                series_id=series_id,
+                episode_item_ids=episode_item_ids,
+                episode_labels=episode_labels_pre,
+                work_dir=work,
+            )
+            if episode_visual_profiles:
+                from simple_highlight_plan import clips_per_episode_simple
+
+                n_m = sum(len(v) for v in episode_visual_profiles.values())
+                logger.info(
+                    "两段高光模式：已分析 %d 集画面/音效轴（%d 段），本地选 Top%d",
+                    len(episode_visual_profiles),
+                    n_m,
+                    clips_per_episode_simple(),
+                )
+        edit_plan = plan_simple_two_highlight(
+            drama_title=drama_title,
+            opening=opening,
+            keyword=keyword,
+            episode_labels=episode_labels_pre,
+            episode_durations=episode_durations_pre,
+            episode_visual_profiles=episode_visual_profiles or None,
+        )
     else:
         edit_plan = default_plan(
             drama_title=drama_title,
@@ -2163,10 +2292,15 @@ async def generate_hook_video(
             episode_durations=episode_durations_pre,
         )
 
+    plan_mode = (
+        "AI 剪辑大师"
+        if use_ai_edit
+        else ("两段高光直剪" if use_simple_highlight else "规则剪辑")
+    )
     logger.info(
         "成片：%s | %s | 风格=%s | %s%s",
         video_backend(),
-        "AI 剪辑大师" if use_ai_edit else "规则剪辑",
+        plan_mode,
         edit_plan.edit_style,
         (edit_plan.hook_summary or "")[:80],
         tts_note,
@@ -2231,12 +2365,19 @@ async def generate_hook_video(
     try:
         segments: list[Path] = []
         intro_seconds = 0.0
+        opening_enabled = opening_voiceover_enabled()
 
         golden_src: Optional[Path] = None
         body_paths: list[Path] = []
 
         splash_segment: Optional[Path] = None
-        if splash_keyword:
+        splash_enabled = os.getenv("HONGGUO_OPENING_SPLASH", "0").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        if splash_enabled and splash_keyword:
             splash_img = work / "00_splash.png"
             splash_mp4 = work / "00_splash.mp4"
             render_keyword_splash_card(
@@ -2266,6 +2407,7 @@ async def generate_hook_video(
 
         if (
             not use_pro
+            and opening_enabled
             and originality_enabled()
             and edit_plan.opening_text.strip()
         ):
@@ -2367,6 +2509,7 @@ async def generate_hook_video(
                 seg_plan = plan_run.body_for_index(index)
                 if (
                     use_pro
+                    and opening_enabled
                     and index == 1
                     and file_tag == ""
                     and not ai_body_faithful_enabled()
@@ -2400,6 +2543,7 @@ async def generate_hook_video(
                                 work_dir=work,
                                 segment_plan=seg_plan,
                                 commentary_lines=commentary_lines,
+                                transcript_cues=(episode_transcripts or {}).get(index) or [],
                                 originality_seed=f"{originality_seed}:{item_id}",
                             )
                             episode_ready = True
@@ -2420,6 +2564,7 @@ async def generate_hook_video(
                             work_dir=work,
                             segment_plan=seg_plan,
                             commentary_lines=commentary_lines,
+                            transcript_cues=(episode_transcripts or {}).get(index) or [],
                             originality_seed=f"{originality_seed}:ext",
                         )
                         episode_ready = True
@@ -2445,7 +2590,7 @@ async def generate_hook_video(
                 body_seconds_total += clip_dur
                 body_notes.append(note)
                 body_paths.append(clip_path)
-                if use_pro and index == 1 and golden_src is None:
+                if use_pro and opening_enabled and index == 1 and golden_src is None:
                     golden_src = work / f"00_golden_src{file_tag}.mp4"
                     golden_from = find_local_material(series_id, item_id) or clip_path
                     from video_intro_strip import compliance_intro_skip_sec
@@ -2469,7 +2614,7 @@ async def generate_hook_video(
                 pro_segments: list[Path] = []
                 if splash_segment and splash_segment.is_file():
                     pro_segments.append(splash_segment)
-                if golden_src and golden_src.is_file():
+                if opening_enabled and golden_src and golden_src.is_file():
                     golden_final = work / f"00_golden{file_tag}.mp4"
                     enhance_golden_opening_clip(
                         golden_src,
@@ -2495,7 +2640,7 @@ async def generate_hook_video(
                         body_seconds_total = sum(
                             _probe_duration(p) or 0.0 for p in body_paths
                         )
-                elif body_paths:
+                elif opening_enabled and body_paths:
                     golden_src = work / f"00_golden_src{file_tag}.mp4"
                     from video_intro_strip import compliance_intro_skip_sec
 
@@ -2574,12 +2719,12 @@ async def generate_hook_video(
                     )
 
                 freeze_mp4 = work / f"98_fadeout{file_tag}.mp4"
-                from hook_duration_budget import hook_target_min_sec
                 from hook_timeline import (
                     body_outro_skip_transition,
                     body_outro_use_fade,
                     body_tail_fade_sec,
                     freeze_hold_sec,
+                    timeline_total_sec,
                 )
 
                 splash_dur_pre = (
@@ -2596,7 +2741,7 @@ async def generate_hook_video(
                 outro_dur_est = outro_dur_pro or outro_cta_sec()
                 skip_tail = body_outro_skip_transition()
                 fade_dur = 0.0 if skip_tail else freeze_hold_sec()
-                min_total = hook_target_min_sec()
+                min_total = timeline_total_sec()
                 projected = (
                     splash_dur_pre
                     + golden_dur_pre

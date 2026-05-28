@@ -1,4 +1,4 @@
-"""专业 60 秒推荐钩子：0-5s 口播(A 类画面) / 5-50s 正片 45s(A+B 快切) / 定格 / 尾帧。"""
+"""专业 30 秒强钩子：片头口播 + 23s 冲突高光正片 + 片尾 CTA。"""
 
 from __future__ import annotations
 
@@ -57,19 +57,27 @@ def _read_seg(key: str, default: float, *, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
 
 
+def opening_voiceover_enabled() -> bool:
+    """片头口播开关：关=不生成片头口播段，直接进入正片。"""
+    v = os.getenv("HONGGUO_OPENING_VOICEOVER", "1").strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
 def golden_open_sec() -> float:
-    return _read_seg("HONGGUO_GOLDEN_OPEN_SEC", 3.5, lo=2.5, hi=5.0)
+    if not opening_voiceover_enabled():
+        return 0.0
+    return _read_seg("HONGGUO_GOLDEN_OPEN_SEC", 4.0, lo=2.0, hi=6.0)
 
 
 def ai_body_script_max_sec() -> float:
-    """AI 剪辑脚本（正片 clips 合计）硬上限。"""
-    return _read_seg("HONGGUO_AI_BODY_SCRIPT_MAX_SEC", 65.0, lo=55.0, hi=75.0)
+    """AI 剪辑脚本（正片 clips 合计）硬上限。默认 23s 强冲突快剪。"""
+    return _read_seg("HONGGUO_AI_BODY_SCRIPT_MAX_SEC", 23.0, lo=15.0, hi=40.0)
 
 
 def ai_body_script_optimal_range() -> tuple[float, float]:
-    """AI 剪辑脚本推荐时长区间（秒）。"""
-    lo = _read_seg("HONGGUO_AI_BODY_SCRIPT_OPT_LO", 50.0, lo=40.0, hi=62.0)
-    hi = _read_seg("HONGGUO_AI_BODY_SCRIPT_OPT_HI", 60.0, lo=48.0, hi=65.0)
+    """AI 剪辑脚本推荐时长区间（秒）。默认聚焦 23s 冲突高光。"""
+    lo = _read_seg("HONGGUO_AI_BODY_SCRIPT_OPT_LO", 21.0, lo=15.0, hi=30.0)
+    hi = _read_seg("HONGGUO_AI_BODY_SCRIPT_OPT_HI", 23.0, lo=18.0, hi=35.0)
     mx = ai_body_script_max_sec()
     return lo, min(hi, mx)
 
@@ -92,7 +100,7 @@ def body_main_sec() -> float:
 
 def freeze_hold_sec() -> float:
     """正片结尾过渡时长（淡出模式为淡出长度，定格模式为静帧时长）；0=跳过，直接接片尾口播。"""
-    return _read_seg("HONGGUO_FREEZE_SEC", 1.0, lo=0.0, hi=12.0)
+    return _read_seg("HONGGUO_FREEZE_SEC", 0.0, lo=0.0, hi=12.0)
 
 
 def body_outro_skip_transition() -> bool:
@@ -152,14 +160,14 @@ def intro_outro_overhead_pro() -> float:
 def fixed_opening_line() -> str:
     return (
         os.getenv("HONGGUO_FIXED_OPENING_TEXT", "").strip()
-        or "一分钟带您看好剧！"
+        or "30秒速览精品好剧！"
     )
 
 
 def fixed_outro_line() -> str:
     return (
         os.getenv("HONGGUO_FIXED_OUTRO_TEXT", "").strip()
-        or "关注我，带您精准找好剧"
+        or "剧名在评论区"
     )
 
 
@@ -181,7 +189,7 @@ def timeline_summary() -> str:
         else f"；正片参考 {opt_lo:.0f}–{opt_hi:.0f}s"
     )
     return (
-        f"专业60s 模板参考(.env)：黄金口播≤{golden_open_sec():.0f}s + "
+        f"专业30s 模板参考(.env)：黄金口播≤{golden_open_sec():.0f}s + "
         f"正片参考{body_main_sec():.0f}s + 尾过渡{freeze_hold_sec():.0f}s + "
         f"尾帧{outro_cta_sec():.0f}s{story_note}"
     )

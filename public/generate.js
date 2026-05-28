@@ -8,7 +8,6 @@ const MAX_SELECT = 6;
 const titleEl = document.getElementById("drama-title");
 const metaEl = document.getElementById("drama-meta");
 const panelTitleEl = document.getElementById("episode-panel-title");
-const keywordEl = document.getElementById("keyword");
 const btnPreviewSplash = document.getElementById("btn-preview-splash");
 const splashPreviewEl = document.getElementById("splash-preview");
 const splashTitleFontEl = document.getElementById("splash-title-font");
@@ -95,9 +94,6 @@ let lastDownloadUrl = "";
 let previewObjectUrl = "";
 
 titleEl.textContent = dramaTitle;
-if (keywordEl && !keywordEl.value.trim()) {
-  keywordEl.value = "";
-}
 metaEl.textContent = dramaIntro
   ? dramaIntro.slice(0, 120) + (dramaIntro.length > 120 ? "…" : "")
   : `ID: ${seriesId}`;
@@ -152,18 +148,11 @@ loadSplashFontsFromStorage();
 loadServiceConfig();
 refreshSplashPreview();
 useFqKocEl?.addEventListener("change", loadServiceConfig);
-keywordEl?.addEventListener("input", () => {
-  updateGenerateState();
-  scheduleSplashPreview();
-});
-
 let splashPreviewTimer = 0;
 function splashPreviewUrl() {
-  const kw = (keywordEl?.value || "").trim();
   const { splash_title_font, splash_subtitle_font } = getSplashFontSizes();
   const badge = getSplashBadge();
   const q = new URLSearchParams({
-    keyword: kw,
     title_font: String(splash_title_font),
     subtitle_font: String(splash_subtitle_font),
     _: String(Date.now()),
@@ -174,12 +163,6 @@ function splashPreviewUrl() {
 
 function refreshSplashPreview() {
   if (!splashPreviewEl) return;
-  const kw = (keywordEl?.value || "").trim();
-  if (!kw) {
-    splashPreviewEl.classList.add("hidden");
-    splashPreviewEl.removeAttribute("src");
-    return;
-  }
   splashPreviewEl.src = splashPreviewUrl();
   splashPreviewEl.classList.remove("hidden");
 }
@@ -204,18 +187,15 @@ splashBadgeEl?.addEventListener("input", () => {
 });
 
 function updateGenerateState() {
-  const hasKeyword = Boolean(keywordEl?.value.trim());
   const hasEpisodes = selected.size > 0;
-  const ready = seriesId && hasEpisodes && hasKeyword;
+  const ready = seriesId && hasEpisodes;
   btnGenerate.disabled = !ready;
   if (generateHint) {
-    if (!hasKeyword) {
-      generateHint.textContent = "请填写片头关键词（1 秒《关键词》片头）后再生成";
-    } else if (!hasEpisodes) {
+    if (!hasEpisodes) {
       generateHint.textContent = "请选择至少 1 集";
     } else {
       generateHint.textContent =
-        "AI 只留最精彩：片头 → 解说卡 → 多集快切正片（约2分30–3分30）→ 片尾";
+        "两段高光直剪：每集 2 段最高光，成片约 30 秒（默认不调用 AI）。";
     }
   }
 }
@@ -387,8 +367,8 @@ function renderEpisodes() {
       }
       generateHint.textContent =
         selected.size === 1
-          ? "已选 1 集：AI 剪辑大师只留最精彩片段"
-          : `已选 ${selected.size} 集：AI 只留最精彩，拼成约 2分30–3分30 钩子`;
+          ? "已选 1 集：取 2 段最高光直剪"
+          : `已选 ${selected.size} 集：每集 2 段高光，拼成约 30 秒`;
       if (selected.size === 1) {
         loadServiceConfig(id);
         // 选中 1 集时尝试自动把该集 CDN MP4 缓存到本地（失败则提示手动/导入）。
@@ -593,14 +573,6 @@ downloadLink.addEventListener("click", (e) => {
 btnGenerate.addEventListener("click", async () => {
   if (btnGenerate.disabled) return;
 
-  const keyword = (keywordEl?.value || "").trim();
-  if (!keyword) {
-    resultPanel.classList.remove("hidden");
-    resultMsg.textContent = "请先填写片头关键词（显示为《关键词》的 1 秒片头）";
-    keywordEl?.focus();
-    return;
-  }
-
   btnGenerate.disabled = true;
   btnGenerate.textContent = "正在生成，请稍候…";
   resultPanel.classList.remove("hidden");
@@ -621,7 +593,6 @@ btnGenerate.addEventListener("click", async () => {
         series_id: seriesId,
         drama_title: dramaTitle,
         cover_url: coverUrl,
-        keyword,
         ...getSplashFontSizes(),
         episode_item_ids: Array.from(selected),
         use_ai_edit: Boolean(useAiEditEl?.checked),
