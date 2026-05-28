@@ -285,83 +285,259 @@ async def _discover_book_detail_url(
     page: Any,
     book_id: str,
     item_id: str,
+    drama_title: str = "",
     *,
     timeout_ms: int = 60_000,
 ) -> str:
     """
-    在推广中心内容库检索 book_id，从真实跳转后的地址栏解析 genre 等参数并缓存。
-    避免手填 HONGGUO_FQ_KOC_GENRE。
+    先进入推广中心内容库主页，再尝试检索 book_id 并解析 book-detail 参数缓存。
+    默认不强制直达 book-detail，避免落在“加载中”页。
     """
     bid = (book_id or "").strip()
+    keyword = (drama_title or "").strip()
     if not bid:
         return build_koc_book_detail_url(book_id, item_id)
-
-    cached = load_book_detail_meta(bid)
-    if cached.get("genre"):
-        url = build_koc_book_detail_url(bid, item_id)
-        logger.info(
-            "复用已检索的 book-detail（genre=%s）",
-            cached.get("genre"),
-        )
-        return url
 
     hub = koc_content_hub_url(bid)
     logger.info("浏览器检索 book_id=%s：打开内容库", bid)
     await page.goto(hub, wait_until="domcontentloaded", timeout=timeout_ms)
-    await page.wait_for_timeout(2500)
+    await page.wait_for_timeout(3500)
+
+    async def _click_first_result(*, term: str) -> dict[str, str]:
+        """优先点包含剧名的结果链接；其次点包含 book_id 的链接。"""
+        t = (term or "").strip()
+        if t:
+            try:
+                loc = page.locator(f"a:has-text('{t}')").first
+                if await loc.count():
+                    await loc.click(timeout=2500)
+                    return {"via": "pw_link_title", "term": t}
+            except Exception:
+                pass
+        try:
+            loc = page.locator(f"a[href*='{bid}']").first
+            if await loc.count():
+                await loc.click(timeout=2500)
+                return {"via": "pw_link_book_id", "term": bid}
+        except Exception:
+            pass
+        return {"via": "no_result_link"}
+
+    async def _search_once(term: str) -> dict[str, str]:
+        term = (term or "").strip()
+        if not term:
+            return {"via": "empty_term"}
+        selectors = (
+            "input[placeholder*='Book']",
+            "input[placeholder*='book']",
+            "input[placeholder*='书名']",
+            "input[placeholder*='作者']",
+            "input[type='search']",
+            "input.el-input__inner",
+        )
+        input_loc = None
+        for sel in selectors:
+            loc = page.locator(sel)
+            if await loc.count():
+                input_loc = loc.first
+                break
+        if input_loc is None:
+            return {"via": "fallback_no_input", "term": term}
+        try:
+            await input_loc.click(timeout=2000)
+            await input_loc.fill("")
+            await input_loc.fill(term)
+            await input_loc.press("Enter")
+            await page.wait_for_timeout(2200)
+        except Exception:
+            return {"via": "input_action_failed", "term": term}
+        hit = await _click_first_result(term=term)
+        if hit.get("via", "").startswith("pw_link_"):
+            return hit
+        return {"via": "searched_no_hit", "term": term}
+
+    # 先用 Playwright 原生输入事件做一轮搜索（比页面内 evaluate 触发更稳）。
+    title_variants: list[str] = []
+    if keyword:
+        title_variants.append(keyword)
+        short = re.split(r"[：:|·\\-\\s]", keyword)[0].strip()
+        if short and short != keyword:
+            title_variants.append(short)
+    title_variants.append(bid)
+    seen_terms: set[str] = set()
+    for q in title_variants:
+        q = q.strip()
+        if not q or q in seen_terms:
+            continue
+        seen_terms.add(q)
+        pw_try = await _search_once(q)
+        logger.info("内容库原生检索结果: %s（keyword=%s）", pw_try.get("via"), q[:30])
+        if pw_try.get("via", "").startswith("pw_link_"):
+            try:
+                await page.wait_for_url("**/book-detail**", timeout=12_000)
+            except Exception:
+                await page.wait_for_timeout(2500)
+            break
 
     navigated = await page.evaluate(
-        """async (bookId) => {
+        """async ({ bookId, keyword }) => {
           const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
           const hasBook = (href) =>
             href && (href.includes('book_id=' + bookId) || href.includes(bookId));
+          const hasKeyword = (text) =>
+            keyword && text && String(text).includes(keyword);
+          const searchText = keyword || bookId;
+          const inputSelectors = [
+            'input[placeholder*="Book"]',
+            'input[placeholder*="book"]',
+            'input[placeholder*="书名"]',
+            'input[placeholder*="作者"]',
+            'input[type="search"]',
+            'input.el-input__inner',
+            'input',
+          ];
+          const pickInput = () => {
+            const isVisible = (el) =>
+              !!el &&
+              !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+            for (const sel of inputSelectors) {
+              const list = [...document.querySelectorAll(sel)];
+              // 优先右上搜索框（通常宽度更大、位置更靠右）
+              list.sort((a, b) => {
+                const ra = a.getBoundingClientRect();
+                const rb = b.getBoundingClientRect();
+                return rb.right - ra.right;
+              });
+              const hit = list.find(isVisible);
+              if (hit) return hit;
+            }
+            return null;
+          };
+          const clickResultByText = () => {
+            const rows = [
+              ...document.querySelectorAll(
+                'a[href], .item, .card, .row, li, tr, [class*="item"], [class*="card"]'
+              ),
+            ];
+            for (const el of rows) {
+              const txt = (el.textContent || '').trim();
+              if (!txt) continue;
+              const href = el.getAttribute && (el.getAttribute('href') || '');
+              if (hasBook(href)) {
+                el.click();
+                return { via: 'row_href', href: href || '' };
+              }
+              if (hasKeyword(txt)) {
+                // 优先点击行内可跳转 a
+                const a = el.querySelector && el.querySelector('a[href]');
+                if (a) {
+                  a.click();
+                  return { via: 'row_title_link', href: a.getAttribute('href') || '' };
+                }
+                el.click();
+                return { via: 'row_title', href: href || '' };
+              }
+            }
+            return null;
+          };
           for (const a of document.querySelectorAll('a[href]')) {
             const href = a.getAttribute('href') || '';
             if (hasBook(href)) {
               a.click();
               return { via: 'link', href: a.href || href };
             }
+            if (hasKeyword(a.textContent || '')) {
+              a.click();
+              return { via: 'link_title', href: a.href || href };
+            }
           }
-          const inputs = [...document.querySelectorAll('input')].filter((el) => {
-            const hint =
-              (el.placeholder || '') +
-              (el.getAttribute('aria-label') || '') +
-              (el.className || '');
-            return /搜|查询|关键|search/i.test(hint) || el.type === 'search';
-          });
-          if (inputs.length) {
-            const inp = inputs[0];
+          const inp = pickInput();
+          if (inp) {
             inp.focus();
-            inp.value = bookId;
+            inp.value = searchText;
             inp.dispatchEvent(new Event('input', { bubbles: true }));
+            inp.dispatchEvent(new Event('change', { bubbles: true }));
             inp.dispatchEvent(
               new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })
             );
+            inp.dispatchEvent(
+              new KeyboardEvent('keyup', { key: 'Enter', bubbles: true })
+            );
             await sleep(2500);
+            const rowHit = clickResultByText();
+            if (rowHit) return rowHit;
             for (const a of document.querySelectorAll('a[href]')) {
               const href = a.getAttribute('href') || '';
               if (hasBook(href)) {
                 a.click();
                 return { via: 'search', href: a.href || href };
               }
+              if (hasKeyword(a.textContent || '')) {
+                a.click();
+                return { via: 'search_title', href: a.href || href };
+              }
             }
+            return { via: 'searched_no_hit', q: searchText };
           }
-          return { via: 'none' };
+          return { via: 'none', q: searchText };
         }""",
-        bid,
+        {"bookId": bid, "keyword": keyword},
     )
-    logger.info("内容库检索结果: %s", navigated.get("via"))
+    logger.info(
+        "内容库检索结果: %s（keyword=%s）",
+        navigated.get("via"),
+        (keyword or bid)[:30],
+    )
+
+    if navigated.get("via") in ("none", "searched_no_hit") and keyword and keyword != bid:
+        await page.wait_for_timeout(1800)
+        retry = await page.evaluate(
+            """async ({ bookId }) => {
+              const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+              const hasBook = (href) =>
+                href && (href.includes('book_id=' + bookId) || href.includes(bookId));
+              const inputs = [
+                ...document.querySelectorAll(
+                  'input[placeholder*="Book"], input[placeholder*="book"], input[placeholder*="书名"], input[type="search"], input.el-input__inner, input'
+                ),
+              ].filter((el) => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+              if (!inputs.length) return { via: 'fallback_no_input' };
+              inputs.sort((a, b) => b.getBoundingClientRect().right - a.getBoundingClientRect().right);
+              const inp = inputs[0];
+              inp.focus();
+              inp.value = bookId;
+              inp.dispatchEvent(new Event('input', { bubbles: true }));
+              inp.dispatchEvent(new Event('change', { bubbles: true }));
+              inp.dispatchEvent(
+                new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })
+              );
+              inp.dispatchEvent(
+                new KeyboardEvent('keyup', { key: 'Enter', bubbles: true })
+              );
+              await sleep(2500);
+              for (const a of document.querySelectorAll('a[href]')) {
+                const href = a.getAttribute('href') || '';
+                if (hasBook(href)) {
+                  a.click();
+                  return { via: 'search_book_id', href: a.href || href };
+                }
+              }
+              return { via: 'fallback_no_hit' };
+            }""",
+            {"bookId": bid},
+        )
+        logger.info("内容库检索回退 book_id 结果: %s", retry.get("via"))
+        if retry.get("via") in ("search_book_id",):
+            try:
+                await page.wait_for_url("**/book-detail**", timeout=15_000)
+            except Exception:
+                await page.wait_for_timeout(2500)
 
     if navigated.get("via") != "none":
         try:
             await page.wait_for_url("**/book-detail**", timeout=15_000)
         except Exception:
             await page.wait_for_timeout(3000)
-    else:
-        seed = build_koc_book_detail_url(bid, item_id)
-        logger.info("内容库未命中链接，尝试直达: %s", seed[:100])
-        await page.goto(seed, wait_until="domcontentloaded", timeout=timeout_ms)
-        await page.wait_for_timeout(3000)
 
     final = page.url or ""
     if "book-detail" in final and bid in final:
@@ -377,12 +553,14 @@ async def _discover_book_detail_url(
             return target
         return final
 
-    return build_koc_book_detail_url(bid, item_id)
+    logger.info("内容库未命中 book-detail，保持主页检索流程")
+    return hub
 
 
 async def _run_in_browser(
     book_id: str,
     item_id: str,
+    drama_title: str = "",
     *,
     open_browser: Optional[bool] = None,
     timeout_sec: int = 180,
@@ -427,8 +605,11 @@ async def _run_in_browser(
             page,
             book_id,
             item_id,
+            drama_title=drama_title,
             timeout_ms=timeout_sec * 1000,
         )
+        if "book-detail" not in (page_url or ""):
+            raise RuntimeError("内容库未命中目标剧，跳过浏览器自动下载")
         logger.info("Playwright 使用 book-detail: %s", page_url)
 
         def on_request(request: Any) -> None:
@@ -660,6 +841,7 @@ async def auto_download_episode_to_cache(
     book_id: str,
     item_id: str,
     cache_path: Path,
+    drama_title: str = "",
     open_browser: Optional[bool] = None,
 ) -> Path:
     """自动在浏览器内签名并下载 MP4 到本地缓存路径。"""
@@ -682,6 +864,7 @@ async def auto_download_episode_to_cache(
             info = await _run_in_browser(
                 book_id,
                 item_id,
+                drama_title=drama_title,
                 open_browser=try_headed,
                 timeout_sec=180,
                 download_to=cache_path,
@@ -711,12 +894,17 @@ async def auto_download_episode_to_cache(
 async def sync_koc_auth_via_browser(
     book_id: str,
     item_id: str,
+    drama_title: str = "",
     *,
     open_browser: Optional[bool] = None,
     timeout_sec: int = 120,
 ) -> dict[str, Any]:
     info = await _run_in_browser(
-        book_id, item_id, open_browser=open_browser, timeout_sec=timeout_sec
+        book_id,
+        item_id,
+        drama_title=drama_title,
+        open_browser=open_browser,
+        timeout_sec=timeout_sec,
     )
     return {
         "ok": True,
@@ -731,6 +919,7 @@ async def sync_koc_auth_via_browser(
 async def ensure_koc_auth(
     book_id: str,
     item_id: str,
+    drama_title: str = "",
     *,
     force: bool = False,
 ) -> bool:
@@ -743,7 +932,9 @@ async def ensure_koc_auth(
     try:
         # 有浏览器档案时优先无头同步 token，仅失败时再弹窗（见 sync 内重试）
         ob: Optional[bool] = False if _profile_ready() else None
-        await sync_koc_auth_via_browser(book_id, item_id, open_browser=ob)
+        await sync_koc_auth_via_browser(
+            book_id, item_id, drama_title=drama_title, open_browser=ob
+        )
         return True
     except Exception as exc:
         logger.warning("自动同步达人中心权限失败: %s", exc)

@@ -1056,6 +1056,119 @@ def _normalize_list_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return out
 
 
+def _iter_string_values(obj: Any) -> list[str]:
+    out: list[str] = []
+    stack = [obj]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, str):
+            out.append(cur)
+        elif isinstance(cur, dict):
+            stack.extend(cur.values())
+        elif isinstance(cur, list):
+            stack.extend(cur)
+    return out
+
+
+def _looks_like_media_url(url: str) -> bool:
+    u = (url or "").strip()
+    if not u.startswith("http"):
+        return False
+    low = u.lower()
+    return (
+        "fanqieopenvod" in low
+        or "fqkol" in low
+        or ".mp4" in low
+        or "video/tos/" in low
+    )
+
+
+def _extract_media_url_from_item(item: dict[str, Any]) -> str:
+    # 先走已知字段
+    for key in (
+        "download_url",
+        "play_url",
+        "video_url",
+        "url",
+        "mp4_url",
+        "source_url",
+    ):
+        v = item.get(key)
+        if isinstance(v, str) and _looks_like_media_url(v):
+            return v
+    # 再递归扫整个结构里的字符串
+    for s in _iter_string_values(item):
+        if _looks_like_media_url(s):
+            return s
+    return ""
+
+
+async def _resolve_direct_url_from_content_list(
+    client: httpx.AsyncClient,
+    *,
+    book_id: str,
+    item_id: str,
+    drama_title: str,
+) -> str:
+    """
+    兜底方案：从达人中心内容列表接口直接取该集的播放/下载地址，绕开 Playwright 页面搜索。
+    """
+    terms: list[str] = []
+    title = (drama_title or "").strip()
+    if title:
+        terms.append(title)
+        short = re.split(r"[：:|·\-\s]", title)[0].strip()
+        if short and short != title:
+            terms.append(short)
+    if book_id:
+        terms.append(book_id)
+    if item_id:
+        terms.append(item_id)
+
+    seen: set[str] = set()
+    tab = int(os.getenv("HONGGUO_FQ_KOC_TAB_TYPE", "6").strip() or "6")
+    for term in terms:
+        t = term.strip()
+        if not t or t in seen:
+            continue
+        seen.add(t)
+        try:
+            items = await search_member_content(
+                client, t, tab_type=tab, page=1, page_size=60
+            )
+        except Exception as exc:
+            logger.debug("内容列表检索失败（term=%s）: %s", t, exc)
+            continue
+        # 先精准 item_id 命中
+        for it in items:
+            iid = str(
+                it.get("item_id")
+                or it.get("content_item_id")
+                or it.get("episode_item_id")
+                or it.get("id")
+                or ""
+            )
+            bid = str(it.get("book_id") or it.get("series_id") or "")
+            if item_id and iid and iid != item_id:
+                continue
+            if book_id and bid and bid != book_id:
+                continue
+            u = _extract_media_url_from_item(it)
+            if u:
+                logger.info("内容列表命中直链（term=%s，item=%s）", t, iid or "-")
+                return u
+        # 再尝试同 book_id 的任一条（有些返回不带 item_id）
+        for it in items:
+            bid = str(it.get("book_id") or it.get("series_id") or "")
+            if book_id and bid and bid != book_id:
+                continue
+            u = _extract_media_url_from_item(it)
+            if u:
+                logger.info("内容列表 book 命中直链（term=%s）", t)
+                return u
+    return ""
+
+
 async def create_batch_download(
     client: httpx.AsyncClient,
     *,
@@ -1319,7 +1432,10 @@ async def resolve_episode_download_url(
             if browser_sync_available():
                 try:
                     sync = await sync_koc_auth_via_browser(
-                        book_id, item_id, open_browser=False
+                        book_id,
+                        item_id,
+                        drama_title="",
+                        open_browser=False,
                     )
                     url = str(sync.get("download_url") or "").strip()
                     if url.startswith("http"):
@@ -1422,6 +1538,34 @@ async def fetch_fq_koc_episode(
     if not _cookie_effective():
         raise_material_download_error(book_id=book_id, item_id=item_id)
 
+    # 用户开启自动浏览器同步时，直接走浏览器下载，避免无效的
+    # batch_download/create 多轮重试刷日志。
+    from fq_koc_browser import _auto_sync_enabled, auto_download_episode_to_cache, browser_sync_available
+
+    if _auto_sync_enabled() and browser_sync_available():
+        cache = _cache_path(book_id, item_id)
+        logger.info("AUTO_SYNC=1：跳过 batch_download 轮询，直接浏览器自动下载: %s", item_id)
+        try:
+            await auto_download_episode_to_cache(
+                client,
+                book_id=book_id,
+                item_id=item_id,
+                cache_path=cache,
+                drama_title=drama_title,
+            )
+            validate_local_material(book_id, item_id)
+            _link_or_copy(cache, dest)
+            return {
+                "local_path": dest,
+                "play_url": "",
+                "book_id": book_id,
+                "item_id": item_id,
+                "source": "fq_koc_auto",
+                "caption": drama_title,
+            }
+        except RuntimeError as exc:
+            logger.info("浏览器自动下载跳过/失败，回退后续流程: %s", exc)
+
     if not _ms_token() or not _a_bogus():
         raise_material_download_error(book_id=book_id, item_id=item_id)
 
@@ -1438,11 +1582,7 @@ async def fetch_fq_koc_episode(
         last_api_errors.append(str(exc))
 
     if not play_url.startswith("http"):
-        from fq_koc_browser import (
-            _auto_sync_enabled,
-            auto_download_episode_to_cache,
-            browser_sync_available,
-        )
+        from fq_koc_browser import _auto_sync_enabled, auto_download_episode_to_cache, browser_sync_available
 
         if browser_sync_available() and _auto_sync_enabled():
             cache = _cache_path(book_id, item_id)
@@ -1453,6 +1593,7 @@ async def fetch_fq_koc_episode(
                     book_id=book_id,
                     item_id=item_id,
                     cache_path=cache,
+                    drama_title=drama_title,
                 )
                 validate_local_material(book_id, item_id)
                 _link_or_copy(cache, dest)
@@ -1467,6 +1608,21 @@ async def fetch_fq_koc_episode(
             except RuntimeError as exc:
                 last_api_errors.append(str(exc))
 
+        # 页面法失败后，尝试纯接口直链兜底（不依赖 Playwright 页面搜索）。
+        try:
+            list_url = await _resolve_direct_url_from_content_list(
+                client,
+                book_id=book_id,
+                item_id=item_id,
+                drama_title=drama_title,
+            )
+            if list_url.startswith("http"):
+                play_url = apply_fanqie_vod_query(list_url)
+                logger.info("已切换到内容列表直链下载兜底: %s", item_id)
+        except Exception as exc:
+            last_api_errors.append(f"内容列表直链兜底失败: {exc}")
+
+    if not play_url.startswith("http"):
         raise_material_download_error(
             book_id=book_id,
             item_id=item_id,

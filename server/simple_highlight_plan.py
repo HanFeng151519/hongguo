@@ -142,6 +142,34 @@ def _moments_to_clips(
     return clips
 
 
+def _merge_nearby_clips(
+    clips: list[ClipFragment], *, max_gap_sec: float = 1.0
+) -> list[ClipFragment]:
+    """
+    两段高光若重叠或间隔过小，直接合并为一段，避免观感重复。
+    max_gap_sec=1.0 表示前后相距 <=1s 也视为同一段。
+    """
+    if len(clips) < 2:
+        return clips
+    ordered = sorted(clips, key=lambda c: c.trim_start_sec)
+    merged: list[ClipFragment] = [ordered[0]]
+    for cur in ordered[1:]:
+        prev = merged[-1]
+        prev_end = prev.trim_start_sec + prev.duration_sec
+        gap = cur.trim_start_sec - prev_end
+        if gap <= max_gap_sec:
+            new_start = min(prev.trim_start_sec, cur.trim_start_sec)
+            new_end = max(prev_end, cur.trim_start_sec + cur.duration_sec)
+            merged[-1] = ClipFragment(
+                trim_start_sec=round(new_start, 2),
+                duration_sec=round(max(0.8, new_end - new_start), 2),
+                reason="A|高光合并：相邻片段去重",
+            )
+            continue
+        merged.append(cur)
+    return merged
+
+
 def plan_simple_two_highlight(
     *,
     drama_title: str = "",
@@ -184,6 +212,14 @@ def plan_simple_two_highlight(
             target_sec=per_ep,
             intro_skip=intro_skip,
         )
+        before_merge = len(clips)
+        clips = _merge_nearby_clips(clips, max_gap_sec=1.0)
+        if len(clips) < before_merge:
+            logger.info(
+                "第%d集 两段高光存在重叠/贴边，已自动合并为 %d 段",
+                i + 1,
+                len(clips),
+            )
         trim, total, clips = sync_segment_from_clips(
             trim_start_sec=clips[0].trim_start_sec if clips else 0.0,
             duration_sec=per_ep,

@@ -598,6 +598,7 @@ async def sync_fq_koc_session(body: FqKocSessionSyncRequest):
         result = await sync_koc_auth_via_browser(
             book_id,
             item_id,
+            drama_title=body.drama_title.strip(),
             open_browser=body.open_browser,
         )
     except RuntimeError as exc:

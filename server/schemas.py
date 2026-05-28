@@ -78,6 +78,7 @@ class FqKocSessionImportRequest(BaseModel):
 class FqKocSessionSyncRequest(BaseModel):
     series_id: str = Field(default="", description="短剧 book_id，用于在页面内试下载")
     item_id: str = Field(default="", description="分集 item_id")
+    drama_title: str = Field(default="", description="剧名，浏览器优先按剧名检索")
     open_browser: bool = Field(
         default=True,
         description="True=弹出浏览器（首次登录）；False=无头同步",
