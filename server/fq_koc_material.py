@@ -800,6 +800,27 @@ def local_material_decode_ok(path: Path) -> bool:
     return video_decodes(path, min_frames=3)
 
 
+def has_usable_local_episode(book_id: str, item_id: str) -> bool:
+    """本地已有且可解码的正片（无需再走达人中心下载）。"""
+    path = find_local_material(book_id, item_id)
+    return bool(path and local_material_decode_ok(path))
+
+
+def episodes_missing_local(book_id: str, episode_item_ids: list[str]) -> list[str]:
+    """返回尚未具备可用本地缓存的 item_id 列表。"""
+    return [
+        item_id
+        for item_id in episode_item_ids
+        if not has_usable_local_episode(book_id, item_id)
+    ]
+
+
+def episodes_all_cached_locally(book_id: str, episode_item_ids: list[str]) -> bool:
+    if not episode_item_ids:
+        return False
+    return len(episodes_missing_local(book_id, episode_item_ids)) == 0
+
+
 def find_local_material(book_id: str, item_id: str) -> Optional[Path]:
     """达人中心浏览器下载的 MP4 可放到 public/materials/fq_koc/ 下复用。"""
     MATERIAL_DIR.mkdir(parents=True, exist_ok=True)
@@ -1557,10 +1578,9 @@ async def fetch_fq_koc_episode(
     dest = dest_dir / f"{safe}_{item_id}.mp4"
 
     cached = find_local_material(book_id, item_id)
-    if cached:
-        validate_local_material(book_id, item_id)
+    if cached and local_material_decode_ok(cached):
         _link_or_copy(cached, dest)
-        logger.info("使用本地达人中心素材（硬链/拷贝）: %s", cached.name)
+        logger.info("使用本地达人中心素材（跳过下载）: %s", cached.name)
         return {
             "local_path": dest,
             "play_url": "",
@@ -1569,6 +1589,11 @@ async def fetch_fq_koc_episode(
             "source": "fq_koc_local",
             "caption": drama_title,
         }
+    if cached:
+        logger.warning(
+            "本地素材 %s 无法解码，将尝试从达人中心重新获取",
+            cached.name,
+        )
 
     direct_url = _direct_mp4_url(book_id, item_id)
     if direct_url:

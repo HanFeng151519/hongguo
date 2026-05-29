@@ -644,6 +644,63 @@ def default_plan(
     return plan
 
 
+def plan_from_manual_dict(
+    raw: dict[str, Any],
+    *,
+    drama_title: str = "",
+    opening: str = "",
+    keyword: str = "",
+    episode_labels: list[str],
+    episode_durations: list[float],
+) -> HookEditPlan:
+    """使用者手動填寫的多段剪輯方案：保留入點，時長對齊鉤子預算（如 30s）。"""
+    plan = _normalize_plan(
+        raw,
+        drama_title=drama_title,
+        opening=opening,
+        keyword=keyword,
+        episode_labels=episode_labels,
+        episode_durations=episode_durations,
+        episode_transcripts=None,
+        episode_edit_briefs=None,
+        manual=True,
+    )
+    ep_n = len(episode_labels) or len(plan.body_segments) or 1
+    from manual_edit_plan import apply_manual_hook_clip_budget
+
+    body_total = apply_manual_hook_clip_budget(
+        plan.body_segments, episode_count=ep_n
+    )
+    if not (plan.hook_summary or "").strip():
+        plan.hook_summary = "手動多段剪輯"
+    try:
+        from hook_duration_budget import hook_duration_range_text
+
+        summary = plan.hook_summary or ""
+        if body_total > 0 and "成片" not in summary:
+            base = summary.split("（")[0].strip() or "手動多段剪輯"
+            plan.hook_summary = (
+                f"{base}（正片约 {body_total:.0f}s，成片 {hook_duration_range_text()}）"
+            )
+    except ImportError:
+        pass
+    import logging
+
+    log = logging.getLogger(__name__)
+    for seg in plan.body_segments:
+        clips = seg.resolved_clips()
+        if clips:
+            log.info(
+                "手動方案 第%d集 %d 段: %s",
+                seg.episode_index,
+                len(clips),
+                ", ".join(
+                    f"{c.trim_start_sec:.1f}s+{c.duration_sec:.1f}s" for c in clips
+                ),
+            )
+    return plan
+
+
 def _normalize_plan(
     raw: dict[str, Any],
     *,
@@ -654,6 +711,7 @@ def _normalize_plan(
     episode_durations: list[float],
     episode_transcripts: Optional[dict[int, list]] = None,
     episode_edit_briefs: Optional[dict] = None,
+    manual: bool = False,
 ) -> HookEditPlan:
     short = _title_short(drama_title)
     opening_text = (
@@ -691,6 +749,38 @@ def _normalize_plan(
                 if idx - 1 < len(episode_durations)
                 else 120.0
             )
+            label = str(item.get("label") or "")
+            if not label and idx - 1 < len(episode_labels):
+                label = episode_labels[idx - 1]
+            raw_clips = normalize_clip_list(
+                item.get("clips") or item.get("fragments") or item.get("cuts"),
+                preserve_manual=manual,
+            )
+            if manual:
+                from multi_clip import clamp_clips_to_source
+
+                raw_clips = clamp_clips_to_source(raw_clips, dur_avail=dur_avail)
+                if not raw_clips:
+                    continue
+                trim, duration, raw_clips = sync_segment_from_clips(
+                    trim_start_sec=0.0,
+                    duration_sec=sum(c.duration_sec for c in raw_clips),
+                    clips=raw_clips,
+                )
+                segments.append(
+                    BodySegmentPlan(
+                        episode_index=idx,
+                        trim_start_sec=trim,
+                        duration_sec=duration,
+                        label=label,
+                        reason=str(item.get("reason") or "手動剪輯"),
+                        clips=raw_clips,
+                        clips_dialogue_full=[],
+                        meme_captions=[],
+                        meme_beats=[],
+                    )
+                )
+                continue
             trim_start = _clamp(
                 float(item.get("trim_start_sec") or item.get("start_sec") or 0),
                 0.0,
@@ -714,12 +804,7 @@ def _normalize_plan(
             except ImportError:
                 pass
             duration = _clamp(duration, min_body, min(max_body, max_allowed))
-            label = str(item.get("label") or "")
-            if not label and idx - 1 < len(episode_labels):
-                label = episode_labels[idx - 1]
-            raw_clips = normalize_clip_list(
-                item.get("clips") or item.get("fragments") or item.get("cuts")
-            )
+            clips_dialogue_full: list[ClipFragment] = []
             if raw_clips:
                 raw_clips = enforce_hook_only_clips(
                     raw_clips,
@@ -970,7 +1055,12 @@ def _normalize_plan(
     ep_n = len(episode_labels) or len(segments)
     from hook_timeline import ai_body_faithful_enabled
 
-    if hook_budget_enabled(ep_n) and segments and not ai_body_faithful_enabled():
+    if (
+        not manual
+        and hook_budget_enabled(ep_n)
+        and segments
+        and not ai_body_faithful_enabled()
+    ):
         scale_body_segments_to_budget(segments, episode_count=ep_n)
         for seg in segments:
             if seg.clips:
@@ -1009,9 +1099,15 @@ def _normalize_plan(
     for cap in plan_caps:
         cap.text = sanitize_promo_copy(cap.text, max_len=24) or cap.text
 
-    _keep_first_dialogue_line(segments, episode_transcripts=episode_transcripts)
-    _keep_flirt_dialogue_lines(segments, episode_transcripts=episode_transcripts)
-    _enforce_head_keep_tail_ai(segments)
+    if not manual:
+        _keep_first_dialogue_line(segments, episode_transcripts=episode_transcripts)
+        _keep_flirt_dialogue_lines(segments, episode_transcripts=episode_transcripts)
+        _enforce_head_keep_tail_ai(segments)
+
+    if manual and not (raw.get("hook_summary") or "").strip():
+        hook_summary = "手動多段剪輯"
+    else:
+        hook_summary = _hook_summary_from_raw(raw)
 
     plan = HookEditPlan(
         opening_text=opening_text,
@@ -1019,13 +1115,13 @@ def _normalize_plan(
         outro_keyword=outro_keyword,
         outro_seconds=outro_seconds,
         body_segments=segments,
-        hook_summary=_hook_summary_from_raw(raw),
+        hook_summary=hook_summary,
         subtitle_hint=subtitle_hint,
         post_caption=post_caption,
         commentary_lines=commentary_lines,
-        edit_style=edit_style,
-        meme_captions=plan_caps,
-        meme_beats=plan_beats,
+        edit_style="manual" if manual else edit_style,
+        meme_captions=plan_caps if not manual else [],
+        meme_beats=plan_beats if not manual else [],
     )
     apply_fixed_opening_to_plan(plan)
     return plan

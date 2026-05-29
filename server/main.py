@@ -22,16 +22,20 @@ from pathlib import Path
 from typing import Any, Optional
 
 import httpx
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from hook_generator import FFMPEG
 
 logging.basicConfig(level=logging.INFO)
 
-from hongguo_api import fetch_episode_video_info, fetch_episodes
+from hongguo_api import (
+    duration_from_episode_info,
+    fetch_episode_video_info,
+    fetch_episodes,
+)
 from ai_edit_planner import default_plan, plan_hook_edit, plan_to_dict
 from hook_generator import generate_hook_video, render_keyword_splash_card
 from douyin_material import (
@@ -62,7 +66,7 @@ from fq_koc_material import (
 )
 from qwen_client import config_info as llm_config_info
 from qwen_client import is_configured as qwen_configured
-from ai_edit_schemas import AiEditPlanRequest
+from ai_edit_schemas import AiEditPlanRequest, ManualEditPlanDraftRequest
 from schemas import (
     FqKocCaptureRequest,
     FqKocCacheUrlRequest,
@@ -416,6 +420,12 @@ async def _set_job(job_id: str, **fields: Any) -> None:
         job.update(fields)
 
 
+async def _job_interrupt_requested(job_id: str) -> bool:
+    async with GENERATE_JOBS_LOCK:
+        job = GENERATE_JOBS.get(job_id) or {}
+        return bool(job.get("interrupt_for_edit"))
+
+
 async def _run_generate_job(job_id: str, body: GenerateHookRequest) -> None:
     set_request_koc_options(
         create_url=body.fq_koc_create_url.strip(),
@@ -429,12 +439,25 @@ async def _run_generate_job(job_id: str, body: GenerateHookRequest) -> None:
     os.environ["HONGGUO_FQ_KOC_SESSION_MUTABLE"] = "0"
     try:
         ep_count = len(body.episode_item_ids)
-        if body.use_fq_koc_material:
-            from fq_koc_browser import _auto_sync_enabled
+        book_id = body.series_id.strip()
+        all_episodes_local = False
+        missing_count = ep_count
+        if body.use_fq_koc_material and book_id:
+            from fq_koc_material import episodes_missing_local
 
-            if _auto_sync_enabled() and browser_sync_available():
-                book_id = body.series_id.strip()
-                if book_id:
+            missing_ids = episodes_missing_local(book_id, body.episode_item_ids)
+            missing_count = len(missing_ids)
+            all_episodes_local = missing_count == 0
+            if all_episodes_local:
+                logging.getLogger(__name__).info(
+                    "job %s: 所选 %d 集均已本地缓存，跳过达人中心登录与下载",
+                    job_id,
+                    ep_count,
+                )
+            else:
+                from fq_koc_browser import _auto_sync_enabled
+
+                if _auto_sync_enabled() and browser_sync_available():
                     await _set_job(
                         job_id,
                         progress=(
@@ -452,28 +475,74 @@ async def _run_generate_job(job_id: str, body: GenerateHookRequest) -> None:
                             error=str(exc),
                         )
                         return
+        manual_edit_flow = bool(body.pause_for_manual_edit) and body.use_fq_koc_material
+        if all_episodes_local and manual_edit_flow:
+            dl_progress = f"所选 {ep_count} 集均已本地缓存，正在载入时间轴…"
+        elif all_episodes_local:
+            dl_progress = f"所选 {ep_count} 集均已本地缓存，正在生成成片…"
+        elif manual_edit_flow:
+            dl_progress = (
+                f"正在下载缺失正片（{missing_count} 集，已跳过 {ep_count - missing_count} 集本地缓存）"
+                "，完成后将自动进入时间轴编辑…"
+            )
+        else:
+            dl_progress = (
+                f"正在生成（{ep_count} 集，含去重增强约需 {max(3, ep_count * 2)}–{ep_count * 4} 分钟）…"
+            )
         await _set_job(
             job_id,
-            progress=f"正在生成（{ep_count} 集，含去重增强约需 {max(3, ep_count * 2)}–{ep_count * 4} 分钟）…",
+            progress=dl_progress,
+            phase="starting",
+            manual_edit_flow=manual_edit_flow,
+            episode_item_ids=list(body.episode_item_ids),
         )
-        async with httpx.AsyncClient(timeout=7200.0) as client:
-            output_path, filename, gen_warning, edit_plan = await generate_hook_video(
-                client,
-                series_id=body.series_id,
-                drama_title=body.drama_title or body.series_id,
-                cover_url=body.cover_url.strip(),
-                opening=body.opening.strip(),
-                keyword=body.keyword.strip(),
-                episode_item_ids=body.episode_item_ids,
-                use_fq_koc_material=body.use_fq_koc_material,
-                use_kuaishou_material=body.use_kuaishou_material,
-                kuaishou_share_url=body.kuaishou_share_url.strip(),
-                use_ai_edit=body.use_ai_edit,
-                drama_intro=body.drama_intro.strip(),
-                splash_title_font=body.splash_title_font,
-                splash_subtitle_font=body.splash_subtitle_font,
-                splash_badge=body.splash_badge.strip(),
+
+        async def _on_materials_ready() -> None:
+            await _set_job(
+                job_id,
+                phase="materials_ready",
+                progress="正片已下载到本地，正在载入时间轴草稿…",
             )
+
+        async def _should_interrupt() -> bool:
+            return await _job_interrupt_requested(job_id)
+
+        async with httpx.AsyncClient(timeout=7200.0) as client:
+            try:
+                output_path, filename, gen_warning, edit_plan = await generate_hook_video(
+                    client,
+                    series_id=body.series_id,
+                    drama_title=body.drama_title or body.series_id,
+                    cover_url=body.cover_url.strip(),
+                    opening=body.opening.strip(),
+                    keyword=body.keyword.strip(),
+                    episode_item_ids=body.episode_item_ids,
+                    use_fq_koc_material=body.use_fq_koc_material,
+                    use_kuaishou_material=body.use_kuaishou_material,
+                    kuaishou_share_url=body.kuaishou_share_url.strip(),
+                    use_ai_edit=body.use_ai_edit,
+                    drama_intro=body.drama_intro.strip(),
+                    splash_title_font=body.splash_title_font,
+                    splash_subtitle_font=body.splash_subtitle_font,
+                    splash_badge=body.splash_badge.strip(),
+                    edit_plan_override=body.edit_plan,
+                    job_id=job_id,
+                    should_interrupt=_should_interrupt if manual_edit_flow else None,
+                    on_materials_ready=_on_materials_ready if manual_edit_flow else None,
+                )
+            except Exception as exc:
+                from generate_job_control import JobInterruptedForEdit
+
+                if isinstance(exc, JobInterruptedForEdit):
+                    await _set_job(
+                        job_id,
+                        status="awaiting_manual_edit",
+                        phase="awaiting_manual_edit",
+                        progress="已进入手动剪辑。请在下方时间轴调整片段，完成后点「继续生成成片」。",
+                        edit_plan=exc.edit_plan,
+                    )
+                    return
+                raise
         # 保存成片（无 BackgroundTasks，直接写盘后更新 job）
         work_dir = output_path.parent
         video_bytes = output_path.read_bytes()
@@ -666,6 +735,26 @@ async def login_only_fq_koc_session(body: FqKocLoginRequest):
     }
 
 
+@app.get("/api/material/fq-koc/local-status")
+async def get_fq_koc_local_status(
+    series_id: str = Query(..., min_length=1),
+    item_ids: str = Query(..., min_length=1, description="逗号分隔的 item_id"),
+):
+    """批量查询哪些分集已有可解码的本地正片（不触发达人中心下载）。"""
+    from fq_koc_material import has_usable_local_episode
+
+    ids = [x.strip() for x in item_ids.split(",") if x.strip()]
+    statuses = {iid: has_usable_local_episode(series_id, iid) for iid in ids}
+    cached = sum(1 for v in statuses.values() if v)
+    return {
+        "ok": True,
+        "series_id": series_id,
+        "episodes": statuses,
+        "cached_count": cached,
+        "total": len(ids),
+    }
+
+
 @app.get("/api/material/fq-koc/download-url")
 async def get_fq_koc_download_url(
     series_id: str = Query(..., min_length=1),
@@ -699,6 +788,153 @@ async def get_fq_koc_download_url(
             "message": f"解析下载地址异常: {exc}",
         }
     return {"ok": result.get("ok", False), **result}
+
+
+@app.get("/api/material/fq-koc/playback")
+async def get_fq_koc_playback_url(
+    series_id: str = Query(..., min_length=1),
+    item_id: str = Query(..., min_length=1),
+):
+    """
+    时间轴预览专用：本地走 /materials 静态路径；远端 CDN 走同源代理（避免 CORS 导致无法播放）。
+    """
+    from fq_koc_material import find_local_material, local_material_decode_ok
+
+    path = find_local_material(series_id, item_id)
+    if path and local_material_decode_ok(path):
+        rel = path.relative_to(STATIC_DIR)
+        return {
+            "ok": True,
+            "source": "local",
+            "cached": True,
+            "playback_url": f"/{rel.as_posix()}",
+            "size": path.stat().st_size,
+        }
+
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            result = await resolve_episode_download_url(
+                client,
+                book_id=series_id,
+                item_id=item_id,
+                try_browser=False,
+            )
+    except Exception as exc:
+        return {"ok": False, "message": str(exc)}
+
+    if not result.get("ok"):
+        return {
+            "ok": False,
+            "source": result.get("source", "need_capture"),
+            "message": result.get("message", "未找到可播放素材"),
+        }
+
+    dl = str(result.get("download_url") or "").strip()
+    if dl.startswith("/"):
+        return {
+            "ok": True,
+            "playback_url": dl,
+            "proxied": False,
+            **{k: v for k, v in result.items() if k != "download_url"},
+        }
+
+    if dl.startswith("http"):
+        return {
+            "ok": True,
+            "source": result.get("source", "remote"),
+            "playback_url": (
+                f"/api/material/fq-koc/stream"
+                f"?series_id={series_id}&item_id={item_id}"
+            ),
+            "proxied": True,
+            "remote_url": dl[:120],
+        }
+
+    return {"ok": False, "message": "未解析到有效 MP4 地址"}
+
+
+@app.get("/api/material/fq-koc/stream")
+async def stream_fq_koc_material(
+    request: Request,
+    series_id: str = Query(..., min_length=1),
+    item_id: str = Query(..., min_length=1),
+):
+    """同源流式播放：本地 FileResponse（支持 Range）；远端经后端转发（避免浏览器 CORS）。"""
+    from fq_koc_material import (
+        DEFAULT_UA,
+        find_local_material,
+        local_material_decode_ok,
+    )
+
+    path = find_local_material(series_id, item_id)
+    if path and local_material_decode_ok(path):
+        return FileResponse(
+            path,
+            media_type="video/mp4",
+            filename=path.name,
+        )
+
+    async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=30.0)) as client:
+        result = await resolve_episode_download_url(
+            client,
+            book_id=series_id,
+            item_id=item_id,
+            try_browser=False,
+        )
+    if not result.get("ok"):
+        raise HTTPException(
+            status_code=404,
+            detail=result.get("message", "未找到素材"),
+        )
+
+    dl = str(result.get("download_url") or "").strip()
+    if dl.startswith("/"):
+        local = STATIC_DIR / dl.lstrip("/")
+        if local.is_file():
+            return FileResponse(local, media_type="video/mp4", filename=local.name)
+        raise HTTPException(status_code=404, detail="本地文件不存在")
+
+    if not dl.startswith("http"):
+        raise HTTPException(status_code=404, detail="无有效下载地址")
+
+    fwd_headers = {"User-Agent": DEFAULT_UA}
+    range_h = request.headers.get("range")
+    if range_h:
+        fwd_headers["Range"] = range_h
+
+    client = httpx.AsyncClient(
+        timeout=httpx.Timeout(600.0, connect=30.0),
+        follow_redirects=True,
+    )
+    try:
+        req = client.build_request("GET", dl, headers=fwd_headers)
+        upstream = await client.send(req, stream=True)
+    except httpx.HTTPError as exc:
+        await client.aclose()
+        raise HTTPException(status_code=502, detail=f"拉取远端视频失败: {exc}") from exc
+
+    async def _iter():
+        try:
+            async for chunk in upstream.aiter_bytes(65536):
+                yield chunk
+        finally:
+            await upstream.aclose()
+            await client.aclose()
+
+    out_headers: dict[str, str] = {
+        "Accept-Ranges": "bytes",
+        "Content-Type": upstream.headers.get("content-type") or "video/mp4",
+    }
+    if upstream.headers.get("content-length"):
+        out_headers["Content-Length"] = upstream.headers["content-length"]
+    if upstream.headers.get("content-range"):
+        out_headers["Content-Range"] = upstream.headers["content-range"]
+
+    return StreamingResponse(
+        _iter(),
+        status_code=upstream.status_code,
+        headers=out_headers,
+    )
 
 
 @app.post("/api/material/fq-koc/capture")
@@ -747,6 +983,80 @@ async def capture_fq_koc_from_browser(body: FqKocCaptureRequest):
     return {
         "ok": bool(msg_parts),
         "message": "；".join(msg_parts) if msg_parts else "未收到 MP4 地址",
+    }
+
+
+@app.post("/api/material/fq-koc/cache-episode")
+async def cache_fq_koc_episode_quiet(body: FqKocMaterialRequest):
+    """
+    时间轴「缓存本集」：仅后台 HTTP 下载，不调用 Playwright（避免弹出空白浏览器页）。
+    """
+    from fq_koc_material import (
+        cache_episode_from_url,
+        find_local_material,
+        local_material_decode_ok,
+    )
+
+    book_id = body.series_id.strip()
+    item_id = body.item_id.strip()
+    path = find_local_material(book_id, item_id)
+    if path and local_material_decode_ok(path):
+        rel = path.relative_to(STATIC_DIR)
+        return {
+            "ok": True,
+            "cached": True,
+            "source": "local",
+            "public_url": f"/{rel.as_posix()}",
+            "size": path.stat().st_size,
+        }
+
+    try:
+        async with httpx.AsyncClient(timeout=600.0) as client:
+            result = await resolve_episode_download_url(
+                client,
+                book_id=book_id,
+                item_id=item_id,
+                try_browser=False,
+            )
+            if not result.get("ok"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=result.get("message", "无法解析下载地址，请配置 Cookie 或手动导入 MP4"),
+                )
+            dl = str(result.get("download_url") or "").strip()
+            if dl.startswith("/"):
+                local = STATIC_DIR / dl.lstrip("/")
+                if not local.is_file():
+                    raise HTTPException(status_code=404, detail="本地文件不存在")
+                return {
+                    "ok": True,
+                    "cached": True,
+                    "source": result.get("source", "local"),
+                    "public_url": dl,
+                    "size": local.stat().st_size,
+                }
+            if not dl.startswith("http"):
+                raise HTTPException(status_code=400, detail="未拿到有效 MP4 地址")
+            path = await cache_episode_from_url(
+                client,
+                book_id=book_id,
+                item_id=item_id,
+                mp4_url=dl,
+            )
+    except HTTPException:
+        raise
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"下载失败: {exc}") from exc
+
+    rel = path.relative_to(STATIC_DIR)
+    return {
+        "ok": True,
+        "cached": True,
+        "source": result.get("source", "download"),
+        "public_url": f"/{rel.as_posix()}",
+        "size": path.stat().st_size,
     }
 
 
@@ -1053,6 +1363,34 @@ async def generate_hook(
     return {"ok": True, "job_id": job_id, "status": "running"}
 
 
+@app.post("/api/generate/job/{job_id}/interrupt-for-edit")
+async def interrupt_generate_for_edit(job_id: str):
+    """生成过程中中断：正片已下载后进入手动时间轴（任务状态变为 awaiting_manual_edit）。"""
+    if not re.fullmatch(r"[\w-]{8,64}", job_id):
+        raise HTTPException(status_code=404, detail="任务不存在或已过期")
+    async with GENERATE_JOBS_LOCK:
+        job = GENERATE_JOBS.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="任务不存在或已过期")
+        if job.get("status") != "running":
+            raise HTTPException(
+                status_code=400,
+                detail="当前任务未在运行，无法中断（可能已完成或已中断）",
+            )
+        job["interrupt_for_edit"] = True
+        phase = job.get("phase") or ""
+    logging.getLogger(__name__).info(
+        "job %s interrupt_for_edit=1 (phase=%s)", job_id, phase
+    )
+    progress = (
+        "已收到中断请求，正片下载完成后将自动进入时间轴…"
+        if phase not in ("materials_ready", "awaiting_manual_edit")
+        else "正在中断并载入时间轴草稿…"
+    )
+    await _set_job(job_id, progress=progress)
+    return {"ok": True, "job_id": job_id, "phase": phase, "progress": progress}
+
+
 @app.get("/api/generate/job/{job_id}")
 async def get_generate_job(job_id: str):
     if not re.fullmatch(r"[\w-]{8,64}", job_id):
@@ -1064,11 +1402,52 @@ async def get_generate_job(job_id: str):
     return {"ok": True, "job_id": job_id, **job}
 
 
+@app.post("/api/manual/edit-plan-draft")
+async def manual_edit_plan_draft(body: ManualEditPlanDraftRequest):
+    """手動多段剪輯：生成可編輯草稿（可預填兩段高光）。"""
+    from fq_koc_material import local_material_duration
+    from manual_edit_plan import build_manual_draft_with_prefill
+
+    if not body.episode_item_ids:
+        raise HTTPException(status_code=400, detail="请至少选择一集")
+    labels: list[str] = []
+    durations: list[float] = []
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            for index, item_id in enumerate(body.episode_item_ids, start=1):
+                labels.append(body.episode_titles.get(item_id) or f"第{index}集")
+                dur_local = local_material_duration(body.series_id, item_id)
+                if dur_local > 1:
+                    durations.append(dur_local)
+                    continue
+                try:
+                    info = await fetch_episode_video_info(
+                        client, item_id, book_id=body.series_id
+                    )
+                    durations.append(duration_from_episode_info(info))
+                except Exception:
+                    durations.append(120.0)
+        draft = await build_manual_draft_with_prefill(
+            series_id=body.series_id,
+            drama_title=body.drama_title or body.series_id,
+            opening=body.opening.strip(),
+            keyword=body.keyword.strip(),
+            episode_labels=labels,
+            episode_durations=durations,
+            episode_item_ids=body.episode_item_ids,
+            prefill=body.prefill,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logging.getLogger(__name__).exception("manual edit-plan-draft failed")
+        raise HTTPException(status_code=500, detail=str(exc)[:500]) from exc
+    return {"ok": True, "edit_plan": draft}
+
+
 @app.post("/api/ai/edit-plan")
 async def preview_ai_edit_plan(body: AiEditPlanRequest):
     """仅生成 AI 剪辑方案，不下载/合成视频。"""
-    from hook_generator import _episode_duration_seconds
-
     labels: list[str] = []
     durations: list[float] = []
     async with httpx.AsyncClient(timeout=120.0) as client:
@@ -1078,7 +1457,7 @@ async def preview_ai_edit_plan(body: AiEditPlanRequest):
                 info = await fetch_episode_video_info(
                     client, item_id, book_id=body.series_id
                 )
-                durations.append(_episode_duration_seconds(info))
+                durations.append(duration_from_episode_info(info))
             except Exception:
                 durations.append(120.0)
         plan = await plan_hook_edit(
@@ -1093,8 +1472,16 @@ async def preview_ai_edit_plan(body: AiEditPlanRequest):
     return {"ok": True, "edit_plan": plan_to_dict(plan)}
 
 
-# 静态资源：仅挂载 public 目录，且放在所有 API 路由之后
+# 静态资源：放在所有 API 路由之后
 if STATIC_DIR.is_dir():
+    _materials_root = STATIC_DIR / "materials"
+    if _materials_root.is_dir():
+        app.mount(
+            "/materials",
+            StaticFiles(directory=str(_materials_root)),
+            name="materials",
+        )
+
     app.mount(
         "/assets",
         StaticFiles(directory=str(STATIC_DIR)),

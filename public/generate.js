@@ -68,6 +68,12 @@ function getSplashFontSizes() {
 }
 
 const useAiEditEl = document.getElementById("use-ai-edit");
+const useManualEditEl = document.getElementById("use-manual-edit");
+const manualEditPanel = document.getElementById("manual-edit-panel");
+const manualEditSegmentsEl = document.getElementById("manual-edit-segments");
+const manualEditStatusEl = document.getElementById("manual-edit-status");
+const manualEditTotalEl = document.getElementById("manual-edit-total");
+const btnReloadManualDraft = document.getElementById("btn-reload-manual-draft");
 const useFqKocEl = document.getElementById("use-fq-koc");
 const episodeUrlStatus = new Map();
 const fqKocImportStatusEl = document.getElementById("fq-koc-import-status");
@@ -79,6 +85,7 @@ const cacheInProgress = new Set();
 const episodeStatusEl = document.getElementById("episode-status");
 const episodeGridEl = document.getElementById("episode-grid");
 const btnGenerate = document.getElementById("btn-generate");
+const btnInterruptEdit = document.getElementById("btn-interrupt-edit");
 const generateHint = document.getElementById("generate-hint");
 const resultPanel = document.getElementById("result-panel");
 const resultMsg = document.getElementById("result-msg");
@@ -92,6 +99,97 @@ const selected = new Set();
 let lastPreviewUrl = "";
 let lastDownloadUrl = "";
 let previewObjectUrl = "";
+let manualEditPlan = null;
+let manualDraftTimer = 0;
+let manualDraftLoading = false;
+let manualTimeline = null;
+/** 已中断并载入时间轴，下一次生成携带 edit_plan */
+let manualAwaitingContinue = false;
+let activeGenerateJobId = "";
+const MANUAL_EDIT_LS_KEY = "hongguo_manual_edit_state";
+
+function saveManualEditState() {
+  if (!seriesId || !manualAwaitingContinue || !manualEditPlan) return;
+  try {
+    localStorage.setItem(
+      MANUAL_EDIT_LS_KEY,
+      JSON.stringify({
+        series_id: seriesId,
+        episode_item_ids: Array.from(selected),
+        manualEditPlan,
+      })
+    );
+  } catch {
+    /* ignore */
+  }
+}
+
+function restoreManualEditState() {
+  try {
+    const raw = localStorage.getItem(MANUAL_EDIT_LS_KEY);
+    if (!raw) return;
+    const o = JSON.parse(raw);
+    if (!o || o.series_id !== seriesId) return;
+    if (!Array.isArray(o.episode_item_ids) || !o.manualEditPlan) return;
+    const ids = o.episode_item_ids.filter((id) =>
+      episodes.some((ep) => ep.item_id === id)
+    );
+    if (!ids.length) return;
+    selected.clear();
+    ids.forEach((id) => selected.add(id));
+    renderEpisodes();
+    manualEditPlan = o.manualEditPlan;
+    manualAwaitingContinue = true;
+    bindManualSegmentItemIds();
+    renderManualEditor();
+    btnGenerate.textContent = "继续生成成片";
+    if (useManualEditEl) useManualEditEl.checked = true;
+    syncEditModeCheckboxes(true);
+    manualEditPanel?.classList.remove("hidden");
+    setManualDraftStatus("已恢复上次中断的手动剪辑方案，可继续调整或点「继续生成成片」。");
+    updateGenerateState();
+  } catch {
+    /* ignore */
+  }
+}
+
+function clearManualEditState() {
+  manualAwaitingContinue = false;
+  try {
+    localStorage.removeItem(MANUAL_EDIT_LS_KEY);
+  } catch {
+    /* ignore */
+  }
+}
+
+function buildEditPlanPayload() {
+  if (!manualEditPlan) return null;
+  const segs = (manualEditPlan.body_segments || []).map((seg) => ({
+    episode_index: seg.episode_index,
+    label: seg.label,
+    reason: seg.reason,
+    item_id: seg.item_id,
+    duration_sec: (seg.clips || []).reduce(
+      (sum, c) => sum + (Number(c.duration_sec) || 0),
+      0
+    ),
+    clips: (seg.clips || []).map((c) => ({
+      trim_start_sec: Number(c.trim_start_sec) || 0,
+      duration_sec: Number(c.duration_sec) || 0,
+      reason: c.reason || "",
+    })),
+  }));
+  return {
+    hook_summary: manualEditPlan.hook_summary || "手動多段剪輯",
+    opening_text: manualEditPlan.opening_text,
+    opening_seconds: manualEditPlan.opening_seconds,
+    outro_keyword: manualEditPlan.outro_keyword,
+    outro_seconds: manualEditPlan.outro_seconds,
+    post_caption: manualEditPlan.post_caption,
+    edit_style: manualEditPlan.edit_style,
+    body_segments: segs,
+  };
+}
 
 titleEl.textContent = dramaTitle;
 metaEl.textContent = dramaIntro
@@ -186,13 +284,294 @@ splashBadgeEl?.addEventListener("input", () => {
   scheduleSplashPreview();
 });
 
+function isManualEditMode() {
+  return Boolean(useManualEditEl?.checked);
+}
+
+function syncEditModeCheckboxes(fromManual = false) {
+  if (!useManualEditEl || !useAiEditEl) return;
+  if (fromManual && useManualEditEl.checked) {
+    useAiEditEl.checked = false;
+    useAiEditEl.disabled = true;
+  } else if (!useManualEditEl.checked) {
+    useAiEditEl.disabled = false;
+  }
+  if (useAiEditEl.checked) {
+    useManualEditEl.checked = false;
+    useManualEditEl.disabled = true;
+    if (!manualAwaitingContinue) manualEditPanel?.classList.add("hidden");
+  } else {
+    useManualEditEl.disabled = false;
+    if (useManualEditEl.checked && manualAwaitingContinue) {
+      manualEditPanel?.classList.remove("hidden");
+    } else if (!manualAwaitingContinue) {
+      manualEditPanel?.classList.add("hidden");
+    }
+  }
+}
+
+function episodeTitlesMap() {
+  const m = {};
+  for (const ep of episodes) {
+    if (selected.has(ep.item_id)) {
+      m[ep.item_id] = ep.title || "";
+    }
+  }
+  return m;
+}
+
+function updateManualEditTotal() {
+  if (!manualEditTotalEl || !manualEditPlan?.body_segments) return;
+  const parts = [];
+  let total = 0;
+  for (const seg of manualEditPlan.body_segments) {
+    const clips = seg.clips || [];
+    clips.forEach((c, i) => {
+      const dur = Number(c.duration_sec) || 0;
+      const start = Number(c.trim_start_sec) || 0;
+      total += dur;
+      parts.push(`片段${i + 1} ${dur.toFixed(1)}秒（${start.toFixed(1)}s起）`);
+    });
+  }
+  const detail = parts.length ? `：${parts.join(" + ")}` : "";
+  const target = Number(manualEditPlan?.target_body_sec) || 0;
+  const hookTotal = Number(manualEditPlan?.target_hook_total_sec) || 0;
+  const overhead = Number(manualEditPlan?.hook_overhead_sec) || 0;
+  const hookRange = (manualEditPlan?.hook_range_text || "").trim();
+  let targetHint = "";
+  if (target > 0 && hookTotal > 0) {
+    targetHint = ` / 目标正片约 ${target.toFixed(0)} 秒 + 片头片尾约 ${overhead.toFixed(0)} 秒 ≈ 成片 ${hookTotal.toFixed(0)} 秒`;
+  } else if (target > 0) {
+    targetHint = ` / 目标正片约 ${target.toFixed(0)} 秒${hookRange ? `（成片 ${hookRange}）` : ""}`;
+  } else if (hookRange) {
+    targetHint = `（成片 ${hookRange}）`;
+  }
+  const prefill =
+    manualEditPlan?.prefill_source === "fallback"
+      ? "（未分析到音画轴，当前为占位高光位，请先缓存正片后点「重新载入草稿」）"
+      : "；两段为音画高能高光（打斗/音效等），可拖拽修改";
+  manualEditTotalEl.textContent = `正片合计约 ${total.toFixed(1)} 秒${targetHint}${detail}${prefill}`;
+}
+
+async function cacheEpisodeForTimeline(itemId) {
+  if (!seriesId || !itemId) return false;
+  setManualDraftStatus("正在后台缓存本集（不弹浏览器）…");
+  try {
+    const res = await fetch("/api/material/fq-koc/cache-episode", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        series_id: seriesId,
+        item_id: itemId,
+        drama_title: dramaTitle,
+      }),
+    });
+    const { data } = await readJsonResponse(res);
+    if (!res.ok || !data.ok) {
+      const detail = formatApiErrorDetail(data.detail) || data.message || "缓存失败";
+      setManualDraftStatus(detail);
+      return false;
+    }
+    episodeUrlStatus.set(itemId, "local");
+    renderEpisodes();
+    setManualDraftStatus(
+      data.size
+        ? `缓存完成（${(data.size / 1024 / 1024).toFixed(1)} MB），正在加载预览…`
+        : "缓存完成，正在加载预览…"
+    );
+    return true;
+  } catch (e) {
+    setManualDraftStatus(String(e.message || e));
+    return false;
+  }
+}
+
+function bindManualSegmentItemIds() {
+  if (!manualEditPlan?.body_segments) return;
+  const ids = Array.from(selected);
+  manualEditPlan.body_segments.forEach((seg, si) => {
+    const idx = (seg.episode_index || si + 1) - 1;
+    seg.item_id = seg.item_id || ids[si] || ids[idx] || ids[0] || "";
+  });
+}
+
+function renderManualEditor() {
+  if (!manualEditSegmentsEl || !manualEditPlan?.body_segments?.length) {
+    if (manualEditSegmentsEl) manualEditSegmentsEl.innerHTML = "";
+    manualTimeline = null;
+    return;
+  }
+  bindManualSegmentItemIds();
+
+  if (typeof ManualTimelineEditor === "undefined") {
+    manualEditSegmentsEl.innerHTML =
+      '<p class="episode-status">时间轴组件加载失败，请硬刷新页面（Ctrl+Shift+R）</p>';
+    return;
+  }
+
+  manualEditSegmentsEl.innerHTML = '<div id="manual-timeline-mount"></div>';
+  const mount = document.getElementById("manual-timeline-mount");
+  manualTimeline = new ManualTimelineEditor(mount, {
+    seriesId,
+    absoluteUrl,
+    onChange: () => {
+      updateManualEditTotal();
+      saveManualEditState();
+    },
+    onCacheEpisode: cacheEpisodeForTimeline,
+  });
+  manualTimeline.setData({
+    segments: manualEditPlan.body_segments,
+    itemIds: manualEditPlan.body_segments.map((s) => s.item_id),
+    durations: manualEditPlan.episode_durations || [],
+  });
+  manualTimeline.mount();
+  updateManualEditTotal();
+}
+
+function collectManualEditPlanFromDom() {
+  if (manualTimeline) manualTimeline.syncToPlan();
+  if (!manualEditPlan?.body_segments) return manualEditPlan;
+  for (const seg of manualEditPlan.body_segments) {
+    seg.duration_sec = (seg.clips || []).reduce(
+      (sum, c) => sum + (Number(c.duration_sec) || 0),
+      0
+    );
+  }
+  saveManualEditState();
+  return manualEditPlan;
+}
+
+function validateManualEditPlan(plan) {
+  const segs = plan?.body_segments || [];
+  if (!segs.length) return "请至少为一集添加剪辑片段";
+  for (const seg of segs) {
+    if (!seg.clips?.length) {
+      return `${seg.label || "某一集"} 至少需要 1 个片段`;
+    }
+    for (const c of seg.clips) {
+      if ((c.duration_sec || 0) < 2) {
+        return "每段时长至少 2 秒";
+      }
+      if ((c.trim_start_sec || 0) < 0) {
+        return "入点不能为负数";
+      }
+    }
+  }
+  return "";
+}
+
+function formatApiErrorDetail(detail) {
+  if (!detail) return "";
+  if (typeof detail === "string") return detail;
+  if (Array.isArray(detail)) {
+    return detail.map((x) => x.msg || x.message || JSON.stringify(x)).join("；");
+  }
+  return String(detail);
+}
+
+function setManualDraftStatus(text) {
+  if (manualEditStatusEl) manualEditStatusEl.textContent = text;
+}
+
+async function loadManualDraft(options = {}) {
+  const force = Boolean(options.force);
+  const prefill = options.prefill || "simple";
+
+  if (!isManualEditMode()) {
+    setManualDraftStatus("请先勾选「手动多段剪辑」");
+    return false;
+  }
+  if (!seriesId) {
+    setManualDraftStatus("缺少短剧 ID，请从检索页重新进入本页");
+    return false;
+  }
+  if (selected.size === 0) {
+    setManualDraftStatus("请先选择分集");
+    return false;
+  }
+  if (manualDraftLoading && !force) {
+    setManualDraftStatus("正在载入中，请稍候…");
+    return false;
+  }
+
+  clearTimeout(manualDraftTimer);
+  manualDraftLoading = true;
+  if (btnReloadManualDraft) btnReloadManualDraft.disabled = true;
+  setManualDraftStatus("正在载入剪辑草稿…");
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 120_000);
+
+  try {
+    const res = await fetch("/api/manual/edit-plan-draft", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      signal: controller.signal,
+      body: JSON.stringify({
+        series_id: seriesId,
+        drama_title: dramaTitle,
+        episode_item_ids: Array.from(selected),
+        episode_titles: episodeTitlesMap(),
+        prefill,
+      }),
+    });
+    const { data } = await readJsonResponse(res);
+    if (!res.ok) {
+      throw new Error(formatApiErrorDetail(data.detail) || "载入草稿失败");
+    }
+    manualEditPlan = data.edit_plan || null;
+    if (!manualEditPlan?.body_segments?.length) {
+      throw new Error("服务器返回的草稿为空，请确认已选分集并重试");
+    }
+    bindManualSegmentItemIds();
+    renderManualEditor();
+    setManualDraftStatus(
+      manualEditPlan.hook_summary ||
+        "已载入草稿：可修改各段入点/时长，或增删片段后生成。"
+    );
+    return true;
+  } catch (e) {
+    const msg =
+      e.name === "AbortError"
+        ? "载入超时（超过 2 分钟），请减少选集或稍后重试"
+        : e.message === "Failed to fetch"
+          ? "无法连接服务器：请确认后端已启动并已包含 /api/manual/edit-plan-draft 接口"
+          : String(e.message || e);
+    setManualDraftStatus(msg);
+    return false;
+  } finally {
+    clearTimeout(timeoutId);
+    manualDraftLoading = false;
+    if (btnReloadManualDraft) btnReloadManualDraft.disabled = false;
+    updateGenerateState();
+  }
+}
+
+function scheduleManualDraftReload() {
+  if (!isManualEditMode()) return;
+  clearTimeout(manualDraftTimer);
+  manualDraftTimer = setTimeout(loadManualDraft, 500);
+}
+
 function updateGenerateState() {
   const hasEpisodes = selected.size > 0;
-  const ready = seriesId && hasEpisodes;
+  const manual = isManualEditMode();
+  const ready =
+    seriesId &&
+    hasEpisodes &&
+    (!manual ||
+      (manualAwaitingContinue
+        ? Boolean(manualEditPlan?.body_segments?.length)
+        : true));
   btnGenerate.disabled = !ready;
   if (generateHint) {
     if (!hasEpisodes) {
       generateHint.textContent = "请选择至少 1 集";
+    } else if (manual) {
+      generateHint.textContent = manualAwaitingContinue
+        ? "已在时间轴调整？点「继续生成成片」按方案输出。"
+        : "手动模式：点「生成钩子视频」下载正片，完成后将自动进入时间轴。";
     } else {
       generateHint.textContent =
         "点「生成钩子视频」：自动登录达人中心后开始下载与成片（两段高光直剪，约 30 秒）。";
@@ -204,6 +583,13 @@ function escapeHtml(str) {
   const div = document.createElement("div");
   div.textContent = str;
   return div.innerHTML;
+}
+
+function escapeAttr(str) {
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/</g, "&lt;");
 }
 
 async function readJsonResponse(res) {
@@ -232,7 +618,45 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function pollGenerateJob(jobId) {
+function showInterruptButton(show) {
+  if (!btnInterruptEdit) return;
+  btnInterruptEdit.classList.toggle("hidden", !show);
+}
+
+async function requestInterruptForEdit(jobId) {
+  const res = await fetch(
+    `/api/generate/job/${encodeURIComponent(jobId)}/interrupt-for-edit`,
+    { method: "POST" }
+  );
+  const { data } = await readJsonResponse(res);
+  if (!res.ok) {
+    throw new Error(formatApiErrorDetail(data.detail) || "中断请求失败");
+  }
+  return data;
+}
+
+function applyAwaitingManualEditJob(data) {
+  manualAwaitingContinue = true;
+  manualEditPlan = data.edit_plan || null;
+  activeGenerateJobId = "";
+  showInterruptButton(false);
+  syncEditModeCheckboxes(true);
+  bindManualSegmentItemIds();
+  renderManualEditor();
+  saveManualEditState();
+  if (manualEditStatusEl) {
+    manualEditStatusEl.textContent =
+      data.progress || "正片已在本地，请在时间轴调整各段后点「继续生成成片」。";
+  }
+  btnGenerate.disabled = false;
+  btnGenerate.textContent = "继续生成成片";
+  resultMsg.textContent =
+    data.progress || "已进入时间轴。请调整各段后点「继续生成成片」。";
+  updateGenerateState();
+}
+
+async function pollGenerateJob(jobId, { manualInterruptFlow = false } = {}) {
+  activeGenerateJobId = jobId;
   const started = Date.now();
   while (true) {
     let res;
@@ -250,10 +674,21 @@ async function pollGenerateJob(jobId) {
     if (data.progress && resultMsg) {
       resultMsg.textContent = data.progress;
     }
+    if (manualInterruptFlow && data.status === "running") {
+      showInterruptButton(data.phase === "starting");
+    }
+    if (data.status === "awaiting_manual_edit") {
+      applyAwaitingManualEditJob(data);
+      return data;
+    }
     if (data.status === "completed") {
+      activeGenerateJobId = "";
+      showInterruptButton(false);
       return data;
     }
     if (data.status === "failed") {
+      activeGenerateJobId = "";
+      showInterruptButton(false);
       throw new Error(data.error || "生成失败");
     }
     if (Date.now() - started > 7200_000) {
@@ -365,8 +800,9 @@ function renderEpisodes() {
         selected.add(id);
         btn.classList.add("active");
       }
-      generateHint.textContent =
-        selected.size === 1
+      generateHint.textContent = isManualEditMode()
+        ? `已选 ${selected.size} 集：请在下方编辑各段剪辑点`
+        : selected.size === 1
           ? "已选 1 集：取 2 段最高光直剪"
           : `已选 ${selected.size} 集：每集 2 段高光，拼成约 30 秒`;
       if (selected.size === 1) {
@@ -376,6 +812,48 @@ function renderEpisodes() {
     });
   });
 }
+
+btnInterruptEdit?.addEventListener("click", async () => {
+  const jobId = activeGenerateJobId;
+  if (!jobId || btnInterruptEdit.disabled) return;
+  btnInterruptEdit.disabled = true;
+  const waitStarted = Date.now();
+  try {
+    resultMsg.textContent = "正在发送中断请求…";
+    const ack = await requestInterruptForEdit(jobId);
+    resultMsg.textContent =
+      ack?.progress ||
+      (ack?.phase === "materials_ready"
+        ? "正在载入时间轴草稿，请稍候…"
+        : "已请求中断：正片下载/分析完成后会自动进入时间轴，请勿关闭页面。");
+    while (Date.now() - waitStarted < 600_000) {
+      const res = await fetch(`/api/generate/job/${encodeURIComponent(jobId)}`);
+      const { data } = await readJsonResponse(res);
+      if (data.status === "awaiting_manual_edit") {
+        applyAwaitingManualEditJob(data);
+        break;
+      }
+      if (data.status === "failed") {
+        throw new Error(data.error || "中断失败");
+      }
+      if (data.status === "completed") {
+        resultMsg.textContent =
+          "任务已直接完成（未能中断，可能点击过晚）。请重新勾选「手动多段剪辑」再试。";
+        showInterruptButton(false);
+        break;
+      }
+      if (data.progress) resultMsg.textContent = data.progress;
+      await sleep(1200);
+    }
+    if (Date.now() - waitStarted >= 600_000) {
+      throw new Error("等待中断超时（10 分钟），请刷新页面查看任务状态");
+    }
+  } catch (e) {
+    resultMsg.textContent = String(e.message || e);
+  } finally {
+    btnInterruptEdit.disabled = false;
+  }
+});
 
 async function cacheEpisodeFromMp4Url(itemId, mp4Url) {
   if (!seriesId || !itemId) return null;
@@ -494,6 +972,28 @@ async function fetchEpisodeList() {
   throw new Error(lastError);
 }
 
+async function refreshLocalEpisodeStatus(episodeList) {
+  if (!seriesId || !episodeList?.length) return;
+  const ids = episodeList.map((ep) => ep.item_id).filter(Boolean);
+  if (!ids.length) return;
+  try {
+    const res = await fetch(
+      `/api/material/fq-koc/local-status?series_id=${encodeURIComponent(seriesId)}&item_ids=${encodeURIComponent(ids.join(","))}`
+    );
+    const data = await res.json();
+    if (!res.ok || !data.ok || !data.episodes) return;
+    for (const [itemId, cached] of Object.entries(data.episodes)) {
+      if (cached) episodeUrlStatus.set(itemId, "local");
+    }
+    renderEpisodes();
+    if (data.cached_count > 0 && fqKocImportStatusEl) {
+      fqKocImportStatusEl.textContent = `已有 ${data.cached_count}/${data.total} 集本地缓存，生成时将跳过重复下载`;
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
 async function loadEpisodes() {
   if (!seriesId) {
     episodeStatusEl.innerHTML = "缺少短剧 ID，请从检索页点击「一键生成」进入";
@@ -521,6 +1021,7 @@ async function loadEpisodes() {
     }
     episodeStatusEl.textContent = `已加载 ${episodes.length} 集；选集后 AI 自动剪辑并写推文`;
     renderEpisodes();
+    await refreshLocalEpisodeStatus(episodes);
     generateHint.textContent = "请选择要用于推广成片的分集";
     updateGenerateState();
   } catch (err) {
@@ -543,10 +1044,41 @@ document.getElementById("select-all").addEventListener("click", () => {
 
 document.getElementById("clear-all").addEventListener("click", () => {
   selected.clear();
+  manualEditPlan = null;
+  clearManualEditState();
+  renderManualEditor();
   renderEpisodes();
   generateHint.textContent = "请选择至少 1 集";
   updateGenerateState();
 });
+
+useManualEditEl?.addEventListener("change", () => {
+  clearManualEditState();
+  manualEditPlan = null;
+  syncEditModeCheckboxes(true);
+  if (!isManualEditMode()) {
+    renderManualEditor();
+    showInterruptButton(false);
+  }
+  updateGenerateState();
+});
+
+useAiEditEl?.addEventListener("change", () => {
+  syncEditModeCheckboxes(false);
+  updateGenerateState();
+});
+
+function onReloadManualDraftClick(e) {
+  e.preventDefault();
+  e.stopPropagation();
+  loadManualDraft({ force: true, prefill: "simple" });
+}
+
+if (btnReloadManualDraft) {
+  btnReloadManualDraft.addEventListener("click", onReloadManualDraftClick);
+} else {
+  console.warn("未找到 #btn-reload-manual-draft，请硬刷新页面（Ctrl+Shift+R）");
+}
 
 btnCopyCaption?.addEventListener("click", async () => {
   const text = postCaptionEl?.textContent?.trim();
@@ -585,6 +1117,35 @@ btnGenerate.addEventListener("click", async () => {
   lastPreviewUrl = "";
   lastDownloadUrl = "";
 
+  const manual = isManualEditMode();
+  let editPlanPayload = null;
+  let pauseForManualEdit = false;
+  if (manual) {
+    if (manualAwaitingContinue) {
+      collectManualEditPlanFromDom();
+      const err = validateManualEditPlan(manualEditPlan);
+      if (err) {
+        resultMsg.textContent = err;
+        btnGenerate.disabled = false;
+        btnGenerate.textContent = "继续生成成片";
+        updateGenerateState();
+        return;
+      }
+      editPlanPayload = buildEditPlanPayload();
+      if (!editPlanPayload?.body_segments?.length) {
+        resultMsg.textContent = "手动剪辑方案为空，请先在时间轴调整片段";
+        btnGenerate.disabled = false;
+        btnGenerate.textContent = "继续生成成片";
+        updateGenerateState();
+        return;
+      }
+    } else {
+      pauseForManualEdit = true;
+      manualEditPlan = null;
+      renderManualEditor();
+    }
+  }
+
   try {
     const res = await fetch("/api/generate/hook", {
       method: "POST",
@@ -595,7 +1156,10 @@ btnGenerate.addEventListener("click", async () => {
         cover_url: coverUrl,
         ...getSplashFontSizes(),
         episode_item_ids: Array.from(selected),
-        use_ai_edit: Boolean(useAiEditEl?.checked),
+        use_ai_edit: manual ? false : Boolean(useAiEditEl?.checked),
+        edit_plan: editPlanPayload,
+        manual_edit: Boolean(editPlanPayload),
+        pause_for_manual_edit: pauseForManualEdit,
         drama_intro: dramaIntro,
         use_fq_koc_material: useFqKocEl ? useFqKocEl.checked !== false : true,
       }),
@@ -617,7 +1181,13 @@ btnGenerate.addEventListener("click", async () => {
     resultMsg.textContent =
       startData.progress || "已提交生成任务，正在后台处理（请勿关闭页面）…";
 
-    const data = await pollGenerateJob(startData.job_id);
+    const data = await pollGenerateJob(startData.job_id, {
+      manualInterruptFlow: pauseForManualEdit,
+    });
+
+    if (data.status === "awaiting_manual_edit") {
+      return;
+    }
 
     if (!data.ok || !data.preview_url) {
       throw new Error("服务器未返回预览地址，请重试");
@@ -649,6 +1219,8 @@ btnGenerate.addEventListener("click", async () => {
       msg += ` 注意：${data.warning}`;
     }
     resultMsg.textContent = msg;
+    clearManualEditState();
+    btnGenerate.textContent = "重新生成钩子视频";
   } catch (err) {
     const msg = err.message || "生成失败";
     resultMsg.textContent =
@@ -657,9 +1229,21 @@ btnGenerate.addEventListener("click", async () => {
         : msg;
   } finally {
     btnGenerate.disabled = false;
-    btnGenerate.textContent = "重新生成钩子视频";
+    if (!manualAwaitingContinue) {
+      btnGenerate.textContent = "重新生成钩子视频";
+    }
+    showInterruptButton(false);
     updateGenerateState();
   }
 });
 
-loadEpisodes();
+syncEditModeCheckboxes();
+
+async function loadEpisodesAndRestoreManual() {
+  await loadEpisodes();
+  if (isManualEditMode()) {
+    restoreManualEditState();
+  }
+}
+
+loadEpisodesAndRestoreManual();

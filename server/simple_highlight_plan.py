@@ -18,7 +18,11 @@ from hook_duration_budget import (
     hook_duration_range_text,
     scale_body_segments_to_budget,
 )
-from multi_clip import ClipFragment, sync_segment_from_clips
+from multi_clip import (
+    ClipFragment,
+    scale_clips_to_episode_duration,
+    sync_segment_from_clips,
+)
 from platform_compliance import safe_post_caption
 from video_moment_profile import VisualMoment
 
@@ -129,13 +133,28 @@ def _pick_moments_for_highlights(
     return sorted(picked[:n], key=lambda m: m.start_sec)
 
 
+def _moment_clip_reason(m: VisualMoment, *, index: int) -> str:
+    """时间轴展示用：统一为「高光 N」，并附带类型说明。"""
+    base = f"高光{index}"
+    tags = str(m.tags or "")
+    if "fallback" in tags or (m.score or 0) < 0.38:
+        return f"{base}·占位"
+    if "fight" in tags or "motion" in tags:
+        return f"{base}·打斗高能"
+    if "sfx_high" in tags:
+        return f"{base}·音效冲击"
+    if m.note and "峰" in m.note:
+        return f"{base}·{m.note[:14]}"
+    return f"{base}·音画峰"
+
+
 def _fallback_moments(
     dur_avail: float,
     n: int,
     *,
     intro_skip: float = 0.0,
 ) -> list[VisualMoment]:
-    """无画面轴时：跳过片头后均分取点。"""
+    """无音画轴缓存时：按剧情节奏占位（仍标为高光位，非随机）。"""
     avail = max(20.0, float(dur_avail) - intro_skip - 5.0)
     base = intro_skip + 3.0
     fracs = [0.22, 0.52, 0.78, 0.9][:n]
@@ -149,7 +168,7 @@ def _fallback_moments(
                 min(dur_avail - 0.5, mid + span * 0.6),
                 tags="fallback",
                 score=0.35 - i * 0.03,
-                note="默认高光位（未检测到音画峰）",
+                note="需缓存正片",
             )
         )
     return out
@@ -174,19 +193,14 @@ def _moments_to_clips(
     avail = max(lo + 1.0, float(dur_avail) - 0.5)
 
     clips: list[ClipFragment] = []
-    for m in moments:
+    for mi, m in enumerate(moments):
         span = max(m.end_sec - m.start_sec, lo)
         dur = _clamp(span, lo, hi)
         start = _clamp(m.start_sec - 0.25, intro_skip, avail - dur)
         if start + dur > avail:
             dur = max(lo, avail - start)
-        reason = "A|本集高光"
-        if "fight" in m.tags or "motion" in m.tags:
-            reason = "A|高能画面"
-        elif "sfx_high" in m.tags:
-            reason = "A|音效冲击"
-        if m.note:
-            reason = f"{reason}：{m.note[:20]}"
+        label = _moment_clip_reason(m, index=mi + 1)
+        reason = f"A|{label}"
         clips.append(
             ClipFragment(
                 trim_start_sec=round(start, 2),
@@ -447,6 +461,17 @@ def plan_simple_two_highlight(
         )
 
     scale_body_segments_to_budget(segments, episode_count=ep_n)
+    for seg in segments:
+        if not seg.clips:
+            continue
+        scale_clips_to_episode_duration(seg.clips, seg.duration_sec)
+        trim, total, seg.clips = sync_segment_from_clips(
+            trim_start_sec=seg.trim_start_sec,
+            duration_sec=seg.duration_sec,
+            clips=seg.clips,
+        )
+        seg.trim_start_sec = trim
+        seg.duration_sec = total
 
     opening_text = (
         fixed_opening_text()

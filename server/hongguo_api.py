@@ -204,4 +204,13 @@ async def fetch_episode_play_url(
     book_id: str = "",
 ) -> tuple[str, float]:
     info = await fetch_episode_video_info(client, item_id, book_id=book_id)
-    return str(info["url"]), float(info["duration"])
+    return str(info["url"]), duration_from_episode_info(info)
+
+
+def duration_from_episode_info(info: dict[str, Any]) -> float:
+    """从 fetch_episode_video_info 返回值解析源片时长（秒）。"""
+    try:
+        dur = float(info.get("duration") or info.get("video_duration") or 0)
+    except (TypeError, ValueError):
+        dur = 0.0
+    return dur if dur > 1 else 120.0

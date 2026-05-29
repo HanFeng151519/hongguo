@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/style.css?v=10" />
+  <link rel="stylesheet" href="/style.css?v=12" />
 </head>
 <body>
   <div class="page page-generate">
@@ -25,6 +25,10 @@
     <section class="generate-panel">
       <h2 class="panel-title">AI 推广剪辑</h2>
       <p class="episode-status"><strong>两段高光直剪</strong>：本集已剪好的正片里自动取 2 段最高光（音画分析），拼成约 30 秒钩子，原声 1x，不调用 AI。</p>
+      <label class="field field-checkbox">
+        <input id="use-manual-edit" type="checkbox" />
+        <span>手动多段剪辑（自定每段入点与时长，再生成成片）</span>
+      </label>
       <label class="field field-checkbox">
         <input id="use-ai-edit" type="checkbox" />
         <span>改用 AI 剪辑大师（需 LM Studio；关闭时默认两段高光直剪）</span>
@@ -48,8 +52,19 @@
       <div id="episode-grid" class="episode-grid episode-grid-loading"></div>
     </section>
 
+    <section id="manual-edit-panel" class="generate-panel hidden">
+      <div class="panel-head">
+        <h2 class="panel-title">手动多段剪辑</h2>
+        <button type="button" id="btn-reload-manual-draft" class="btn-ghost">重新载入草稿</button>
+      </div>
+      <p id="manual-edit-status" class="episode-status">流程：① 生成并下载正片 → ② 自动按音画高光预填两段（可改）→ ③ 继续生成成片。</p>
+      <div id="manual-edit-segments"></div>
+      <p id="manual-edit-total" class="manual-edit-total"></p>
+    </section>
+
     <section class="generate-actions">
       <button type="button" id="btn-generate" class="btn-primary" disabled>生成钩子视频</button>
+      <button type="button" id="btn-interrupt-edit" class="btn-ghost hidden">提前进入时间轴</button>
       <p id="generate-hint" class="generate-hint">选集后点生成：将自动打开浏览器完成达人中心登录（已登录会跳过），再开始下载与成片。两段高光直剪，约 30 秒，原声 1x。</p>
     </section>
 
@@ -65,6 +80,7 @@
       <a id="download-link" class="btn-download hidden" href="#" download="hook_video.mp4">下载推广视频（MP4）</a>
     </section>
   </div>
-  <script src="/generate.js?v=40"></script>
+  <script src="/manual_timeline.js?v=9"></script>
+  <script src="/generate.js?v=54"></script>
 </body>
 </html>

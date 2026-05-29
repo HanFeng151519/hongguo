@@ -6,7 +6,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import httpx
 from PIL import Image, ImageDraw, ImageFont, ImageOps
@@ -20,8 +20,10 @@ from ai_edit_planner import (
     plan_to_dict,
 )
 from fq_koc_material import (
+    episodes_missing_local,
     fetch_fq_koc_episode,
     find_local_material,
+    has_usable_local_episode,
     is_configured as fq_koc_configured,
     local_material_duration,
     raise_material_download_error,
@@ -1058,7 +1060,14 @@ def _clip_with_plan(
         commentary_lines, meme_caps, meme_beats
     )
     clips = segment_plan.resolved_clips() if segment_plan else []
-    use_multi = multi_clip_enabled() and len(clips) > 1
+    manual_segment = bool(
+        segment_plan
+        and (
+            "手動" in (segment_plan.reason or "")
+            or "手动" in (segment_plan.reason or "")
+        )
+    )
+    use_multi = bool(clips) and multi_clip_enabled()
 
     def _reason_preview(text: str, max_len: int = 72) -> str:
         s = re.sub(r"\s+", " ", str(text or "")).strip()
@@ -1109,11 +1118,10 @@ def _clip_with_plan(
     if not use_multi:
         trim = segment_plan.trim_start_sec if segment_plan else 0.0
         max_d = segment_plan.duration_sec if segment_plan else None
-        keep_first = os.getenv("HONGGUO_KEEP_FIRST_LINE", "1").strip().lower() not in (
-            "0",
-            "false",
-            "no",
-            "off",
+        keep_first = (
+            not manual_segment
+            and os.getenv("HONGGUO_KEEP_FIRST_LINE", "1").strip().lower()
+            not in ("0", "false", "no", "off")
         )
         cue_span = _first_cue_span() if keep_first else None
         if cue_span:
@@ -1123,7 +1131,7 @@ def _clip_with_plan(
             need = max(1.0, en - st + 0.8)
             if max_d and max_d > 0:
                 max_d = max(max_d, need)
-        if originality_enabled():
+        if originality_enabled() and not manual_segment:
             trim = max(
                 0.0,
                 trim + trim_jitter_seconds(f"{originality_seed}:{label}:{trim:.1f}"),
@@ -1153,11 +1161,10 @@ def _clip_with_plan(
             part = work / f"{dest.stem}_f{i:02d}.mp4"
             trim = frag.trim_start_sec
             frag_dur = float(getattr(frag, "duration_sec", fallback_seconds) or fallback_seconds)
-            keep_first = os.getenv("HONGGUO_KEEP_FIRST_LINE", "1").strip().lower() not in (
-                "0",
-                "false",
-                "no",
-                "off",
+            keep_first = (
+                not manual_segment
+                and os.getenv("HONGGUO_KEEP_FIRST_LINE", "1").strip().lower()
+                not in ("0", "false", "no", "off")
             )
             if i == 0 and keep_first:
                 cue_span = _first_cue_span()
@@ -1179,7 +1186,7 @@ def _clip_with_plan(
             spoken = _cue_range_text(trim, trim + src_len)
             if spoken:
                 logger.info("%s·段%d 台词片段: %s", label, i + 1, spoken)
-            if originality_enabled():
+            if originality_enabled() and not manual_segment:
                 trim = max(
                     0.0,
                     trim
@@ -1570,6 +1577,63 @@ def _process_body_clip(
     _ensure_output_aspect(dest, label)
 
 
+async def _raise_manual_interrupt_for_timeline(
+    *,
+    series_id: str,
+    drama_title: str,
+    opening: str,
+    keyword: str,
+    episode_item_ids: list[str],
+    episode_labels_pre: list[str],
+    reason: str = "manual",
+) -> None:
+    """手動流程：載入草稿並進入時間軸（不自動成片）。"""
+    from generate_job_control import JobInterruptedForEdit
+    from manual_edit_plan import build_manual_draft_after_materials
+
+    titles = {
+        iid: episode_labels_pre[idx]
+        for idx, iid in enumerate(episode_item_ids)
+    }
+    if reason == "auto":
+        logger.info("手動模式：正片已下載，自動進入時間軸編輯…")
+    else:
+        logger.info("使用者請求中斷，正在載入手動剪輯草稿…")
+    draft = await build_manual_draft_after_materials(
+        series_id=series_id,
+        drama_title=drama_title,
+        opening=opening,
+        keyword=keyword,
+        episode_item_ids=episode_item_ids,
+        episode_titles=titles,
+    )
+    raise JobInterruptedForEdit(draft)
+
+
+async def _maybe_raise_manual_interrupt(
+    should_interrupt: Optional[Any],
+    *,
+    series_id: str,
+    drama_title: str,
+    opening: str,
+    keyword: str,
+    episode_item_ids: list[str],
+    episode_labels_pre: list[str],
+) -> None:
+    """手動流程：使用者點「提前進入時間軸」時在協作點拋出。"""
+    if not should_interrupt or not await should_interrupt():
+        return
+    await _raise_manual_interrupt_for_timeline(
+        series_id=series_id,
+        drama_title=drama_title,
+        opening=opening,
+        keyword=keyword,
+        episode_item_ids=episode_item_ids,
+        episode_labels_pre=episode_labels_pre,
+        reason="user",
+    )
+
+
 async def _prefetch_fq_koc_for_planning(
     client: httpx.AsyncClient,
     *,
@@ -1578,11 +1642,24 @@ async def _prefetch_fq_koc_for_planning(
     episode_labels: list[str],
     drama_title: str,
     work_dir: Path,
+    should_interrupt: Optional[Any] = None,
+    series_id_for_interrupt: str = "",
+    drama_title_for_interrupt: str = "",
+    opening_for_interrupt: str = "",
+    keyword_for_interrupt: str = "",
 ) -> None:
-    """分镜/ASR 前把缺失集拉到 public/materials/fq_koc 缓存（避免「无本地 MP4」）。"""
+    """分镜/ASR 前把缺失集拉到 public/materials/fq_koc 缓存（已有本地可解码则跳过）。"""
+    missing_ids = episodes_missing_local(series_id, episode_item_ids)
+    cached_n = len(episode_item_ids) - len(missing_ids)
+    if cached_n > 0:
+        logger.info(
+            "%d/%d 集已本地缓存（可解码），跳过达人中心下载",
+            cached_n,
+            len(episode_item_ids),
+        )
     missing: list[tuple[int, str]] = []
     for index, item_id in enumerate(episode_item_ids, start=1):
-        if not find_local_material(series_id, item_id):
+        if item_id in missing_ids:
             missing.append((index, item_id))
     if not missing:
         return
@@ -1614,6 +1691,16 @@ async def _prefetch_fq_koc_for_planning(
                 logger.info("%s 已缓存 → %s", label, mat.name)
         except Exception as exc:
             logger.warning("%s 预拉失败（分镜可能无对白轴）: %s", label, exc)
+        if should_interrupt and series_id_for_interrupt:
+            await _maybe_raise_manual_interrupt(
+                should_interrupt,
+                series_id=series_id_for_interrupt,
+                drama_title=drama_title_for_interrupt,
+                opening=opening_for_interrupt,
+                keyword=keyword_for_interrupt,
+                episode_item_ids=episode_item_ids,
+                episode_labels_pre=episode_labels,
+            )
 
 
 async def _download_episode_segment_from_fq_koc(
@@ -2051,6 +2138,10 @@ async def generate_hook_video(
     splash_title_font: Optional[int] = None,
     splash_subtitle_font: Optional[int] = None,
     splash_badge: str = "",
+    edit_plan_override: Optional[dict] = None,
+    job_id: Optional[str] = None,
+    should_interrupt: Optional[Any] = None,
+    on_materials_ready: Optional[Any] = None,
 ) -> tuple[Path, str, str, dict]:
     if not episode_item_ids:
         raise ValueError("请至少选择一集")
@@ -2076,6 +2167,42 @@ async def generate_hook_video(
             episode_labels=episode_labels_pre,
             drama_title=drama_title,
             work_dir=work,
+            should_interrupt=should_interrupt,
+            series_id_for_interrupt=series_id,
+            drama_title_for_interrupt=drama_title,
+            opening_for_interrupt=opening,
+            keyword_for_interrupt=keyword,
+        )
+        if on_materials_ready:
+            await on_materials_ready()
+            await _raise_manual_interrupt_for_timeline(
+                series_id=series_id,
+                drama_title=drama_title,
+                opening=opening,
+                keyword=keyword,
+                episode_item_ids=episode_item_ids,
+                episode_labels_pre=episode_labels_pre,
+                reason="auto",
+            )
+        else:
+            await _maybe_raise_manual_interrupt(
+                should_interrupt,
+                series_id=series_id,
+                drama_title=drama_title,
+                opening=opening,
+                keyword=keyword,
+                episode_item_ids=episode_item_ids,
+                episode_labels_pre=episode_labels_pre,
+            )
+    else:
+        await _maybe_raise_manual_interrupt(
+            should_interrupt,
+            series_id=series_id,
+            drama_title=drama_title,
+            opening=opening,
+            keyword=keyword,
+            episode_item_ids=episode_item_ids,
+            episode_labels_pre=episode_labels_pre,
         )
     from output_canvas import (
         activate_canvas,
@@ -2104,12 +2231,37 @@ async def generate_hook_video(
             )
         episode_durations_pre.append(dur_local if dur_local > 1 else 120.0)
 
+    await _maybe_raise_manual_interrupt(
+        should_interrupt,
+        series_id=series_id,
+        drama_title=drama_title,
+        opening=opening,
+        keyword=keyword,
+        episode_item_ids=episode_item_ids,
+        episode_labels_pre=episode_labels_pre,
+    )
+
     episode_transcripts: dict = {}
     episode_visual_profiles: dict = {}
     from simple_highlight_plan import plan_simple_two_highlight, simple_highlight_enabled
 
     use_simple_highlight = (not use_ai_edit) and simple_highlight_enabled()
-    if use_ai_edit:
+    if edit_plan_override:
+        from ai_edit_planner import plan_from_manual_dict
+
+        n_seg = len(edit_plan_override.get("body_segments") or [])
+        logger.info("使用前端手動剪輯方案（%d 集）", n_seg)
+        edit_plan = plan_from_manual_dict(
+            edit_plan_override,
+            drama_title=drama_title,
+            opening=opening,
+            keyword=keyword,
+            episode_labels=episode_labels_pre,
+            episode_durations=episode_durations_pre,
+        )
+        if not edit_plan.body_segments:
+            raise ValueError("手動剪輯方案為空或無有效片段，請回到時間軸調整後重試")
+    elif use_ai_edit:
         import asyncio
 
         from video_transcript import asr_enabled, gather_episode_transcripts
@@ -2259,12 +2411,30 @@ async def generate_hook_video(
 
         episode_visual_profiles: dict = {}
         if visual_profile_enabled():
+            await _maybe_raise_manual_interrupt(
+                should_interrupt,
+                series_id=series_id,
+                drama_title=drama_title,
+                opening=opening,
+                keyword=keyword,
+                episode_item_ids=episode_item_ids,
+                episode_labels_pre=episode_labels_pre,
+            )
             episode_visual_profiles = await asyncio.to_thread(
                 gather_episode_visual_profiles,
                 series_id=series_id,
                 episode_item_ids=episode_item_ids,
                 episode_labels=episode_labels_pre,
                 work_dir=work,
+            )
+            await _maybe_raise_manual_interrupt(
+                should_interrupt,
+                series_id=series_id,
+                drama_title=drama_title,
+                opening=opening,
+                keyword=keyword,
+                episode_item_ids=episode_item_ids,
+                episode_labels_pre=episode_labels_pre,
             )
             if episode_visual_profiles:
                 from simple_highlight_plan import clips_per_episode_simple
@@ -2276,6 +2446,15 @@ async def generate_hook_video(
                     n_m,
                     clips_per_episode_simple(),
                 )
+        await _maybe_raise_manual_interrupt(
+            should_interrupt,
+            series_id=series_id,
+            drama_title=drama_title,
+            opening=opening,
+            keyword=keyword,
+            episode_item_ids=episode_item_ids,
+            episode_labels_pre=episode_labels_pre,
+        )
         edit_plan = plan_simple_two_highlight(
             drama_title=drama_title,
             opening=opening,
@@ -2294,9 +2473,13 @@ async def generate_hook_video(
         )
 
     plan_mode = (
-        "AI 剪辑大师"
-        if use_ai_edit
-        else ("两段高光直剪" if use_simple_highlight else "规则剪辑")
+        "手动多段剪辑"
+        if edit_plan_override
+        else (
+            "AI 剪辑大师"
+            if use_ai_edit
+            else ("两段高光直剪" if use_simple_highlight else "规则剪辑")
+        )
     )
     logger.info(
         "成片：%s | %s | 风格=%s | %s%s",
@@ -2508,12 +2691,30 @@ async def generate_hook_video(
 
         for file_tag, plan_run, merged_name, output_name in render_runs:
             logger.info("开始合成成片…")
+            await _maybe_raise_manual_interrupt(
+                should_interrupt,
+                series_id=series_id,
+                drama_title=drama_title,
+                opening=opening,
+                keyword=keyword,
+                episode_item_ids=episode_item_ids,
+                episode_labels_pre=episode_labels_pre,
+            )
             body_paths = []
             golden_src = None
             body_seconds_total = 0.0
             intro_seconds = 0.0
 
             for index, item_id in enumerate(episode_item_ids, start=1):
+                await _maybe_raise_manual_interrupt(
+                    should_interrupt,
+                    series_id=series_id,
+                    drama_title=drama_title,
+                    opening=opening,
+                    keyword=keyword,
+                    episode_item_ids=episode_item_ids,
+                    episode_labels_pre=episode_labels_pre,
+                )
                 label = episode_labels_pre[index - 1]
                 seg_plan = plan_run.body_for_index(index)
                 if (
@@ -2531,7 +2732,7 @@ async def generate_hook_video(
                 episode_ready = False
 
                 if use_fq_koc_material:
-                    has_local = bool(find_local_material(series_id, item_id))
+                    has_local = has_usable_local_episode(series_id, item_id)
                     if not has_local and not fq_koc_configured():
                         try:
                             raise_material_download_error(

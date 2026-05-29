@@ -69,6 +69,14 @@ class GenerateHookRequest(BaseModel):
         max_length=24,
         description="片头封面下方可选文字，如 1-5",
     )
+    edit_plan: Optional[dict] = Field(
+        default=None,
+        description="手動多段剪輯方案（body_segments.clips）；傳入時跳過 AI/兩段高光自動選段",
+    )
+    pause_for_manual_edit: bool = Field(
+        default=False,
+        description="先走生成流程下载正片，允许中断后在时间轴调整（再带 edit_plan 继续成片）",
+    )
 
 
 class FqKocSessionImportRequest(BaseModel):

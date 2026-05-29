@@ -294,7 +294,7 @@ def normalize_clip_fragment(item: Any) -> ClipFragment | None:
     )
 
 
-def normalize_clip_list(raw: Any) -> list[ClipFragment]:
+def normalize_clip_list(raw: Any, *, preserve_manual: bool = False) -> list[ClipFragment]:
     if not isinstance(raw, list):
         return []
     out: list[ClipFragment] = []
@@ -302,7 +302,33 @@ def normalize_clip_list(raw: Any) -> list[ClipFragment]:
         frag = normalize_clip_fragment(item)
         if frag:
             out.append(frag)
+    if preserve_manual:
+        return out
     return _dedupe_and_sort_clips(out)
+
+
+def clamp_clips_to_source(
+    clips: list[ClipFragment],
+    *,
+    dur_avail: float,
+    min_clip_sec: float = 2.0,
+) -> list[ClipFragment]:
+    """手動剪輯：僅把入點/時長限制在源片範圍內，不改寫片段順序與數量。"""
+    if not clips:
+        return []
+    avail = max(min_clip_sec + 0.25, float(dur_avail) - 0.25)
+    out: list[ClipFragment] = []
+    for c in clips:
+        start = max(0.0, min(float(c.trim_start_sec), avail - min_clip_sec))
+        dur = max(min_clip_sec, min(float(c.duration_sec), avail - start))
+        out.append(
+            ClipFragment(
+                trim_start_sec=round(start, 2),
+                duration_sec=round(dur, 2),
+                reason=(c.reason or "").strip(),
+            )
+        )
+    return out
 
 
 def enforce_hook_only_clips(
