@@ -429,6 +429,29 @@ async def _run_generate_job(job_id: str, body: GenerateHookRequest) -> None:
     os.environ["HONGGUO_FQ_KOC_SESSION_MUTABLE"] = "0"
     try:
         ep_count = len(body.episode_item_ids)
+        if body.use_fq_koc_material:
+            from fq_koc_browser import _auto_sync_enabled
+
+            if _auto_sync_enabled() and browser_sync_available():
+                book_id = body.series_id.strip()
+                if book_id:
+                    await _set_job(
+                        job_id,
+                        progress=(
+                            "正在确认达人中心登录（全程仅一次）：如弹出浏览器请先完成登录"
+                            "，已登录将自动跳过，请勿关闭浏览器…"
+                        ),
+                    )
+                    try:
+                        await ensure_koc_login(book_id)
+                    except RuntimeError as exc:
+                        await _set_job(
+                            job_id,
+                            status="failed",
+                            progress="登录失败",
+                            error=str(exc),
+                        )
+                        return
         await _set_job(
             job_id,
             progress=f"正在生成（{ep_count} 集，含去重增强约需 {max(3, ep_count * 2)}–{ep_count * 4} 分钟）…",

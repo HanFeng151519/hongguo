@@ -63,6 +63,12 @@ def opening_voiceover_enabled() -> bool:
     return v not in ("0", "false", "no", "off")
 
 
+def outro_voiceover_enabled() -> bool:
+    """片尾口播开关：关=正片结束即成片，不追加尾帧 TTS。"""
+    v = os.getenv("HONGGUO_OUTRO_VOICEOVER", "0").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
 def golden_open_sec() -> float:
     if not opening_voiceover_enabled():
         return 0.0
@@ -93,6 +99,16 @@ def ai_script_duration_guidance() -> str:
 
 def body_main_sec() -> float:
     """正片参考时长（默认取最佳区间中点）。"""
+    try:
+        from hook_duration_budget import (
+            hook_target_total_sec,
+            is_thirty_second_hook_preset,
+        )
+
+        if is_thirty_second_hook_preset():
+            return max(8.0, hook_target_total_sec() - intro_outro_overhead_pro())
+    except ImportError:
+        pass
     lo, hi = ai_body_script_optimal_range()
     default_mid = (lo + hi) / 2.0
     return _read_seg("HONGGUO_BODY_MAIN_SEC", default_mid, lo=lo, hi=hi)
@@ -144,6 +160,8 @@ def outro_tail_video_sec() -> float:
 
 
 def outro_cta_sec() -> float:
+    if not outro_voiceover_enabled():
+        return 0.0
     return _read_seg("HONGGUO_OUTRO_CTA_SEC", 3.0, lo=2.0, hi=6.0)
 
 
@@ -167,7 +185,7 @@ def fixed_opening_line() -> str:
 def fixed_outro_line() -> str:
     return (
         os.getenv("HONGGUO_FIXED_OUTRO_TEXT", "").strip()
-        or "剧名在评论区"
+        or "关注我，带您看更多好剧！"
     )
 
 

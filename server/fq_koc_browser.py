@@ -10,7 +10,7 @@ import re
 import socket
 from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
 import httpx
 
@@ -41,11 +41,64 @@ _BROWSER_LOCK = asyncio.Lock()
 _BROWSER_AVAILABLE: Optional[bool] = None
 _CREATE_PATH = "/api/platform/content/batch_download/create/v1"
 
+
+def _browser_batch_create_url() -> str:
+    """浏览器内 fetch 必须用绝对 URL（相对路径会触发 Failed to parse URL）。"""
+    raw = os.getenv("HONGGUO_FQ_KOC_CREATE_URL", "").strip()
+    if raw.startswith("http") and "batch_download/create" in raw:
+        return raw
+    qs: dict[str, str] = {"app_id": "457699", "aid": "457699"}
+    ms = os.getenv("HONGGUO_FQ_KOC_MS_TOKEN", "").strip()
+    ab = os.getenv("HONGGUO_FQ_KOC_A_BOGUS", "").strip()
+    if ms:
+        qs["msToken"] = ms
+    if ab:
+        qs["a_bogus"] = ab
+    return f"{KOC_BASE}{_CREATE_PATH}?{urlencode(qs)}"
+
+
+async def _browser_post_batch_create(
+    context: Any,
+    *,
+    book_id: str,
+    item_id: str,
+    referer: str = "",
+) -> dict[str, Any]:
+    """
+    用 Playwright 自带 request（共享浏览器 Cookie），避免 page.evaluate + fetch
+    在 about:blank / 跨域页面上 Failed to fetch。
+    """
+    from fq_koc_material import _browser_form_payload
+
+    post_url = _browser_batch_create_url()
+    form = _browser_form_payload(book_id, item_id)
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+        "Referer": referer or f"{KOC_BASE}/page/member/content",
+        "Origin": KOC_BASE,
+    }
+    resp = await context.request.post(
+        post_url,
+        data=urlencode(form),
+        headers=headers,
+        timeout=120_000,
+    )
+    text = await resp.text()
+    return {
+        "status": resp.status,
+        "url": str(resp.url),
+        "text": text,
+        "ok": resp.ok,
+    }
+
+
 # 常驻 Playwright：首次启动后保持 Chrome 与登录态，避免每集关浏览器
 _pw: Any = None
 _pw_context: Any = None
 _pw_headless: Optional[bool] = None
 _pw_page: Any = None
+# 本次服务进程内是否已完成「一次」达人中心登录确认（防止生成任务里连弹两次浏览器）
+_koc_login_verified: bool = False
 
 
 def _browser_keep_alive() -> bool:
@@ -73,6 +126,15 @@ def browser_sync_available() -> bool:
 
 def _profile_ready() -> bool:
     return LOGIN_MARKER.is_file() and PROFILE_DIR.is_dir()
+
+
+def _mark_koc_logged_in() -> None:
+    PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    LOGIN_MARKER.write_text("1", encoding="utf-8")
+
+
+def koc_login_verified() -> bool:
+    return _koc_login_verified
 
 
 def _cookies_header(cookies: list[dict[str, Any]]) -> str:
@@ -111,15 +173,27 @@ def _stable_member_content_url() -> str:
     return f"{KOC_BASE}/page/member/content"
 
 
+def _login_use_invite_url() -> bool:
+    """
+    是否用 invite 邀请链打开登录页（页面上会显示机构名，如「不鸣文化」）。
+    默认：已配置 HONGGUO_FQ_KOC_INVITE_TOKEN 则用邀请页；=0 强制稳定会员页。
+    """
+    explicit = os.getenv("HONGGUO_FQ_KOC_LOGIN_USE_INVITE", "").strip().lower()
+    if explicit in ("0", "false", "no", "off"):
+        return False
+    if explicit in ("1", "true", "yes", "on"):
+        return True
+    return bool(os.getenv("HONGGUO_FQ_KOC_INVITE_TOKEN", "").strip())
+
+
 def _login_entry_url(book_id: str = "") -> str:
-    """
-    登录入口优先机构邀请页（可显示机构名，如“不鸣文化”）；
-    若 invite 未配置则退回稳定会员页。
-    """
-    try:
-        return koc_content_hub_url(book_id)
-    except Exception:
-        return _stable_member_content_url()
+    """登录入口：有 invite 时走邀请页（显示机构名）；否则稳定会员页。"""
+    if _login_use_invite_url():
+        try:
+            return koc_content_hub_url(book_id)
+        except Exception as exc:
+            logger.debug("invite 登录入口不可用，退回会员页: %s", exc)
+    return _stable_member_content_url()
 
 
 def _extract_download_url(payload: Any) -> str:
@@ -161,12 +235,13 @@ def _login_wait_sec(default_sec: int = 600) -> int:
 
 
 async def _wait_for_login(page: Any, *, timeout_sec: int = 600) -> None:
+    global _koc_login_verified
     for _ in range(timeout_sec):
         cookies = await page.context.cookies(KOC_BASE)
         names = {c.get("name") for c in cookies}
         if "sessionid" in names or "sid_tt" in names:
-            LOGIN_MARKER.parent.mkdir(parents=True, exist_ok=True)
-            LOGIN_MARKER.write_text("1", encoding="utf-8")
+            _koc_login_verified = True
+            _mark_koc_logged_in()
             return
         await page.wait_for_timeout(1000)
     raise KocLoginRequiredError(
@@ -180,10 +255,11 @@ async def ensure_koc_login(
     *,
     timeout_sec: Optional[int] = None,
 ) -> dict[str, Any]:
-    """仅执行登录同步，不触发任何下载。"""
-    global _pw_page
+    """打开可见浏览器并进入达人中心登录页（同任务内已真正登录则跳过）。"""
+    global _pw_page, _koc_login_verified
     wait_sec = timeout_sec if timeout_sec is not None else _login_wait_sec()
-    context = await _acquire_persistent_context(want_headless=False)
+    logger.info("正在打开 Chrome 登录达人中心（请在本机查看弹出的浏览器窗口）…")
+    context = await _acquire_login_context()
     page: Any = None
     keep_page_open = False
     try:
@@ -196,23 +272,56 @@ async def ensure_koc_login(
             page = reused
             logger.info("登录同步：复用现有浏览器标签页")
         else:
-            page = _pw_page
             page = await context.new_page()
             logger.info("登录同步：新建浏览器标签页")
+        await _bring_page_to_front(page)
+
+        if await _session_really_valid(page, context):
+            if _koc_login_verified:
+                logger.info("本会话已登录且页面正常，跳过二次打开登录页")
+            else:
+                logger.info("登录同步：已登录，跳过打开登录页")
+            _koc_login_verified = True
+            _mark_koc_logged_in()
+            await _sync_browser_session_from_context(context)
+            if _browser_keep_alive():
+                _pw_page = page
+                keep_page_open = True
+            return {
+                "ok": True,
+                "wait_sec": 0,
+                "logged_in": True,
+                "skipped_navigation": True,
+            }
+
+        _koc_login_verified = False
+        await _maybe_inject_env_cookies(context)
+
+        login_url = _login_entry_url(book_id)
+        logger.info("打开登录页: %s", login_url[:120])
         try:
             await page.goto(
-                _login_entry_url(book_id),
+                login_url,
                 wait_until="domcontentloaded",
                 timeout=120_000,
             )
-        except Exception:
+        except Exception as exc:
+            logger.warning("invite 登录页打开失败，改用会员页: %s", exc)
             await page.goto(
-                f"{KOC_BASE}/page/member/content",
+                _stable_member_content_url(),
                 wait_until="domcontentloaded",
                 timeout=120_000,
             )
-        await _wait_for_login(page, timeout_sec=wait_sec)
-        logger.info("达人中心登录完成，后续将复用同一会话")
+        await _bring_page_to_front(page)
+        if await _session_really_valid(page, context):
+            logger.info("达人中心登录完成（跳转后已检测到登录态）")
+        else:
+            logger.info("请在弹出的浏览器窗口完成机构/手机号登录（最多等待 %s 秒）", wait_sec)
+            await _wait_for_login(page, timeout_sec=wait_sec)
+            logger.info("达人中心登录完成，后续将复用同一会话")
+        _koc_login_verified = True
+        _mark_koc_logged_in()
+        await _sync_browser_session_from_context(context)
         if _browser_keep_alive():
             _pw_page = page
             keep_page_open = True
@@ -313,10 +422,103 @@ async def _has_login_cookie(context: Any) -> bool:
         return False
 
 
+async def _session_really_valid(page: Any, context: Any) -> bool:
+    """Cookie 存在且当前页不是机构登录页，才算真正已登录。"""
+    if not await _has_login_cookie(context):
+        return False
+    if await _is_login_gate_page(page):
+        return False
+    try:
+        url = (page.url or "").lower()
+    except Exception:
+        return False
+    if not url or url in ("about:blank", "chrome://newtab/"):
+        return False
+    return "fqopenplatform" in url
+
+
+async def _sync_browser_session_from_context(context: Any) -> None:
+    """把浏览器当前登录 Cookie 写回 koc_session，勿用 .env 覆盖浏览器。"""
+    try:
+        cookies = await context.cookies(KOC_BASE)
+        header = _cookies_header(cookies)
+        if header and ("sessionid=" in header or "sid_tt=" in header):
+            save_koc_session(cookie=header)
+            logger.info("已从浏览器同步登录 Cookie 到会话")
+    except Exception as exc:
+        logger.debug("sync browser session: %s", exc)
+
+
+async def _maybe_inject_env_cookies(context: Any) -> None:
+    """
+    仅在无浏览器登录态且显式开启时注入 .env Cookie。
+    默认禁止：.env 里过期 Cookie 会覆盖 pw_profile 刚登录的会话（表现为「一上来就掉线」）。
+    """
+    env_cookie = os.getenv("HONGGUO_FQ_KOC_COOKIE", "").strip()
+    if not env_cookie:
+        return
+    if await _has_login_cookie(context):
+        logger.info("浏览器已有登录态，跳过 .env Cookie 注入")
+        return
+    allow = os.getenv("HONGGUO_FQ_KOC_INJECT_ENV_COOKIE", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    if not allow:
+        logger.info(
+            "未注入 .env Cookie（避免覆盖浏览器登录）；"
+            "无登录态时请直接在弹出 Chrome 里登录"
+        )
+        return
+    try:
+        await context.add_cookies(_cookie_header_to_playwright(env_cookie))
+        logger.info("已注入 .env Cookie（HONGGUO_FQ_KOC_INJECT_ENV_COOKIE=1）")
+    except Exception as exc:
+        logger.debug("inject env cookie: %s", exc)
+
+
 async def close_koc_browser() -> None:
     """关闭常驻浏览器（服务退出时可调用）。"""
     async with _BROWSER_LOCK:
         await _close_persistent_browser()
+
+
+async def _acquire_login_context() -> Any:
+    """登录专用：强制有头可见窗口；若当前是无头常驻则重启。"""
+    global _pw, _pw_context, _pw_headless
+
+    if not _browser_keep_alive():
+        from playwright.async_api import async_playwright
+
+        pw = await async_playwright().start()
+        ctx = await _launch_context(pw, headless=False)
+        ctx._hongguo_ephemeral_pw = pw  # type: ignore[attr-defined]
+        return ctx
+
+    async with _BROWSER_LOCK:
+        if _pw_context is not None and _pw_headless:
+            logger.info("登录：当前为无头浏览器，重启为可见窗口")
+            await _close_persistent_browser()
+        if _pw_context is not None and await _is_context_alive(_pw_context):
+            return _pw_context
+        if _pw_context is not None:
+            await _close_persistent_browser()
+        from playwright.async_api import async_playwright
+
+        _pw = await async_playwright().start()
+        _pw_context = await _launch_context(_pw, headless=False)
+        _pw_headless = False
+        logger.info("已打开可见 Chrome 窗口供达人中心登录")
+        return _pw_context
+
+
+async def _bring_page_to_front(page: Any) -> None:
+    try:
+        await page.bring_to_front()
+    except Exception as exc:
+        logger.debug("bring_to_front: %s", exc)
 
 
 async def _acquire_persistent_context(*, want_headless: bool) -> Any:
@@ -773,44 +975,32 @@ async def _run_in_browser(
             page = await context.new_page()
             logger.info("下载链路：新建浏览器标签页")
 
-        env_cookie = os.getenv("HONGGUO_FQ_KOC_COOKIE", "").strip()
-        if env_cookie:
-            try:
-                await context.add_cookies(
-                    _cookie_header_to_playwright(env_cookie)
-                )
-            except Exception as exc:
-                logger.debug("inject env cookie: %s", exc)
+        await _maybe_inject_env_cookies(context)
 
-        # 先确保登录，再做内容检索；避免在“机构成员登录”页误把手机号输入框当搜索框。
-        cookies = await context.cookies(KOC_BASE)
-        names = {c.get("name") for c in cookies}
-        logged_in = "sessionid" in names or "sid_tt" in names
+        # 登录应在生成任务开头由 ensure_koc_login 完成一次；此处仅校验，不再二次打开登录页。
+        logged_in = await _has_login_cookie(context)
         if not logged_in:
+            if _koc_login_verified:
+                raise KocLoginRequiredError(
+                    "登录态已丢失：请重新点「生成钩子视频」并在浏览器中登录一次"
+                )
             if want_headless:
                 raise KocLoginRequiredError(
                     "请先完成登录：当前为无头模式且未检测到登录态，"
-                    "请先点“仅登录同步”完成登录后再生成。"
+                    "请点「生成钩子视频」并在弹出浏览器中完成登录后再继续。"
                 )
-            try:
-                await page.goto(
-                    _login_entry_url(book_id),
-                    wait_until="domcontentloaded",
-                    timeout=120_000,
-                )
-            except Exception:
-                await page.goto(
-                    f"{KOC_BASE}/page/member/content",
-                    wait_until="domcontentloaded",
-                    timeout=120_000,
-                )
-            await _wait_for_login(
-                page, timeout_sec=max(timeout_sec, _login_wait_sec())
+            logger.warning(
+                "下载链路：未检测到登录态（请确认生成任务开头已完成登录确认）"
+            )
+            raise KocLoginRequiredError(
+                "未检测到登录态：请重新点「生成钩子视频」，在弹出浏览器中完成登录"
             )
 
         page_url = (page.url or "").strip() or _stable_member_content_url()
         if await _is_login_gate_page(page):
-            raise KocLoginRequiredError("请先完成登录：当前页面仍是机构成员登录页。")
+            raise KocLoginRequiredError(
+                "当前页面仍是机构登录页：请在该浏览器窗口完成登录后重试"
+            )
         if no_navigate_mode:
             logger.info("下载链路：无跳转模式（复用当前页，仅发接口请求）")
         else:
@@ -872,29 +1062,36 @@ async def _run_in_browser(
                 page, timeout_sec=max(timeout_sec, _login_wait_sec())
             )
 
-        evaluate_result = await page.evaluate(
-            """async ({bookId, itemId}) => {
-              const path = '/api/platform/content/batch_download/create/v1';
-              const body = new URLSearchParams({
-                book_id: bookId,
-                item_id: itemId,
-                content_tab: '6',
-                app_id: '457699',
-                aid: '457699',
-                origin_app_id: '457699',
-                host_app_id: '457699',
-              });
-              const res = await fetch(path, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                body: body.toString(),
-                credentials: 'include',
-              });
-              const text = await res.text();
-              return { status: res.status, url: res.url, text, ok: res.ok };
-            }""",
-            {"bookId": book_id, "itemId": item_id},
-        )
+        evaluate_result: dict[str, Any] = {}
+        skip_inpage_api = no_navigate_mode and manual_click_only
+        if not skip_inpage_api:
+            try:
+                if page and "fqopenplatform" not in (page.url or "").lower():
+                    await page.goto(
+                        _stable_member_content_url(),
+                        wait_until="domcontentloaded",
+                        timeout=90_000,
+                    )
+                evaluate_result = await _browser_post_batch_create(
+                    context,
+                    book_id=book_id,
+                    item_id=item_id,
+                    referer=page_url,
+                )
+                logger.info(
+                    "batch_download API（Playwright request）status=%s",
+                    evaluate_result.get("status"),
+                )
+            except Exception as exc:
+                logger.warning("batch_download API 失败: %s", exc)
+                if not manual_click_only:
+                    raise RuntimeError(
+                        f"达人中心下载接口请求失败: {exc}"
+                    ) from exc
+        else:
+            logger.info(
+                "手动下载模式：跳过页面内 API，请在达人中心页手动点「下载」"
+            )
         await page.wait_for_timeout(2000)
 
         cookie_header = _cookies_header(await context.cookies(KOC_BASE))
@@ -1034,11 +1231,13 @@ async def _run_in_browser(
                 raise RuntimeError("下载文件过小，可能链接已过期")
             download_to.write_bytes(body)
 
-        if create_url:
-            ms_token, a_bogus = _parse_create_url(create_url)
+        if create_url or cookie_header:
+            ms_token, a_bogus = (
+                _parse_create_url(create_url) if create_url else ("", "")
+            )
             save_koc_session(
                 create_url=create_url,
-                cookie=cookie_header or os.getenv("HONGGUO_FQ_KOC_COOKIE", ""),
+                cookie=cookie_header,
                 ms_token=ms_token,
                 a_bogus=a_bogus,
                 download_body=post_data
@@ -1064,6 +1263,7 @@ async def _run_in_browser(
             "cookie_header": cookie_header,
         }
     finally:
+        # 不再把复用页 navigate 回登录前 URL（易触发二次鉴权/掉线）
         if (
             _browser_keep_alive()
             and reused_existing_page
@@ -1072,15 +1272,21 @@ async def _run_in_browser(
             and original_page_url
             and (page.url or "").strip() != original_page_url
         ):
-            try:
-                logger.info("下载链路：恢复复用页到原地址")
-                await page.goto(
-                    original_page_url,
-                    wait_until="domcontentloaded",
-                    timeout=30_000,
-                )
-            except Exception as exc:
-                logger.debug("恢复复用页失败: %s", exc)
+            restore = os.getenv(
+                "HONGGUO_FQ_KOC_RESTORE_PAGE_URL", "0"
+            ).strip().lower() in ("1", "true", "yes", "on")
+            if restore and "login" not in original_page_url.lower():
+                try:
+                    logger.info("下载链路：恢复复用页到原地址")
+                    await page.goto(
+                        original_page_url,
+                        wait_until="domcontentloaded",
+                        timeout=30_000,
+                    )
+                except Exception as exc:
+                    logger.debug("恢复复用页失败: %s", exc)
+            else:
+                logger.debug("下载链路：保持当前页，不恢复登录前 URL")
         if _browser_keep_alive() and page is not None and await _is_page_alive(page):
             _pw_page = page
         if page is not None and not _browser_keep_alive():
@@ -1104,16 +1310,7 @@ async def auto_download_episode_to_cache(
     if not _auto_sync_enabled():
         raise RuntimeError("自动下载已关闭（HONGGUO_FQ_KOC_AUTO_SYNC=0）")
 
-    async def _ensure_first_login_if_needed() -> None:
-        """首次无登录标记时，强制有头登录一次并持久化到 pw_profile。"""
-        if _profile_ready():
-            return
-        logger.info("首次使用达人中心，先打开浏览器完成登录...")
-        await ensure_koc_login(book_id, timeout_sec=_login_wait_sec())
-
-    await _ensure_first_login_if_needed()
-
-    # 单会话策略：不再无头/有头来回切换重试，避免触发上下文重建与掉登录态。
+    # 单会话策略：登录仅在生成任务开头 ensure_koc_login 做一次；此处只下载。
     try_open = (
         True if open_browser is None else bool(open_browser)
     )

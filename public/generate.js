@@ -79,7 +79,6 @@ const cacheInProgress = new Set();
 const episodeStatusEl = document.getElementById("episode-status");
 const episodeGridEl = document.getElementById("episode-grid");
 const btnGenerate = document.getElementById("btn-generate");
-const btnLoginSync = document.getElementById("btn-login-sync");
 const generateHint = document.getElementById("generate-hint");
 const resultPanel = document.getElementById("result-panel");
 const resultMsg = document.getElementById("result-msg");
@@ -123,8 +122,8 @@ async function loadServiceConfig(itemId = "") {
     if (data.fq_koc?.auto_sync && data.fq_koc?.browser_sync) {
       parts.push(
         data.fq_koc?.browser_profile_ready
-          ? "Playwright 已开启（AUTO_SYNC=1），失败时会自动拉片"
-          : "Playwright 已开启：可点「自动登录并同步权限」"
+          ? "Playwright 已开启（AUTO_SYNC=1），生成时自动登录并拉片"
+          : "Playwright 已开启：生成时将自动打开浏览器登录"
       );
     } else if (data.fq_koc?.ready) {
       parts.push("推荐：用 .env / 导入 F12 抓包下载，不弹浏览器（AUTO_SYNC=0）");
@@ -196,7 +195,7 @@ function updateGenerateState() {
       generateHint.textContent = "请选择至少 1 集";
     } else {
       generateHint.textContent =
-        "两段高光直剪：每集 2 段最高光，成片约 30 秒（默认不调用 AI）。";
+        "点「生成钩子视频」：自动登录达人中心后开始下载与成片（两段高光直剪，约 30 秒）。";
     }
   }
 }
@@ -530,51 +529,6 @@ async function loadEpisodes() {
   }
 }
 
-async function runLoginOnlySync() {
-  if (!btnLoginSync) return;
-  if (!seriesId) {
-    if (generateHint) {
-      generateHint.textContent = "缺少短剧 ID，请从检索页进入后再点“仅登录同步”。";
-    }
-    return;
-  }
-  btnLoginSync.disabled = true;
-  btnGenerate.disabled = true;
-  btnLoginSync.textContent = "请在浏览器完成登录…";
-  resultPanel.classList.remove("hidden");
-  resultMsg.textContent =
-    "已打开达人中心登录页，请先完成登录；未登录完成前不会继续任何下载。";
-  try {
-    const res = await fetch("/api/fq-koc/session/login-only", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        series_id: seriesId,
-        timeout_sec: 600,
-      }),
-    });
-    const { data } = await readJsonResponse(res);
-    if (!res.ok || !data?.ok) {
-      throw new Error(data?.detail || data?.message || "登录同步失败");
-    }
-    resultMsg.textContent = "已登录。你现在可以点击“生成钩子视频”。";
-    if (generateHint) {
-      generateHint.textContent = "已登录，可直接生成。";
-    }
-    await loadServiceConfig();
-  } catch (err) {
-    const msg = err?.message || "登录同步失败";
-    resultMsg.textContent = msg;
-    if (generateHint) {
-      generateHint.textContent = `请先完成登录：${msg}`;
-    }
-  } finally {
-    btnLoginSync.disabled = false;
-    btnLoginSync.textContent = "仅登录同步（先完成登录）";
-    updateGenerateState();
-  }
-}
-
 document.getElementById("select-all").addEventListener("click", () => {
   selected.clear();
   const limit = Math.min(episodes.length, MAX_SELECT);
@@ -621,8 +575,10 @@ btnGenerate.addEventListener("click", async () => {
   btnGenerate.textContent = "正在生成，请稍候…";
   resultPanel.classList.remove("hidden");
   postCaptionBox?.classList.add("hidden");
-  resultMsg.textContent =
-    "正在生成；如提示等待下载地址，请在已登录达人页面手动点击目标集“下载”一次。";
+  const useFqKoc = useFqKocEl ? useFqKocEl.checked !== false : true;
+  resultMsg.textContent = useFqKoc
+    ? "已提交：将先确认达人中心登录（可能弹出浏览器），再下载素材并生成成片。若提示手动下载，请在达人页点目标集「下载」一次。"
+    : "正在生成，请稍候…";
   previewEl.classList.add("hidden");
   previewEl.removeAttribute("src");
   downloadLink.classList.add("hidden");
@@ -705,7 +661,5 @@ btnGenerate.addEventListener("click", async () => {
     updateGenerateState();
   }
 });
-
-btnLoginSync?.addEventListener("click", runLoginOnlySync);
 
 loadEpisodes();

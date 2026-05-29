@@ -129,6 +129,17 @@ def is_one_minute_hook_preset() -> bool:
     return _hook_preset() in ("1min", "one_minute", "one-minute", "一分钟", "60s", "60")
 
 
+def is_thirty_second_hook_preset() -> bool:
+    return _hook_preset() in (
+        "30s",
+        "30",
+        "thirty",
+        "half_minute",
+        "half-minute",
+        "半分钟",
+    )
+
+
 def _use_pro_timeline() -> bool:
     try:
         from hook_timeline import pro_60_template_enabled
@@ -161,9 +172,11 @@ def opening_card_overhead_sec() -> float:
 
 
 def hook_budget_enabled(episode_count: int) -> bool:
-    """专业 60s：1 集起即按 46s 正片预算；多集长钩子默认 2 集起。"""
+    """专业 60s：1 集起即按 46s 正片预算；30s 预设单集也启用。"""
     if episode_count < 1:
         return False
+    if is_thirty_second_hook_preset():
+        return True
     if _use_pro_timeline():
         return True
     if episode_count < 2:
@@ -193,6 +206,9 @@ def body_budget_seconds(
     if episode_count < 1:
         return 0.0
     overhead = intro_outro_overhead_sec(with_commentary=with_commentary)
+    if is_thirty_second_hook_preset():
+        total = hook_target_total_sec() if total_sec is None else float(total_sec)
+        return max(8.0, total - overhead)
     if _use_pro_timeline():
         from hook_timeline import body_main_sec
 
@@ -251,7 +267,10 @@ def scale_body_segments_to_budget(
     wsum = sum(weights)
     # 按上限规划，减少为凑固定 3 分钟而过度压缩
     targets = [budget_max * w / wsum for w in weights]
-    if _use_pro_timeline():
+    if is_thirty_second_hook_preset():
+        min_each = max(6.0, budget_min / n * 0.45)
+        max_each = budget_max if n == 1 else min(32.0, budget_max / n * 1.5)
+    elif _use_pro_timeline():
         min_each = max(3.0, budget_min / n * 0.38)
         # 专业 60s 单集需吃满整段正片预算（此前 28s 上限导致成片仅 ~44s）
         max_each = budget_max if n == 1 else min(28.0, budget_max / n * 1.6)

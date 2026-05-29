@@ -64,6 +64,7 @@ from hook_timeline import (
     golden_open_sec,
     opening_voiceover_enabled,
     outro_cta_sec,
+    outro_voiceover_enabled,
     pro_60_template_enabled,
     timeline_summary,
 )
@@ -2480,11 +2481,17 @@ async def generate_hook_video(
 
         outro_norm_pro: Optional[Path] = None
         outro_dur_pro = outro_cta_sec()
+        outro_enabled = outro_voiceover_enabled()
         narr_voice_pro = resolve_voice(
             os.getenv("HONGGUO_TTS_VOICE", "").strip()
             or pick_voice_for_episode(originality_seed)
         )
-        if use_pro and tts_enabled() and edge_tts_available():
+        if (
+            use_pro
+            and outro_enabled
+            and tts_enabled()
+            and edge_tts_available()
+        ):
             from edge_tts_narration import opening_card_duration_for_text
 
             _, outro_dur_pro = opening_card_duration_for_text(
@@ -2494,6 +2501,8 @@ async def generate_hook_video(
                 cache_dir=TTS_CACHE_DIR,
             )
             outro_dur_pro = max(outro_cta_sec(), min(6.0, outro_dur_pro))
+        elif not outro_enabled:
+            outro_dur_pro = 0.0
 
         primary_output: Optional[Path] = None
 
@@ -2684,7 +2693,7 @@ async def generate_hook_video(
 
                 pro_segments.extend(body_paths)
 
-                if body_paths:
+                if body_paths and outro_enabled:
                     from hook_pro_render import enhance_outro_voiceover_clip
 
                     outro_line = fixed_outro_line()
@@ -2717,6 +2726,8 @@ async def generate_hook_video(
                         WORK_WIDTH,
                         WORK_HEIGHT,
                     )
+                elif body_paths and not outro_enabled:
+                    logger.info("片尾口播已关闭：成片以正片结束")
 
                 freeze_mp4 = work / f"98_fadeout{file_tag}.mp4"
                 from hook_timeline import (
@@ -2766,7 +2777,7 @@ async def generate_hook_video(
                             fade_sec=tail_fade,
                         )
                     else:
-                        logger.info("正片尾跳过黑场/淡出，直接接片尾口播")
+                        logger.info("正片尾跳过黑场/淡出")
                 else:
                     freeze_src = body_paths[-1] if body_paths else pro_segments[-1]
                     build_freeze_segment(

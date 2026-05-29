@@ -481,6 +481,59 @@ def refine_clips_for_hook_arc(
     return ensure_clip_spacing(_dedupe_and_sort_clips(out))
 
 
+def ensure_clips_timeline_gap(
+    clips: list[ClipFragment],
+    *,
+    min_gap_sec: float,
+    dur_avail: float | None = None,
+) -> list[ClipFragment]:
+    """源片上相邻片段至少相隔 min_gap_sec：只错开起点，绝不合并为一段。"""
+    from hook_edit_methodology import clip_tier
+
+    if not clips:
+        return []
+    gap = max(0.35, float(min_gap_sec))
+    avail = float(dur_avail) if dur_avail is not None else 1e9
+    out: list[ClipFragment] = []
+    for c in sorted(clips, key=lambda x: x.trim_start_sec):
+        if clip_tier(c.reason) == "C":
+            continue
+        start = float(c.trim_start_sec)
+        tier = clip_tier(c.reason)
+        lo = clip_min_sec(tier=tier)
+        hi = clip_max_sec(tier=tier)
+        dur = _clamp(float(c.duration_sec), lo, hi)
+        if out:
+            prev_end = out[-1].trim_start_sec + out[-1].duration_sec
+            if start < prev_end + gap:
+                start = prev_end + gap
+        if start + dur > avail - 0.5:
+            dur = max(lo, avail - 0.5 - start)
+        if dur < lo * 0.85 and out:
+            shrink = min(out[-1].duration_sec - lo, start - (out[-1].trim_start_sec + lo + gap))
+            if shrink > 0.35:
+                out[-1].duration_sec = round(out[-1].duration_sec - shrink, 2)
+                start = out[-1].trim_start_sec + out[-1].duration_sec + gap
+                dur = max(lo, min(float(c.duration_sec), avail - 0.5 - start))
+            if dur < lo * 0.85:
+                logger.warning(
+                    "片段间隔 %.1fs 后片长不足（start=%.1fs avail=%.1fs），保留已有 %d 段",
+                    gap,
+                    start,
+                    avail,
+                    len(out),
+                )
+                continue
+        out.append(
+            ClipFragment(
+                trim_start_sec=round(start, 2),
+                duration_sec=round(dur, 2),
+                reason=c.reason,
+            )
+        )
+    return out
+
+
 def ensure_clip_spacing(
     clips: list[ClipFragment],
     *,

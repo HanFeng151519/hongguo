@@ -3,10 +3,6 @@ const input = document.getElementById("search-input");
 const btn = document.getElementById("search-btn");
 const statusEl = document.getElementById("status");
 const resultsEl = document.getElementById("results");
-const hotListEl = document.getElementById("hot-list");
-const hotStatusEl = document.getElementById("hot-status");
-const hotDateEl = document.getElementById("hot-date");
-
 let debounceTimer = null;
 let currentQuery = "";
 let lastSearchItems = [];
@@ -119,89 +115,6 @@ function officialUrl(item) {
     return `https://www.novelquickapp.com/detail?series_id=${encodeURIComponent(item.id)}`;
   }
   return "";
-}
-
-function formatPlayCount(count) {
-  const num = Number(count) || 0;
-  if (num >= 100_000_000) {
-    return `${(num / 100_000_000).toFixed(1).replace(/\.0$/, "")}亿播放`;
-  }
-  if (num >= 10_000) {
-    return `${(num / 10_000).toFixed(1).replace(/\.0$/, "")}万播放`;
-  }
-  if (num > 0) {
-    return `${num}播放`;
-  }
-  return "";
-}
-
-function renderHotItem(item, rank) {
-  const href = officialUrl(item);
-  const cover = item.cover
-    ? `<img src="${escapeHtml(item.cover)}" alt="" loading="lazy" referrerpolicy="no-referrer" />`
-    : `<div class="placeholder">🎬</div>`;
-  const playLabel = formatPlayCount(item.play_count);
-  const meta = [];
-  if (item.episodes) meta.push(`${item.episodes}集`);
-  if (item.score) meta.push(`${escapeHtml(String(item.score))}分`);
-
-  return `
-    <li class="hot-item">
-      <span class="hot-rank">${rank}</span>
-      <div class="hot-cover">${cover}</div>
-      <div class="hot-info">
-        <h3 title="${escapeHtml(item.title)}">${escapeHtml(item.title)}</h3>
-        <div class="hot-meta">
-          ${playLabel ? `<span class="hot-play">${escapeHtml(playLabel)}</span>` : ""}
-          ${meta.map((m) => `<span>${m}</span>`).join("")}
-        </div>
-      </div>
-      <div class="hot-actions">
-        ${
-          href
-            ? `<a class="btn-watch" href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer">观看</a>`
-            : ""
-        }
-        <button type="button" class="btn-voice-hint" data-title="${escapeHtml(item.title || "")}" title="播放搜索提示">🔊</button>
-        <a class="btn-gen" href="${escapeHtml(buildGenerateUrl(item))}">生成视频</a>
-      </div>
-    </li>
-  `;
-}
-
-async function loadTodayHot() {
-  if (!hotListEl || !hotStatusEl) return;
-
-  hotStatusEl.textContent = "正在加载热门榜单…";
-  hotStatusEl.classList.remove("error", "hidden");
-  hotListEl.classList.add("hidden");
-
-  try {
-    const res = await fetch("/api/hot/today");
-    const data = await res.json();
-    if (!res.ok) {
-      throw new Error(data.detail || "加载失败");
-    }
-    if (!data.items?.length) {
-      hotStatusEl.textContent = "暂无热门数据，请稍后刷新";
-      return;
-    }
-
-    hotStatusEl.classList.add("hidden");
-    hotListEl.classList.remove("hidden");
-    hotListEl.innerHTML = data.items
-      .map((item, i) => renderHotItem(item, i + 1))
-      .join("");
-    bindVoiceHintButtons(hotListEl);
-
-    if (hotDateEl && data.date) {
-      const label = data.kind_label || "短剧+漫剧";
-      hotDateEl.textContent = `${label} · 更新 ${data.date}`;
-    }
-  } catch (err) {
-    hotStatusEl.textContent = err.message || "热门榜单加载失败";
-    hotStatusEl.classList.add("error");
-  }
 }
 
 function renderCard(item, query, index) {
@@ -337,5 +250,3 @@ input.addEventListener("input", () => {
     debounceTimer = setTimeout(() => doSearch(val), 500);
   }
 });
-
-loadTodayHot();
