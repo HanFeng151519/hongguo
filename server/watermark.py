@@ -13,7 +13,12 @@ from PIL import Image, ImageDraw, ImageFont
 logger = logging.getLogger(__name__)
 
 DEFAULT_WATERMARK_TEXT = "丰丰漫剧推荐"
-_FFMPEG = os.getenv("FFMPEG", "ffmpeg")
+
+
+def _ffmpeg_exe() -> str:
+    from ffmpeg_util import resolve_ffmpeg_exe
+
+    return resolve_ffmpeg_exe()
 
 
 def watermark_enabled() -> bool:
@@ -29,11 +34,9 @@ def watermark_text() -> str:
 
 
 def _find_cjk_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
-    for path in (
-        "/System/Library/Fonts/PingFang.ttc",
-        "/System/Library/Fonts/Hiragino Sans GB.ttc",
-        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
-    ):
+    from ffmpeg_util import cjk_font_paths
+
+    for path in cjk_font_paths():
         if Path(path).is_file():
             try:
                 return ImageFont.truetype(path, size=size)
@@ -81,7 +84,7 @@ def render_watermark_png(
 def _burn_via_ffmpeg_overlay(src: Path, dest: Path, overlay_png: Path) -> bool:
     proc = subprocess.run(
         [
-            _FFMPEG,
+            _ffmpeg_exe(),
             "-y",
             "-hide_banner",
             "-loglevel",

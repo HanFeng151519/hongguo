@@ -414,10 +414,11 @@ def apply_tail_fade_inplace(
     ]
     has_audio = True
     try:
-        import shutil
         import subprocess
 
-        ffprobe = shutil.which("ffprobe")
+        from ffmpeg_util import resolve_ffprobe_exe
+
+        ffprobe = resolve_ffprobe_exe()
         if ffprobe:
             proc = subprocess.run(
                 [

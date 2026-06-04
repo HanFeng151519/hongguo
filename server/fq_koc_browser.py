@@ -8,9 +8,53 @@ import logging
 import os
 import re
 import socket
+import sys
+import threading
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Coroutine, Optional, TypeVar
 from urllib.parse import parse_qs, urlencode, urlparse
+
+T = TypeVar("T")
+
+# macOS/Linux：Playwright 跑在主 asyncio 循环；Windows：独立 Proactor 线程（见 _run_playwright_coro）
+_WINDOWS = sys.platform == "win32"
+_PW_LOOP: Optional[asyncio.AbstractEventLoop] = None
+_PW_LOOP_READY = threading.Event()
+
+
+def _pw_background_loop_thread() -> None:
+    global _PW_LOOP
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    _PW_LOOP = loop
+    _PW_LOOP_READY.set()
+    loop.run_forever()
+
+
+def _playwright_event_loop() -> asyncio.AbstractEventLoop:
+    global _PW_LOOP
+    if _PW_LOOP is not None and _PW_LOOP.is_running():
+        return _PW_LOOP
+    threading.Thread(
+        target=_pw_background_loop_thread,
+        name="hongguo-playwright",
+        daemon=True,
+    ).start()
+    if not _PW_LOOP_READY.wait(timeout=60):
+        raise RuntimeError("Playwright 后台线程启动超时")
+    if _PW_LOOP is None:
+        raise RuntimeError("Playwright 后台线程未就绪")
+    return _PW_LOOP
+
+
+async def _run_playwright_coro(coro: Coroutine[Any, Any, T]) -> T:
+    """Windows + uvicorn：在独立 Proactor 线程跑 Playwright，避免 NotImplementedError。"""
+    if not _WINDOWS:
+        return await coro
+    loop = _playwright_event_loop()
+    fut = asyncio.run_coroutine_threadsafe(coro, loop)
+    return await asyncio.wrap_future(fut)
 
 import httpx
 
@@ -250,7 +294,20 @@ async def _wait_for_login(page: Any, *, timeout_sec: int = 600) -> None:
     )
 
 
-async def ensure_koc_login(
+def _playwright_startup_error(exc: BaseException) -> RuntimeError:
+    if isinstance(exc, NotImplementedError) or "NotImplementedError" in type(exc).__name__:
+        return RuntimeError(
+            "无法启动 Playwright（Windows 子进程受限）。请重启服务后再试；"
+            "或生成页「导入 F12 抓包」更新 Cookie/msToken，无需浏览器。"
+        )
+    return RuntimeError(
+        f"无法启动 Chrome 登录达人中心：{exc}\n"
+        "请确认已安装 Google Chrome，且已执行："
+        " py -3.12 -m pip install -r server/requirements-browser.txt"
+    )
+
+
+async def _ensure_koc_login_impl(
     book_id: str,
     *,
     timeout_sec: Optional[int] = None,
@@ -259,7 +316,10 @@ async def ensure_koc_login(
     global _pw_page, _koc_login_verified
     wait_sec = timeout_sec if timeout_sec is not None else _login_wait_sec()
     logger.info("正在打开 Chrome 登录达人中心（请在本机查看弹出的浏览器窗口）…")
-    context = await _acquire_login_context()
+    try:
+        context = await _acquire_login_context()
+    except Exception as exc:
+        raise _playwright_startup_error(exc) from exc
     page: Any = None
     keep_page_open = False
     try:
@@ -333,6 +393,21 @@ async def ensure_koc_login(
             except Exception:
                 pass
         await _release_context_after_run(context)
+
+
+async def ensure_koc_login(
+    book_id: str,
+    *,
+    timeout_sec: Optional[int] = None,
+) -> dict[str, Any]:
+    try:
+        return await _run_playwright_coro(
+            _ensure_koc_login_impl(book_id, timeout_sec=timeout_sec)
+        )
+    except Exception as exc:
+        if isinstance(exc, RuntimeError):
+            raise
+        raise _playwright_startup_error(exc) from exc
 
 
 async def _is_context_alive(ctx: Any) -> bool:
@@ -479,10 +554,14 @@ async def _maybe_inject_env_cookies(context: Any) -> None:
         logger.debug("inject env cookie: %s", exc)
 
 
-async def close_koc_browser() -> None:
+async def _close_koc_browser_impl() -> None:
     """关闭常驻浏览器（服务退出时可调用）。"""
     async with _BROWSER_LOCK:
         await _close_persistent_browser()
+
+
+async def close_koc_browser() -> None:
+    await _run_playwright_coro(_close_koc_browser_impl())
 
 
 async def _acquire_login_context() -> Any:
@@ -1297,7 +1376,7 @@ async def _run_in_browser(
         await _release_context_after_run(context)
 
 
-async def auto_download_episode_to_cache(
+async def _auto_download_episode_to_cache_impl(
     client: httpx.AsyncClient,
     *,
     book_id: str,
@@ -1331,7 +1410,28 @@ async def auto_download_episode_to_cache(
     return cache_path
 
 
-async def sync_koc_auth_via_browser(
+async def auto_download_episode_to_cache(
+    client: httpx.AsyncClient,
+    *,
+    book_id: str,
+    item_id: str,
+    cache_path: Path,
+    drama_title: str = "",
+    open_browser: Optional[bool] = None,
+) -> Path:
+    return await _run_playwright_coro(
+        _auto_download_episode_to_cache_impl(
+            client,
+            book_id=book_id,
+            item_id=item_id,
+            cache_path=cache_path,
+            drama_title=drama_title,
+            open_browser=open_browser,
+        )
+    )
+
+
+async def _sync_koc_auth_via_browser_impl(
     book_id: str,
     item_id: str,
     drama_title: str = "",
@@ -1354,6 +1454,25 @@ async def sync_koc_auth_via_browser(
         "has_a_bogus": bool(info.get("create_url")),
         "has_cookie": bool(info.get("cookie_header")),
     }
+
+
+async def sync_koc_auth_via_browser(
+    book_id: str,
+    item_id: str,
+    drama_title: str = "",
+    *,
+    open_browser: Optional[bool] = None,
+    timeout_sec: int = 120,
+) -> dict[str, Any]:
+    return await _run_playwright_coro(
+        _sync_koc_auth_via_browser_impl(
+            book_id,
+            item_id,
+            drama_title=drama_title,
+            open_browser=open_browser,
+            timeout_sec=timeout_sec,
+        )
+    )
 
 
 async def ensure_koc_auth(

@@ -20,7 +20,10 @@ from Crypto.Util.Padding import unpad
 
 logger = logging.getLogger(__name__)
 
-MP4DECRYPT = shutil.which("mp4decrypt") or "/opt/homebrew/bin/mp4decrypt"
+def _mp4decrypt_exe() -> Optional[str]:
+    from ffmpeg_util import resolve_mp4decrypt_exe
+
+    return resolve_mp4decrypt_exe()
 PLAY_LICENSE_URL = os.getenv(
     "HONGGUO_PLAY_LICENSE_URL",
     "https://vas-lf-x.snssdk.com/video/playapi/1/play_licenses",
@@ -100,19 +103,9 @@ def _derive_candidate_keys(
 
 
 def _ffmpeg_path() -> str:
-    try:
-        import imageio_ffmpeg
+    from ffmpeg_util import resolve_ffmpeg_exe
 
-        return imageio_ffmpeg.get_ffmpeg_exe()
-    except Exception:
-        pass
-    found = shutil.which("ffmpeg")
-    if found:
-        return found
-    for candidate in ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"):
-        if Path(candidate).is_file():
-            return candidate
-    raise RuntimeError("未找到 ffmpeg")
+    return resolve_ffmpeg_exe()
 
 
 def video_decodes(path: Path, *, min_frames: int = 8) -> bool:
@@ -127,12 +120,13 @@ def video_decodes(path: Path, *, min_frames: int = 8) -> bool:
 
 
 def _decrypt_with_mp4decrypt(src: Path, dest: Path, key_hex: str, kid_hex: str) -> bool:
-    if not Path(MP4DECRYPT).is_file():
+    mp4decrypt = _mp4decrypt_exe()
+    if not mp4decrypt or not Path(mp4decrypt).is_file():
         return False
     dest.unlink(missing_ok=True)
     for spec in (f"1:{key_hex}", f"{kid_hex}:{key_hex}", key_hex):
         proc = subprocess.run(
-            [MP4DECRYPT, "--key", spec, str(src), str(dest)],
+            [mp4decrypt, "--key", spec, str(src), str(dest)],
             capture_output=True,
             text=True,
             timeout=300,

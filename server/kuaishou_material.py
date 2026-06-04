@@ -330,13 +330,9 @@ async def download_material(
 
 
 def _ffmpeg_path() -> str:
-    found = shutil.which("ffmpeg")
-    if found:
-        return found
-    for c in ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"):
-        if Path(c).is_file():
-            return c
-    raise RuntimeError("未找到 ffmpeg")
+    from ffmpeg_util import resolve_ffmpeg_exe
+
+    return resolve_ffmpeg_exe()
 
 
 def probe_decodes(path: Path) -> bool:

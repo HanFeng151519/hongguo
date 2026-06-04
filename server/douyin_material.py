@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextvars
 import json
 import logging
 import os
@@ -14,6 +16,7 @@ import httpx
 
 from material_common import (
     download_http_video,
+    douyin_download_auth_configured,
     is_http_url,
     probe_decodes,
     score_caption,
@@ -31,9 +34,37 @@ DEFAULT_UA = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 
+_douyin_cookie_override: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "douyin_cookie_override", default=""
+)
+
+
+class douyin_cookie_scope:
+    """单次请求覆盖抖音 Cookie（主页粘贴 / API 传入）。"""
+
+    def __init__(self, cookie: str) -> None:
+        self._cookie = (cookie or "").strip()
+        self._token: contextvars.Token[str] | None = None
+
+    def __enter__(self) -> "douyin_cookie_scope":
+        if self._cookie:
+            self._token = _douyin_cookie_override.set(self._cookie)
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        if self._token is not None:
+            _douyin_cookie_override.reset(self._token)
+
+
+def effective_douyin_cookie() -> str:
+    override = _douyin_cookie_override.get().strip()
+    if override:
+        return override
+    return os.getenv("HONGGUO_DOUYIN_COOKIE", "").strip()
+
 
 def _cookie() -> str:
-    return os.getenv("HONGGUO_DOUYIN_COOKIE", "").strip()
+    return effective_douyin_cookie()
 
 
 def _headers(referer: str = "https://www.douyin.com/") -> dict[str, str]:
@@ -50,7 +81,8 @@ def _headers(referer: str = "https://www.douyin.com/") -> dict[str, str]:
 
 def _play_url_from_aweme(aweme: dict[str, Any]) -> str:
     video = aweme.get("video") or {}
-    for key in ("play_addr", "download_addr"):
+    # download_addr 多为无水印；play_addr / playwm 常带角标
+    for key in ("download_addr", "play_addr"):
         addr = video.get(key) or {}
         for u in addr.get("url_list") or []:
             if is_http_url(u):
@@ -270,15 +302,38 @@ async def fetch_douyin_body_source(
     safe = re.sub(r"[^\w\u4e00-\u9fff-]+", "_", drama_title)[:40] or "douyin"
 
     if share_url.strip():
-        meta = await resolve_share_url(client, share_url.strip())
-        dest = dest_dir / f"{safe}_{meta.get('aweme_id', 'share')}.mp4"
-        play_url = str(meta.get("play_url") or "")
-        if is_http_url(play_url) and ".mp4" in play_url.split("?")[0]:
-            await download_http_video(
-                client, play_url, dest, referer="https://www.douyin.com/"
-            )
+        dest = dest_dir / f"{safe}_share.mp4"
+        from douyin_crawler import crawl_and_download, crawl_only_default
+
+        if crawl_only_default():
+            crawled = await crawl_and_download(
+                client, share_url.strip(), dest
+            )  # share_url 可为整段分享文案
+            meta = crawled
+            play_url = str(meta.get("play_url") or "")
+            dest = Path(meta["local_path"])
+            if meta.get("aweme_id"):
+                named = dest_dir / f"{safe}_{meta['aweme_id']}.mp4"
+                if dest != named:
+                    dest.rename(named)
+                    dest = named
+                    meta["local_path"] = dest
         else:
-            yt_dlp_download(share_url.strip(), dest, cookie=_cookie())
+            meta = await resolve_share_url(client, share_url.strip())
+            dest = dest_dir / f"{safe}_{meta.get('aweme_id', 'share')}.mp4"
+            play_url = str(meta.get("play_url") or "")
+            if is_http_url(play_url):
+                await download_http_video(
+                    client, play_url, dest, referer="https://www.douyin.com/"
+                )
+            else:
+                if not _cookie():
+                    raise RuntimeError(
+                        "未能获取直链，需要抖音 Cookie 或开启自建爬虫（默认已开启）。"
+                    )
+                await asyncio.to_thread(
+                    yt_dlp_download, share_url.strip(), dest, cookie=_cookie()
+                )
     else:
         meta = await find_best_material(
             client, keyword=keyword or drama_title, drama_title=drama_title

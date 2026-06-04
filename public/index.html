@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/style.css?v=7" />
+  <link rel="stylesheet" href="/style.css?v=8" />
 </head>
 <body>
   <div class="page">
@@ -37,6 +37,108 @@
       </form>
     </section>
 
+    <section class="wm-section" aria-labelledby="dy-section-title">
+      <div class="wm-head">
+        <h2 id="dy-section-title" class="wm-title">抖音分享爬取</h2>
+        <p class="wm-desc">粘贴分享文案即可。默认<strong>优先无水印</strong>（<code>play</code> 直链，非 <code>playwm</code>），不展示抖音简介文案。成片尾仍有平台贴片时可再用下方「去掉视频水印」。</p>
+      </div>
+      <form id="dy-form" class="wm-panel">
+        <label class="wm-field wm-field-full">
+          <span>分享文案 / 链接</span>
+          <textarea
+            id="dy-share"
+            class="wm-share-input dy-cookie-input"
+            rows="3"
+            placeholder="粘贴整段分享文案（含 https://v.douyin.com/… 或其它可访问的视频链接）"
+            spellcheck="false"
+          ></textarea>
+        </label>
+        <details class="dy-cookie-optional">
+          <summary>Cookie（可选，仅短链无法直访时）</summary>
+          <textarea
+            id="dy-cookie"
+            class="wm-share-input dy-cookie-input"
+            rows="2"
+            placeholder="一般留空即可"
+            spellcheck="false"
+          ></textarea>
+        </details>
+        <div class="wm-actions">
+          <button type="submit" id="dy-submit" class="btn-primary">爬取并缓存</button>
+        </div>
+        <p id="dy-status" class="wm-status hidden" role="status"></p>
+        <div id="dy-result" class="wm-result hidden">
+          <p id="dy-meta" class="dy-meta"></p>
+          <video id="dy-preview" class="wm-preview" controls playsinline></video>
+          <div class="wm-result-actions">
+            <a id="dy-download" class="btn-primary" href="#" target="_blank" rel="noopener">下载视频</a>
+          </div>
+        </div>
+      </form>
+    </section>
+
+    <section class="wm-section" aria-labelledby="wm-section-title">
+      <div class="wm-head">
+        <h2 id="wm-section-title" class="wm-title">去掉视频水印</h2>
+        <p class="wm-desc">标配 <strong>OCR 自动框</strong> + <strong>逐帧 inpaint</strong>（直接改像素，不贴模糊块）。遮罩外缘宽羽化，避免画中画感。仍有字痕选「强力」。首次需 <code>pip install rapidocr-onnxruntime opencv-python-headless</code>。</p>
+      </div>
+      <form id="wm-form" class="wm-panel">
+        <label class="wm-upload">
+          <input id="wm-file" type="file" accept="video/mp4,video/quicktime,video/webm,video/x-matroska,.mp4,.mov,.mkv,.webm" />
+          <span id="wm-file-label" class="wm-file-label">点击选择视频，或拖拽到此处</span>
+        </label>
+        <div class="wm-row">
+          <label class="wm-field">
+            <span>水印位置</span>
+            <select id="wm-position" name="position">
+              <option value="doubao" selected>豆包 AI（右下 + 左上，推荐）</option>
+              <option value="bottom-right">仅右下角</option>
+              <option value="top-left">仅左上角</option>
+              <option value="bottom-left">仅左下角</option>
+              <option value="top-right">仅右上角</option>
+              <option value="all-corners">四角都去</option>
+              <option value="bottom-bar">底部横条</option>
+            </select>
+          </label>
+          <label class="wm-field">
+            <span>处理方式</span>
+            <select id="wm-method" name="wm_method">
+              <option value="" selected>智能修复（推荐）</option>
+              <option value="blur_cover">快速模糊（快，易有块感）</option>
+            </select>
+          </label>
+          <label class="wm-field">
+            <span>处理强度</span>
+            <select id="wm-strength" name="strength">
+              <option value="tight">精细（区域最小）</option>
+              <option value="normal" selected>标准（推荐，平衡残影）</option>
+              <option value="strong">强力（去得更干净，块略大）</option>
+            </select>
+          </label>
+          <button type="button" id="wm-toggle-custom" class="btn-ghost wm-custom-toggle">自定义区域</button>
+        </div>
+        <div id="wm-custom" class="wm-custom hidden">
+          <p class="wm-custom-hint">像素坐标（可先选预设，再按预览微调）</p>
+          <div class="wm-custom-grid">
+            <label>X <input id="wm-x" type="number" min="0" step="2" placeholder="0" /></label>
+            <label>Y <input id="wm-y" type="number" min="0" step="2" placeholder="0" /></label>
+            <label>宽 W <input id="wm-w" type="number" min="4" step="2" placeholder="200" /></label>
+            <label>高 H <input id="wm-h" type="number" min="4" step="2" placeholder="80" /></label>
+          </div>
+        </div>
+        <div class="wm-actions">
+          <button type="submit" id="wm-submit" class="btn-primary" disabled>去掉水印</button>
+        </div>
+        <p id="wm-status" class="wm-status hidden" role="status"></p>
+        <div id="wm-result" class="wm-result hidden">
+          <video id="wm-preview" class="wm-preview" controls playsinline></video>
+          <div class="wm-result-actions">
+            <a id="wm-download" class="btn-primary" href="#" download>下载处理后视频</a>
+          </div>
+        </div>
+      </form>
+    </section>
+
     <main>
       <div id="status" class="status hidden"></div>
       <div id="results" class="results"></div>
@@ -46,6 +148,6 @@
       <span>数据来源：红果短剧公开搜索接口</span>
     </footer>
   </div>
-  <script src="/app.js?v=8"></script>
+  <script src="/app.js?v=17"></script>
 </body>
 </html>

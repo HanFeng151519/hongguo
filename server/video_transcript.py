@@ -43,12 +43,9 @@ def asr_model_name() -> str:
 
 
 def _ffmpeg() -> str:
-    try:
-        import imageio_ffmpeg
+    from ffmpeg_util import resolve_ffmpeg_exe
 
-        return imageio_ffmpeg.get_ffmpeg_exe()
-    except Exception:
-        return shutil.which("ffmpeg") or "ffmpeg"
+    return resolve_ffmpeg_exe()
 
 
 def _srt_ts(h: str, m: str, s: str, ms: str) -> float:

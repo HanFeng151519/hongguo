@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
@@ -16,13 +17,9 @@ from kuaishou_material import probe_decodes
 
 
 def _ffmpeg_bin() -> str:
-    found = shutil.which("ffmpeg")
-    if found:
-        return found
-    for c in ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"):
-        if Path(c).is_file():
-            return c
-    return "ffmpeg"
+    from ffmpeg_util import resolve_ffmpeg_exe
+
+    return resolve_ffmpeg_exe()
 
 
 def is_usable_video_file(path: Path, *, min_bytes: int = 100_000) -> bool:
@@ -129,57 +126,218 @@ def is_douyin_url(url: str) -> bool:
     )
 
 
+_DOUYIN_SHARE_URL_RE = re.compile(
+    r"https?://(?:v\.douyin\.com|(?:www\.)?douyin\.com|(?:www\.)?iesdouyin\.com)[^\s\]\)\"'<>，。；;]+",
+    re.IGNORECASE,
+)
+
+
+def extract_douyin_share_url(text: str) -> str:
+    """从分享文案中提取抖音链接（支持整段粘贴）。"""
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+    m = _DOUYIN_SHARE_URL_RE.search(raw)
+    if m:
+        return m.group(0).rstrip("，。,.;；'\"")
+    if is_douyin_url(raw):
+        first = raw.split()[0] if raw.startswith("http") else raw
+        return first.rstrip("，。,.;；'\"")
+    return ""
+
+
 def is_kuaishou_url(url: str) -> bool:
     u = url.lower()
     return any(x in u for x in ("kuaishou.com", "kuaishou.cn", "chenzhongtech.com"))
 
 
-def yt_dlp_download(url: str, dest: Path, *, cookie: str = "") -> Path:
-    """用 yt-dlp 下载抖音/快手分享页（需 Cookie 时传入）。"""
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    ytdlp = shutil.which("yt-dlp")
+def _yt_dlp_executable() -> list[str]:
+    """本机 yt-dlp 启动命令（Windows 用当前 Python，不用 python3）。"""
+    ytdlp = shutil.which("yt-dlp") or shutil.which("yt-dlp.exe")
     if ytdlp:
-        args = [
-            ytdlp,
-            "-o",
-            str(dest),
-            "--no-playlist",
-            "--merge-output-format",
-            "mp4",
-        ]
-    else:
-        args = [
-            "python3",
-            "-m",
-            "yt_dlp",
-            "-o",
-            str(dest),
-            "--no-playlist",
-            "--merge-output-format",
-            "mp4",
-        ]
-    if cookie.strip():
-        cookie_file = dest.parent / "_cookies.txt"
-        cookie_file.write_text(cookie.strip(), encoding="utf-8")
-        args.extend(["--cookies", str(cookie_file)])
-    args.append(url)
-    proc = subprocess.run(args, capture_output=True, text=True, timeout=600)
-    if proc.returncode != 0:
-        tail = (proc.stderr or proc.stdout or "")[-500:]
-        raise RuntimeError(f"yt-dlp 下载失败: {tail}")
-    if dest.is_file():
+        return [ytdlp]
+    try:
+        import yt_dlp  # noqa: F401
+
+        return [sys.executable, "-m", "yt_dlp"]
+    except ImportError:
+        return []
+
+
+def douyin_download_auth_configured() -> bool:
+    if os.getenv("HONGGUO_DOUYIN_COOKIE", "").strip():
+        return True
+    if os.getenv("HONGGUO_DOUYIN_COOKIE_FILE", "").strip():
+        p = Path(os.getenv("HONGGUO_DOUYIN_COOKIE_FILE", "").strip())
+        if p.is_file():
+            return True
+    if os.getenv("HONGGUO_YTDLP_COOKIES_FROM_BROWSER", "").strip():
+        return True
+    return False
+
+
+def _header_cookie_args(cookie: str, work_dir: Path) -> list[str]:
+    c = cookie.strip()
+    if not c:
+        return []
+    if c.lstrip().startswith("# Netscape") or (
+        "\t" in c[:800] and ".douyin" in c.lower()
+    ):
+        cf = work_dir / "_douyin_cookies.txt"
+        cf.write_text(c, encoding="utf-8")
+        return ["--cookies", str(cf), "--add-header", "Referer:https://www.douyin.com/"]
+    hdr = c if c.lower().startswith("cookie:") else f"Cookie:{c}"
+    return ["--add-header", hdr, "--add-header", "Referer:https://www.douyin.com/"]
+
+
+def _yt_dlp_auth_modes(work_dir: Path) -> list[tuple[str, list[str]]]:
+    """
+    鉴权尝试顺序（名称, yt-dlp 参数）。
+    Windows 下 Chrome 开着时无法复制 Cookie DB，故优先用 .env 字符串，浏览器放后并含 Edge 回退。
+    """
+    modes: list[tuple[str, list[str]]] = []
+    seen: set[str] = set()
+
+    def add(name: str, args: list[str]) -> None:
+        key = " ".join(args)
+        if key and key not in seen:
+            seen.add(key)
+            modes.append((name, args))
+
+    env_cookie = os.getenv("HONGGUO_DOUYIN_COOKIE", "").strip()
+    if env_cookie:
+        add("HONGGUO_DOUYIN_COOKIE", _header_cookie_args(env_cookie, work_dir))
+
+    cookie_file = os.getenv("HONGGUO_DOUYIN_COOKIE_FILE", "").strip()
+    if cookie_file:
+        p = Path(cookie_file)
+        if p.is_file():
+            add("cookie_file", ["--cookies", str(p), "--add-header", "Referer:https://www.douyin.com/"])
+
+    use_browser = os.getenv("HONGGUO_YTDLP_USE_BROWSER", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    browser = os.getenv("HONGGUO_YTDLP_COOKIES_FROM_BROWSER", "").strip()
+    if browser and (use_browser or not env_cookie):
+        add(f"browser:{browser}", ["--cookies-from-browser", *browser.split(":")])
+
+    if use_browser and browser:
+        fallback = os.getenv(
+            "HONGGUO_YTDLP_COOKIES_FALLBACK",
+            "edge" if sys.platform == "win32" and browser.lower().startswith("chrome") else "",
+        ).strip()
+        if fallback:
+            fb_key = fallback.split(":")[0].lower()
+            br_key = browser.split(":")[0].lower()
+            if fb_key != br_key:
+                add(
+                    f"browser:{fallback}",
+                    ["--cookies-from-browser", *fallback.split(":")],
+                )
+
+    if not modes:
+        modes.append(("none", []))
+    return modes
+
+
+def _friendly_yt_dlp_error(stderr: str, stdout: str) -> str:
+    blob = f"{stderr}\n{stdout}".lower()
+    if "no module named yt_dlp" in blob or "not found" in blob and "yt-dlp" in blob:
+        return (
+            "未安装 yt-dlp。请在 server 目录执行："
+            "py -3.12 -m pip install yt-dlp"
+        )
+    if "could not copy" in blob and "cookie" in blob:
+        return (
+            "无法从浏览器读取 Cookie（Windows 上 Chrome/Edge 开着时会被锁定）。\n"
+            "请在本页「抖音 Cookie」框粘贴（推荐），或在 .env 设置 HONGGUO_DOUYIN_COOKIE=…，\n"
+            "并注释掉 HONGGUO_YTDLP_COOKIES_FROM_BROWSER。"
+        )
+    if "fresh cookies" in blob or "cookies are needed" in blob:
+        return (
+            "抖音要求登录 Cookie。任选其一：\n"
+            "1) .env 设置 HONGGUO_DOUYIN_COOKIE=浏览器 F12 复制的 Cookie 字符串（Windows 推荐）；\n"
+            "2) .env 设置 HONGGUO_YTDLP_COOKIES_FROM_BROWSER=edge 或 chrome（chrome 需关闭浏览器）；\n"
+            "3) 用扩展导出 Netscape cookies.txt，设置 HONGGUO_DOUYIN_COOKIE_FILE=文件路径"
+        )
+    tail = (stderr or stdout or "").strip()[-600:]
+    return f"yt-dlp 下载失败：{tail or '未知错误'}"
+
+
+def _yt_dlp_run(cmd: list[str], url: str, auth: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [*cmd, *auth, url],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=600,
+    )
+
+
+def _yt_dlp_collect_output(dest: Path) -> Path:
+    if dest.is_file() and dest.stat().st_size > 50_000:
         return dest
-    candidates = sorted(dest.parent.glob(f"{dest.stem}*"))
-    for c in candidates:
-        if c.suffix in (".mp4", ".mkv", ".webm") and c.stat().st_size > 50_000:
+    for c in sorted(
+        dest.parent.glob(f"{dest.stem}*"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    ):
+        if c.suffix.lower() in (".mp4", ".mkv", ".webm", ".mov") and c.stat().st_size > 50_000:
             if c != dest:
+                dest.unlink(missing_ok=True)
                 c.rename(dest)
             return dest
-    raise RuntimeError("yt-dlp 未生成视频文件")
+    raise RuntimeError("yt-dlp 未生成视频文件，请检查 Cookie 或更换链接")
+
+
+def yt_dlp_download(url: str, dest: Path, *, cookie: str = "") -> Path:
+    """用 yt-dlp 下载抖音/快手分享页（多种 Cookie 方式依次尝试）。"""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    cmd = _yt_dlp_executable()
+    if not cmd:
+        raise RuntimeError(
+            "未安装 yt-dlp。请在 server 目录执行：py -3.12 -m pip install yt-dlp"
+        )
+
+    out_tpl = str(dest.with_suffix("")) + ".%(ext)s"
+    base = [
+        *cmd,
+        "--no-playlist",
+        "--no-warnings",
+        "--merge-output-format",
+        "mp4",
+        "-f",
+        "bv*+ba/b",
+        "-o",
+        out_tpl,
+    ]
+
+    modes = _yt_dlp_auth_modes(dest.parent)
+    if cookie.strip() and not any(n == "HONGGUO_DOUYIN_COOKIE" for n, _ in modes):
+        modes.insert(0, ("param_cookie", _header_cookie_args(cookie, dest.parent)))
+
+    last_stderr = ""
+    last_stdout = ""
+    for _name, auth in modes:
+        proc = _yt_dlp_run(base, url, auth)
+        if proc.returncode == 0:
+            return _yt_dlp_collect_output(dest)
+        last_stderr = proc.stderr or ""
+        last_stdout = proc.stdout or ""
+        blob = f"{last_stderr}\n{last_stdout}".lower()
+        if "could not copy" not in blob or "cookie" not in blob:
+            break
+
+    raise RuntimeError(_friendly_yt_dlp_error(last_stderr, last_stdout))
 
 
 __all__ = [
     "download_http_video",
+    "douyin_download_auth_configured",
+    "extract_douyin_share_url",
     "is_douyin_url",
     "is_http_url",
     "is_kuaishou_url",

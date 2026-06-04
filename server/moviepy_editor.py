@@ -44,7 +44,7 @@ def output_size() -> tuple[int, int]:
         int(os.getenv("HONGGUO_OUTPUT_WIDTH", str(WORK_WIDTH))),
         int(os.getenv("HONGGUO_OUTPUT_HEIGHT", str(WORK_HEIGHT))),
     )
-OUTPUT_FPS = int(os.getenv("HONGGUO_OUTPUT_FPS", "30"))
+OUTPUT_FPS = int(os.getenv("HONGGUO_OUTPUT_FPS", "60"))
 OUTPUT_CRF = int(os.getenv("HONGGUO_OUTPUT_CRF", "20"))
 ENCODE_PRESET = os.getenv("HONGGUO_ENCODE_PRESET", "fast")
 BODY_ENCODE_PRESET = os.getenv("HONGGUO_BODY_ENCODE_PRESET", "veryfast")

@@ -13,11 +13,31 @@
 
 ## 快速启动
 
+### macOS / Linux
+
 ```bash
+./start.sh
+# 或：
 cd server
-pip install -r requirements.txt
-uvicorn main:app --reload --host 0.0.0.0 --port 8000
+pip3 install -r requirements.txt
+pip3 install -r requirements-browser.txt   # Playwright 自动登录达人中心（可选）
+python3 -m uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
+
+未安装系统 ffmpeg 时，会自动使用 `imageio-ffmpeg` 自带二进制；也可 `brew install ffmpeg`。
+
+### Windows（PowerShell）
+
+```powershell
+.\start.ps1
+# 或：
+cd server
+py -3.12 -m pip install -r requirements.txt
+py -3.12 -m pip install -r requirements-browser.txt
+py -3.12 -m uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+说明：Windows 上请用 `py -3.12 -m pip` / `py -3.12 -m uvicorn`（不要直接用 `pip`/`uvicorn`，以免找不到命令）。ffmpeg 由 `imageio-ffmpeg` 提供，无需单独加入 PATH。
 
 生成视频依赖 `imageio-ffmpeg`（会自动下载 ffmpeg 二进制），首次生成需联网下载剧集片段，耗时约 1～3 分钟。
 

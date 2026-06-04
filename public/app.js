@@ -250,3 +250,304 @@ input.addEventListener("input", () => {
     debounceTimer = setTimeout(() => doSearch(val), 500);
   }
 });
+
+/* —— 去水印 —— */
+(function initWatermarkTool() {
+  const wmForm = document.getElementById("wm-form");
+  const wmFile = document.getElementById("wm-file");
+  const wmFileLabel = document.getElementById("wm-file-label");
+  const wmPosition = document.getElementById("wm-position");
+  const wmStrength = document.getElementById("wm-strength");
+  const wmMethod = document.getElementById("wm-method");
+  const wmToggleCustom = document.getElementById("wm-toggle-custom");
+  const wmCustom = document.getElementById("wm-custom");
+  const wmSubmit = document.getElementById("wm-submit");
+  const wmStatus = document.getElementById("wm-status");
+  const wmResult = document.getElementById("wm-result");
+  const wmPreview = document.getElementById("wm-preview");
+  const wmDownload = document.getElementById("wm-download");
+  const wmUpload = wmForm?.querySelector(".wm-upload");
+
+  if (!wmForm || !wmFile) return;
+
+  let selectedFile = null;
+
+  function setWmStatus(text, type = "") {
+    wmStatus.textContent = text;
+    wmStatus.className = `wm-status ${type}`.trim();
+    wmStatus.classList.remove("hidden");
+  }
+
+  function hideWmStatus() {
+    wmStatus.classList.add("hidden");
+  }
+
+  function onFileChosen(file) {
+    if (!file) {
+      selectedFile = null;
+      wmFileLabel.textContent = "点击选择视频，或拖拽到此处";
+      wmSubmit.disabled = true;
+      return;
+    }
+    if (!file.type.startsWith("video/") && !/\.(mp4|mov|mkv|webm|avi|m4v)$/i.test(file.name)) {
+      setWmStatus("请选择视频文件（MP4 / MOV 等）", "error");
+      return;
+    }
+    selectedFile = file;
+    const mb = (file.size / 1024 / 1024).toFixed(1);
+    wmFileLabel.textContent = `${file.name}（${mb} MB）`;
+    wmSubmit.disabled = false;
+    hideWmStatus();
+    wmResult.classList.add("hidden");
+  }
+
+  wmFile.addEventListener("change", () => {
+    onFileChosen(wmFile.files?.[0] || null);
+  });
+
+  if (wmUpload) {
+    wmUpload.addEventListener("dragover", (e) => {
+      e.preventDefault();
+      wmUpload.classList.add("wm-dragover");
+    });
+    wmUpload.addEventListener("dragleave", () => {
+      wmUpload.classList.remove("wm-dragover");
+    });
+    wmUpload.addEventListener("drop", (e) => {
+      e.preventDefault();
+      wmUpload.classList.remove("wm-dragover");
+      const file = e.dataTransfer?.files?.[0];
+      if (file) onFileChosen(file);
+    });
+  }
+
+  wmToggleCustom?.addEventListener("click", () => {
+    wmCustom.classList.toggle("hidden");
+    const visible = !wmCustom.classList.contains("hidden");
+    wmToggleCustom.textContent = visible ? "收起自定义" : "自定义区域";
+  });
+
+  wmForm.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    if (!selectedFile) {
+      setWmStatus("请先选择视频", "error");
+      return;
+    }
+
+    const fd = new FormData();
+    fd.append("file", selectedFile);
+    fd.append("position", wmPosition.value);
+    fd.append("strength", wmStrength?.value || "normal");
+    if (wmMethod?.value) {
+      fd.append("wm_method", wmMethod.value);
+    }
+
+    const useCustom = wmCustom && !wmCustom.classList.contains("hidden");
+    if (useCustom) {
+      const x = document.getElementById("wm-x")?.value;
+      const y = document.getElementById("wm-y")?.value;
+      const w = document.getElementBy("wm-w")?.value;
+      const h = document.getElementById("wm-h")?.value;
+      if (x !== "" && y !== "" && w !== "" && h !== "") {
+        fd.append("x", x);
+        fd.append("y", y);
+        fd.append("w", w);
+        fd.append("h", h);
+      }
+    }
+
+    wmSubmit.disabled = true;
+    wmResult.classList.add("hidden");
+
+    const started = Date.now();
+    let pollTimer = null;
+
+    function formatElapsed(sec) {
+      const m = Math.floor(sec / 60);
+      const s = sec % 60;
+      return m > 0 ? `${m} 分 ${s} 秒` : `${s} 秒`;
+    }
+
+    async function pollWmJob(jobId) {
+      while (true) {
+        const elapsed = Math.floor((Date.now() - started) / 1000);
+        let res;
+        try {
+          res = await fetch(`/api/tools/remove-watermark/job/${encodeURIComponent(jobId)}`);
+        } catch {
+          throw new Error("与服务器连接中断，请查看终端是否在运行并重试");
+        }
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data.detail || "查询进度失败");
+        }
+        const base = data.progress || "处理中…";
+        setWmStatus(`${base}（已等待 ${formatElapsed(elapsed)}）`);
+
+        if (data.status === "completed") {
+          const previewUrl = data.preview_url || data.download_url;
+          wmPreview.src = previewUrl;
+          wmDownload.href = data.download_url || previewUrl;
+          wmDownload.download = `去水印_${selectedFile.name.replace(/\.[^.]+$/, "")}.mp4`;
+
+          const regions = data.regions || [];
+          const mb = ((data.size || 0) / 1024 / 1024).toFixed(1);
+          const regionHint =
+            regions.length > 1
+              ? `已去除 ${regions.length} 个区域`
+              : regions[0]
+                ? `区域 ${regions[0].w}×${regions[0].h}`
+                : "";
+          setWmStatus(
+            `完成（约 ${mb} MB，用时 ${formatElapsed(elapsed)}）${regionHint ? "。" + regionHint : ""}`,
+            "ok"
+          );
+          wmResult.classList.remove("hidden");
+          return;
+        }
+        if (data.status === "failed") {
+          throw new Error(data.error || "去水印失败");
+        }
+        if (elapsed > 1200) {
+          throw new Error("处理超过 20 分钟，请换更短视频或先试「仅右下角」单区域");
+        }
+        await new Promise((r) => {
+          pollTimer = setTimeout(r, 1500);
+        });
+      }
+    }
+
+    try {
+      setWmStatus("正在上传视频…");
+      const res = await fetch("/api/tools/remove-watermark", {
+        method: "POST",
+        body: fd,
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        const d = data.detail;
+        throw new Error(
+          typeof d === "string" ? d : Array.isArray(d) ? d.map((x) => x.msg || x).join("；") : "处理失败"
+        );
+      }
+      if (!data.job_id) {
+        throw new Error("服务器未返回任务 ID");
+      }
+      await pollWmJob(data.job_id);
+    } catch (err) {
+      setWmStatus(err.message || "去水印失败", "error");
+    } finally {
+      if (pollTimer) clearTimeout(pollTimer);
+      wmSubmit.disabled = !selectedFile;
+    }
+  });
+})();
+
+/* —— 抖音分享缓存 —— */
+(function initDouyinCacheTool() {
+  const dyForm = document.getElementById("dy-form");
+  const dyShare = document.getElementById("dy-share");
+  const dyCookie = document.getElementById("dy-cookie");
+  const dySubmit = document.getElementById("dy-submit");
+  const DY_COOKIE_KEY = "hongguo_dy_cookie";
+
+  if (dyCookie) {
+    try {
+      const saved = localStorage.getItem(DY_COOKIE_KEY);
+      if (saved) dyCookie.value = saved;
+    } catch {
+      /* ignore */
+    }
+  }
+  const dyStatus = document.getElementById("dy-status");
+  const dyResult = document.getElementById("dy-result");
+  const dyPreview = document.getElementById("dy-preview");
+  const dyDownload = document.getElementById("dy-download");
+  const dyMeta = document.getElementById("dy-meta");
+
+  if (!dyForm || !dyShare) return;
+
+  function setDyStatus(text, type = "") {
+    dyStatus.textContent = text;
+    dyStatus.className = `wm-status ${type}`.trim();
+    dyStatus.classList.remove("hidden");
+  }
+
+  dyForm.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const raw = dyShare.value.trim();
+    const cookie = dyCookie?.value.trim() || "";
+    if (!raw) {
+      setDyStatus("请粘贴抖音分享链接或分享文案", "error");
+      return;
+    }
+    dySubmit.disabled = true;
+    dyResult.classList.add("hidden");
+
+    try {
+      try {
+        localStorage.setItem(DY_COOKIE_KEY, cookie);
+      } catch {
+        /* ignore */
+      }
+      setDyStatus("正在爬取（解析链接 → 获取直链 → 下载），请稍候…");
+      const res = await fetch("/api/tools/douyin-cache", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ share_url: raw, douyin_cookie: cookie }),
+      });
+      const rawBody = await res.text();
+      let data = {};
+      if (rawBody) {
+        try {
+          data = JSON.parse(rawBody);
+        } catch {
+          throw new Error(
+            res.ok
+              ? "服务器返回了无效数据"
+              : rawBody.slice(0, 200) || `请求失败（HTTP ${res.status}）`
+          );
+        }
+      }
+      if (!res.ok) {
+        const d = data.detail;
+        throw new Error(
+          typeof d === "string"
+            ? d
+            : Array.isArray(d)
+              ? d.map((x) => x.msg || x).join("；")
+              : rawBody.slice(0, 200) || `请求失败（HTTP ${res.status}）`
+        );
+      }
+
+      const previewUrl = data.preview_url || data.public_url;
+      const downloadUrl = data.download_url || previewUrl;
+      if (!previewUrl) {
+        throw new Error("服务器未返回视频地址");
+      }
+      const bust = `${previewUrl}${previewUrl.includes("?") ? "&" : "?"}t=${Date.now()}`;
+      dyPreview.removeAttribute("src");
+      dyPreview.load();
+      dyPreview.src = bust;
+      dyDownload.href = downloadUrl;
+      dyDownload.removeAttribute("download");
+      const nameBase = String(data.aweme_id || "douyin").replace(/\D/g, "") || "douyin";
+      dyDownload.setAttribute("download", `douyin_${nameBase}.mp4`);
+
+      const mb = ((data.size || 0) / 1024 / 1024).toFixed(1);
+      const dur = data.duration ? `${Math.round(data.duration)} 秒` : "";
+      const wmHint = data.watermark_free ? "无水印" : "含水印/平台流";
+      dyMeta.textContent = [`ID：${data.aweme_id || "—"}`, dur, `${mb} MB`, wmHint]
+        .filter(Boolean)
+        .join(" · ");
+
+      const method = data.crawl_method ? `（${data.crawl_method}）` : "";
+      setDyStatus(`爬取完成${method} · ${wmHint}，可预览或下载`, "ok");
+      dyResult.classList.remove("hidden");
+    } catch (err) {
+      setDyStatus(err.message || "抖音解析失败", "error");
+    } finally {
+      dySubmit.disabled = false;
+    }
+  });
+})();

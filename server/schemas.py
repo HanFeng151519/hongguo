@@ -109,6 +109,18 @@ class KuaishouMaterialRequest(BaseModel):
     share_url: str = Field(default="", description="快手分享链接，有则跳过搜索")
 
 
+class DouyinCacheRequest(BaseModel):
+    share_url: str = Field(
+        ...,
+        min_length=4,
+        description="抖音分享链接或含链接的整段分享文案",
+    )
+    douyin_cookie: str = Field(
+        default="",
+        description="可选：F12 复制的 Cookie，优先于 .env（Windows 推荐）",
+    )
+
+
 class FqKocMaterialRequest(BaseModel):
     series_id: str = Field(..., min_length=1, description="短剧 book_id / series_id")
     item_id: str = Field(..., min_length=1, description="分集 item_id")

@@ -64,13 +64,9 @@ def _clean_meme_text(text: str, *, max_len: int = 22) -> str:
 
 
 def _load_meme_font(size: int, *, bold: bool = True) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
-    candidates = (
-        "/System/Library/Fonts/STHeiti Medium.ttc",
-        "/System/Library/Fonts/PingFang.ttc",
-        "/System/Library/Fonts/Hiragino Sans GB.ttc",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-    )
-    for path in candidates:
+    from ffmpeg_util import cjk_font_paths
+
+    for path in cjk_font_paths(bold=bold):
         if Path(path).is_file():
             try:
                 return ImageFont.truetype(path, size=size)

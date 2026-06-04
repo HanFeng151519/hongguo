@@ -744,9 +744,9 @@ def koc_resolve_deadline_sec() -> float:
 
 def _probe_local_duration(path: Path) -> float:
     """ffprobe 优先，失败则用 ffmpeg -i 解析 Duration 行。"""
-    import shutil
+    from ffmpeg_util import resolve_ffprobe_exe
 
-    ffprobe = shutil.which("ffprobe")
+    ffprobe = resolve_ffprobe_exe()
     if ffprobe:
         try:
             proc = subprocess.run(

@@ -1,4 +1,4 @@
-"""成片输出画幅：默认跟源片像素（auto/native）；可选标准 1080×1920 / 1920×1080。"""
+"""成片输出画幅：默认标准 1080p（竖屏 1080×1920 / 横屏 1920×1080）；可选跟源片（auto）。"""
 
 from __future__ import annotations
 
@@ -59,7 +59,7 @@ def canvas_from_source_size(source_w: int, source_h: int) -> CanvasSpec:
 
 
 def output_aspect_mode() -> str:
-    return os.getenv("HONGGUO_OUTPUT_ASPECT", "auto").strip().lower()
+    return os.getenv("HONGGUO_OUTPUT_ASPECT", "standard").strip().lower()
 
 
 def canvas_from_env() -> Optional[CanvasSpec]:
@@ -179,8 +179,6 @@ def maybe_upgrade_canvas_from_source(
     """下载到正片后按源片更新画布（默认横屏占位 → 源片实际尺寸）。"""
     if canvas_from_env() is not None:
         return False
-    if not _use_native_source_size() and output_aspect_mode() not in ("auto", ""):
-        return False
     spec = canvas_from_source_size(source_w, source_h)
     ow, oh = output_size()
     if spec.width == ow and spec.height == oh:
@@ -247,7 +245,11 @@ def warn_if_output_aspect_mismatched_source(
         return
 
 
-def probe_video_size_ffmpeg(path: Path, *, ffmpeg: str = "ffmpeg") -> tuple[int, int]:
+def probe_video_size_ffmpeg(path: Path, *, ffmpeg: str | None = None) -> tuple[int, int]:
+    if not ffmpeg:
+        from ffmpeg_util import resolve_ffmpeg_exe
+
+        ffmpeg = resolve_ffmpeg_exe()
     proc = subprocess.run(
         [ffmpeg, "-hide_banner", "-i", str(path)],
         capture_output=True,

@@ -119,15 +119,15 @@ SPLASH_SUBTITLE_FONT_DEFAULT = 70
 SPLASH_BADGE_FONT_DEFAULT = 56
 SPLASH_BADGE_FONT_MIN = 36
 MAX_BODY_SECONDS = 3600  # 单集正片最长 1 小时，防止异常时长
-# 推广成片：横屏 16:9 = 1920×1080（与推广中心正片同比例）
-WORK_WIDTH = 1920
-WORK_HEIGHT = 1080
+# 推广成片默认 1080p 横屏；竖屏源片在 output_canvas 中升为 1080×1920
+WORK_WIDTH = int(os.getenv("HONGGUO_OUTPUT_WIDTH", "1920"))
+WORK_HEIGHT = int(os.getenv("HONGGUO_OUTPUT_HEIGHT", "1080"))
 ASPECT_LABEL = "16:9"
 PANEL_WIDTH = 1920
 MAX_EPISODES = 6
 MIN_OUTPUT_BYTES = 400_000
 AUDIO_RATE = 44100
-OUTPUT_FPS = 30
+OUTPUT_FPS = int(os.getenv("HONGGUO_OUTPUT_FPS", "60"))
 OUTPUT_CRF = 20
 ENCODE_PRESET = "fast"
 BODY_ENCODE_PRESET = "veryfast"  # 正片去重重编码，加快多集成片
@@ -146,25 +146,9 @@ DOWNLOAD_HEADERS = {
 
 
 def _resolve_ffmpeg() -> str:
-    try:
-        import imageio_ffmpeg
+    from ffmpeg_util import resolve_ffmpeg_exe
 
-        return imageio_ffmpeg.get_ffmpeg_exe()
-    except Exception:
-        pass
-
-    found = shutil.which("ffmpeg")
-    if found:
-        return found
-
-    for candidate in ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"):
-        if Path(candidate).is_file():
-            return candidate
-
-    raise RuntimeError(
-        "未找到 ffmpeg。请执行: brew install ffmpeg "
-        "或 pip install imageio-ffmpeg"
-    )
+    return resolve_ffmpeg_exe()
 
 
 FFMPEG = _resolve_ffmpeg()
@@ -183,13 +167,9 @@ def _run_ffmpeg(args: list[str], timeout: int = 300) -> None:
 
 
 def _resolve_ffprobe() -> Optional[str]:
-    found = shutil.which("ffprobe")
-    if found:
-        return found
-    for candidate in ("/opt/homebrew/bin/ffprobe", "/usr/local/bin/ffprobe"):
-        if Path(candidate).is_file():
-            return candidate
-    return None
+    from ffmpeg_util import resolve_ffprobe_exe
+
+    return resolve_ffprobe_exe()
 
 
 def _parse_ffmpeg_duration(stderr: str) -> float:
@@ -488,22 +468,9 @@ def _wrap_text(
 
 
 def _load_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
-    candidates = []
-    if bold:
-        candidates.extend(
-            [
-                "/System/Library/Fonts/PingFang.ttc",
-                "/System/Library/Fonts/STHeiti Medium.ttc",
-            ]
-        )
-    candidates.extend(
-        [
-            "/System/Library/Fonts/PingFang.ttc",
-            "/System/Library/Fonts/Hiragino Sans GB.ttc",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        ]
-    )
-    for path in candidates:
+    from ffmpeg_util import cjk_font_paths
+
+    for path in cjk_font_paths(bold=bold):
         if Path(path).exists():
             try:
                 return ImageFont.truetype(path, size=size)

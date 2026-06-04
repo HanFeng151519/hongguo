@@ -21,12 +21,9 @@ def compliance_intro_strip_enabled() -> bool:
 
 
 def _ffmpeg() -> str:
-    import shutil
+    from ffmpeg_util import resolve_ffmpeg_exe
 
-    for c in (os.getenv("FFMPEG", ""), shutil.which("ffmpeg"), "/opt/homebrew/bin/ffmpeg"):
-        if c and Path(c).is_file():
-            return c
-    return "ffmpeg"
+    return resolve_ffmpeg_exe()
 
 
 def _intro_cache_path(

@@ -328,6 +328,241 @@ body::before {
   cursor: not-allowed;
 }
 
+.wm-field-full {
+  flex: 1 1 100%;
+  min-width: 100%;
+}
+
+.wm-share-input {
+  width: 100%;
+  padding: 0.75rem 1rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  color: var(--text);
+  font-size: 0.95rem;
+  font-family: inherit;
+}
+
+.wm-share-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.dy-meta {
+  font-size: 0.9rem;
+  color: var(--text-muted);
+  margin: 0 0 0.75rem;
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+.dy-cookie-input {
+  resize: vertical;
+  min-height: 4.5rem;
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 0.8rem;
+}
+
+.dy-cookie-hint {
+  font-size: 0.82rem;
+  color: var(--text-muted);
+  margin: -0.5rem 0 1rem;
+  line-height: 1.45;
+}
+
+.dy-cookie-optional {
+  margin-bottom: 1rem;
+  font-size: 0.88rem;
+  color: var(--text-muted);
+}
+
+.dy-cookie-optional summary {
+  cursor: pointer;
+  margin-bottom: 0.5rem;
+  color: var(--text);
+}
+
+.dy-cookie-optional[open] .dy-cookie-input {
+  margin-top: 0.35rem;
+}
+
+.wm-section {
+  margin-bottom: 2rem;
+}
+
+.wm-head {
+  margin-bottom: 1rem;
+}
+
+.wm-title {
+  font-size: 1.25rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+
+.wm-desc {
+  color: var(--text-muted);
+  font-size: 0.9rem;
+  margin-top: 0.35rem;
+}
+
+.wm-panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1.25rem;
+  box-shadow: var(--shadow);
+}
+
+.wm-upload {
+  display: block;
+  border: 2px dashed var(--border);
+  border-radius: 12px;
+  padding: 1.5rem 1rem;
+  text-align: center;
+  cursor: pointer;
+  transition: border-color 0.2s, background 0.2s;
+  margin-bottom: 1rem;
+}
+
+.wm-upload:hover,
+.wm-upload.wm-dragover {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.wm-upload input[type="file"] {
+  position: absolute;
+  width: 0;
+  height: 0;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.wm-file-label {
+  color: var(--text-muted);
+  font-size: 0.95rem;
+}
+
+.wm-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 0.75rem 1rem;
+  margin-bottom: 0.75rem;
+}
+
+.wm-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  flex: 1;
+  min-width: 200px;
+}
+
+.wm-field span {
+  font-size: 0.85rem;
+  color: var(--text-muted);
+}
+
+.wm-field select {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  color: var(--text);
+  padding: 0.55rem 0.75rem;
+  font-family: inherit;
+  font-size: 0.95rem;
+}
+
+.wm-custom-toggle {
+  margin-bottom: 0.15rem;
+}
+
+.wm-custom {
+  margin-bottom: 0.75rem;
+}
+
+.wm-custom-hint {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  margin-bottom: 0.5rem;
+}
+
+.wm-custom-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0.65rem;
+}
+
+.wm-custom-grid label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+
+.wm-custom-grid input {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  padding: 0.45rem 0.5rem;
+  font-family: inherit;
+}
+
+.wm-actions {
+  margin-top: 0.5rem;
+}
+
+.wm-status {
+  margin-top: 1rem;
+  font-size: 0.9rem;
+  color: var(--text-muted);
+}
+
+.wm-status.error {
+  color: #ff8a8c;
+}
+
+.wm-status.ok {
+  color: #7dcea0;
+}
+
+.wm-result {
+  margin-top: 1.25rem;
+  padding-top: 1.25rem;
+  border-top: 1px solid var(--border);
+}
+
+.wm-preview {
+  width: 100%;
+  max-height: 360px;
+  border-radius: 10px;
+  background: #000;
+  margin-bottom: 1rem;
+}
+
+.wm-result-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}
+
+.wm-result-actions .btn-primary {
+  text-decoration: none;
+  display: inline-block;
+  text-align: center;
+}
+
+@media (max-width: 600px) {
+  .wm-custom-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
 .status {
   text-align: center;
   padding: 2rem;

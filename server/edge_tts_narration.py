@@ -91,12 +91,13 @@ def fixed_opening_text() -> str:
 
 def probe_media_duration(path: Path) -> float:
     """读取 mp3/mp4 时长（秒）。"""
-    import shutil
     import subprocess
+
+    from ffmpeg_util import resolve_ffprobe_exe
 
     if not path.is_file():
         return 0.0
-    ffprobe = shutil.which("ffprobe")
+    ffprobe = resolve_ffprobe_exe()
     if ffprobe:
         try:
             proc = subprocess.run(

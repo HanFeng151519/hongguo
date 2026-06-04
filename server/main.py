@@ -1,7 +1,12 @@
 import asyncio
 import logging
 import os
+import sys
 from contextlib import asynccontextmanager
+
+# Windows：uvicorn 下 Playwright 需 Proactor 事件循环；macOS/Linux 不改动默认策略
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 from env_loader import load_project_env
 from fq_koc_browser import (
@@ -13,16 +18,29 @@ from fq_koc_browser import (
 from fq_koc_session import import_curl_text, load_koc_session, session_public_status
 
 load_project_env()
+from ffmpeg_util import configure_ffmpeg_env
+
+configure_ffmpeg_env()
 load_koc_session()
 import re
 import secrets
 import shutil
+import subprocess
 from datetime import date
 from pathlib import Path
 from typing import Any, Optional
 
 import httpx
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request
+from fastapi import (
+    BackgroundTasks,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -40,11 +58,13 @@ from ai_edit_planner import default_plan, plan_hook_edit, plan_to_dict
 from hook_generator import generate_hook_video, render_keyword_splash_card
 from douyin_material import (
     MATERIAL_DIR as DOUYIN_MATERIAL_DIR,
+    douyin_cookie_scope,
+    effective_douyin_cookie,
     find_best_material as find_douyin_best,
     fetch_douyin_body_source,
     resolve_share_url as resolve_douyin_share,
 )
-from material_common import is_douyin_url, is_kuaishou_url
+from material_common import extract_douyin_share_url, is_douyin_url, is_kuaishou_url
 from external_material import fetch_external_body_source
 from kuaishou_material import (
     MATERIAL_DIR,
@@ -76,6 +96,7 @@ from schemas import (
     FqKocSessionSyncRequest,
     GenerateHookRequest,
     KuaishouMaterialRequest,
+    DouyinCacheRequest,
 )
 
 API_BASE = os.getenv(
@@ -106,6 +127,12 @@ STATIC_DIR = Path(__file__).resolve().parent.parent / "public"
 _hot_cache: dict[str, Any] = {"day": "", "items": []}
 _hot_lock = asyncio.Lock()
 DOWNLOAD_DIR = STATIC_DIR / "downloads"
+WM_UPLOAD_DIR = STATIC_DIR / "uploads" / "watermark"
+DOUYIN_CACHE_DIR = STATIC_DIR / "cache" / "douyin"
+WM_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+WM_MAX_BYTES = 500 * 1024 * 1024
+WM_JOBS: dict[str, dict[str, Any]] = {}
+WM_JOBS_LOCK = asyncio.Lock()
 TTS_CACHE_DIR = STATIC_DIR / "tts_cache"
 TTS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 DOWNLOAD_TTL_SEC = 3600
@@ -467,7 +494,7 @@ async def _run_generate_job(job_id: str, body: GenerateHookRequest) -> None:
                     )
                     try:
                         await ensure_koc_login(book_id)
-                    except RuntimeError as exc:
+                    except Exception as exc:
                         await _set_job(
                             job_id,
                             status="failed",
@@ -1207,6 +1234,333 @@ async def download_douyin_material(body: KuaishouMaterialRequest):
     }
 
 
+def _douyin_cache_path(aweme_id: str) -> Path:
+    safe = re.sub(r"[^\d]", "", str(aweme_id or ""))
+    if not safe:
+        raise HTTPException(status_code=404, detail="视频不存在或已过期")
+    path = DOUYIN_CACHE_DIR / f"{safe}.mp4"
+    if not path.is_file() or path.stat().st_size < 10_000:
+        raise HTTPException(status_code=404, detail="视频不存在或已过期，请重新爬取")
+    return path
+
+
+async def _finalize_douyin_mp4(path: Path) -> None:
+    """重封装为浏览器可拖动的 mp4（faststart）。"""
+
+    def work() -> None:
+        from ffmpeg_util import resolve_ffmpeg_exe
+
+        ffmpeg = resolve_ffmpeg_exe()
+        tmp = path.with_suffix(".web.mp4")
+        tmp.unlink(missing_ok=True)
+        proc = subprocess.run(
+            [
+                ffmpeg,
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                str(path),
+                "-map",
+                "0",
+                "-c",
+                "copy",
+                "-map_metadata",
+                "-1",
+                "-movflags",
+                "+faststart",
+                str(tmp),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        if proc.returncode == 0 and tmp.is_file() and tmp.stat().st_size > 10_000:
+            path.unlink(missing_ok=True)
+            tmp.rename(path)
+
+    try:
+        await asyncio.to_thread(work)
+    except Exception as exc:
+        logging.getLogger(__name__).info("douyin mp4 faststart skip: %s", exc)
+
+
+@app.get("/preview/douyin/{aweme_id}.mp4")
+async def preview_douyin_cache(aweme_id: str):
+    path = _douyin_cache_path(aweme_id)
+    return FileResponse(
+        path,
+        media_type="video/mp4",
+        headers={"Content-Disposition": "inline", "Accept-Ranges": "bytes"},
+    )
+
+
+@app.get("/downloads/douyin/{aweme_id}.mp4")
+async def download_douyin_cache(aweme_id: str):
+    path = _douyin_cache_path(aweme_id)
+    name = f"douyin_{re.sub(r'[^\\d]', '', aweme_id) or 'video'}.mp4"
+    return FileResponse(
+        path,
+        media_type="video/mp4",
+        filename=name,
+        headers={"Content-Disposition": f'attachment; filename="{name}"'},
+    )
+
+
+@app.post("/api/tools/douyin-cache")
+async def cache_douyin_from_share(body: DouyinCacheRequest):
+    """主页工具：从分享文案提取 http 链接并直接爬取下载。"""
+    from douyin_crawler import crawl_and_download, extract_all_http_urls
+
+    share_text = (body.share_url or "").strip()
+    if not share_text:
+        raise HTTPException(status_code=400, detail="请粘贴分享文案或链接")
+    if not extract_all_http_urls(share_text):
+        raise HTTPException(
+            status_code=400,
+            detail="文案中未找到 http 链接，请粘贴含 https:// 的分享内容",
+        )
+
+    share = extract_douyin_share_url(share_text) or extract_all_http_urls(share_text)[0]
+    cookie = body.douyin_cookie.strip() or effective_douyin_cookie()
+
+    DOUYIN_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        with douyin_cookie_scope(cookie):
+            async with httpx.AsyncClient(timeout=600.0) as client:
+                dest = DOUYIN_CACHE_DIR / "page_cache.mp4"
+                crawled = await crawl_and_download(client, share_text, dest)
+                from douyin_material import _aweme_id_from_url
+
+                aweme_id = (
+                    _aweme_id_from_url(share)
+                    or re.sub(r"[^\d]", "", str(crawled.get("aweme_id") or ""))
+                    or dest.stem
+                )
+                final = DOUYIN_CACHE_DIR / f"{aweme_id}.mp4"
+                if dest != final:
+                    final.unlink(missing_ok=True)
+                    dest.rename(final)
+                await _finalize_douyin_mp4(final)
+                result = {
+                    "local_path": final,
+                    "play_url": crawled.get("play_url"),
+                    "aweme_id": aweme_id,
+                    "caption": crawled.get("caption", ""),
+                    "duration": crawled.get("duration", 0),
+                    "crawl_method": crawled.get("crawl_method", "crawl"),
+                }
+                preview = crawled
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except httpx.HTTPStatusError as exc:
+        code = exc.response.status_code if exc.response is not None else 0
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"视频下载被抖音拒绝（HTTP {code}）。请稍后重试，"
+                "或展开填写可选 Cookie（登录 douyin.com 后 F12 复制）。"
+            ),
+        ) from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"网络请求失败: {exc}") from exc
+
+    local = Path(result["local_path"])
+    if not local.is_file():
+        raise HTTPException(status_code=500, detail="视频已解析但保存失败")
+    aweme_id = str(result.get("aweme_id") or local.stem)
+    cover = str(preview.get("cover_url") or "").strip()
+    preview_url = f"/preview/douyin/{aweme_id}.mp4"
+    download_url = f"/downloads/douyin/{aweme_id}.mp4"
+    wm_free = bool(result.get("watermark_free", True))
+    method = str(result.get("crawl_method", "crawl"))
+    return {
+        "ok": True,
+        "share_url": share,
+        "aweme_id": aweme_id,
+        "caption": "",
+        "duration": result.get("duration"),
+        "cover_url": cover,
+        "local_path": str(local),
+        "public_url": preview_url,
+        "preview_url": preview_url,
+        "download_url": download_url,
+        "size": local.stat().st_size,
+        "crawl_method": method,
+        "watermark_free": wm_free,
+    }
+
+
+@app.get("/api/tools/watermark-presets")
+async def list_watermark_presets():
+    from watermark_remove import PRESET_LABELS
+
+    return {
+        "ok": True,
+        "presets": [
+            {"id": k, "label": v} for k, v in PRESET_LABELS.items()
+        ],
+    }
+
+
+async def _set_wm_job(job_id: str, **fields: Any) -> None:
+    async with WM_JOBS_LOCK:
+        job = WM_JOBS.setdefault(job_id, {})
+        job.update(fields)
+
+
+async def _run_wm_job(
+    job_id: str,
+    src: Path,
+    out: Path,
+    *,
+    position: str,
+    strength: str,
+    wm_method: str,
+    use_custom_rect: bool,
+    x: Optional[int],
+    y: Optional[int],
+    w: Optional[int],
+    h: Optional[int],
+) -> None:
+    from watermark_remove import remove_watermark
+
+    from watermark_remove import wm_method as resolve_wm_method
+
+    method = resolve_wm_method(wm_method or None)
+    progress = (
+        "正在 OCR 定位水印并智能修复（逐帧计算，请耐心等待）…"
+        if method == "inpaint"
+        else "正在 OCR 定位水印并去水印（整段重编码，请耐心等待）…"
+    )
+    await _set_wm_job(job_id, status="running", progress=progress)
+    try:
+        meta = await asyncio.to_thread(
+            remove_watermark,
+            src,
+            out,
+            preset=position,
+            strength=strength,
+            method=wm_method or None,
+            x=x if use_custom_rect else None,
+            y=y if use_custom_rect else None,
+            w=w if use_custom_rect else None,
+            h=h if use_custom_rect else None,
+        )
+        await _set_wm_job(
+            job_id,
+            status="completed",
+            progress="处理完成",
+            download_url=f"/downloads/wm_{job_id}.mp4",
+            preview_url=f"/preview/wm_{job_id}.mp4",
+            size=out.stat().st_size,
+            region=meta,
+            regions=meta.get("regions") or [],
+        )
+    except Exception as exc:
+        logging.getLogger(__name__).exception("watermark job %s failed", job_id)
+        out.unlink(missing_ok=True)
+        await _set_wm_job(
+            job_id,
+            status="failed",
+            progress="处理失败",
+            error=str(exc),
+        )
+    finally:
+        src.unlink(missing_ok=True)
+
+
+@app.post("/api/tools/remove-watermark")
+async def remove_video_watermark(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(..., description="本地 MP4/MOV 等视频"),
+    position: str = Form("doubao", description="水印位置预设"),
+    strength: str = Form("normal", description="处理强度：tight/normal/strong"),
+    wm_method: str = Form("", description="inpaint=智能修复 / blur_cover=快速模糊"),
+    x: Optional[int] = Form(None, description="自定义区域左上角 X（像素）"),
+    y: Optional[int] = Form(None, description="自定义区域左上角 Y"),
+    w: Optional[int] = Form(None, description="区域宽度"),
+    h: Optional[int] = Form(None, description="区域高度"),
+):
+    """上传视频，后台去水印，前端轮询 job 状态。"""
+    from watermark_remove import PRESET_LABELS, wm_strength
+
+    use_custom_rect = all(v is not None for v in (x, y, w, h))
+    strength = wm_strength(strength)
+    if not use_custom_rect and position not in PRESET_LABELS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"未知预设 {position!r}，或未填写完整自定义坐标",
+        )
+
+    suffix = Path(file.filename or "video.mp4").suffix.lower()
+    if suffix not in (".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"):
+        suffix = ".mp4"
+
+    job_id = secrets.token_urlsafe(10)
+    src = WM_UPLOAD_DIR / f"{job_id}_in{suffix}"
+    out = DOWNLOAD_DIR / f"wm_{job_id}.mp4"
+
+    try:
+        total = 0
+        with src.open("wb") as fh:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > WM_MAX_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail="视频超过 500MB 上限",
+                    )
+                fh.write(chunk)
+    finally:
+        await file.close()
+
+    if total < 10_000:
+        src.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="文件过小或为空")
+
+    est_sec = max(30, int(total / (1024 * 1024) * 45))
+    if position in ("doubao", "all-corners"):
+        est_sec = int(est_sec * 1.3)
+
+    await _set_wm_job(
+        job_id,
+        status="queued",
+        progress=f"已上传，排队处理中…（约 {total // (1024 * 1024)} MB，预计 {est_sec // 60}–{(est_sec * 2) // 60 + 1} 分钟）",
+        size_mb=round(total / (1024 * 1024), 1),
+    )
+
+    background_tasks.add_task(
+        _run_wm_job,
+        job_id,
+        src,
+        out,
+        position=position,
+        strength=strength,
+        wm_method=wm_method,
+        use_custom_rect=use_custom_rect,
+        x=x,
+        y=y,
+        w=w,
+        h=h,
+    )
+
+    return {"ok": True, "job_id": job_id, "estimated_sec": est_sec}
+
+
+@app.get("/api/tools/remove-watermark/job/{job_id}")
+async def get_watermark_job(job_id: str):
+    async with WM_JOBS_LOCK:
+        job = WM_JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="任务不存在或已过期，请重新上传")
+    return {"ok": True, "job_id": job_id, **job}
+
+
 @app.get("/api/tts/search-hint.mp3")
 async def tts_search_hint(
     title: str = Query(..., min_length=1, max_length=64, description="剧名"),
@@ -1487,6 +1841,14 @@ if STATIC_DIR.is_dir():
         StaticFiles(directory=str(STATIC_DIR)),
         name="assets",
     )
+
+    _cache_root = STATIC_DIR / "cache"
+    if _cache_root.is_dir():
+        app.mount(
+            "/cache",
+            StaticFiles(directory=str(_cache_root)),
+            name="cache",
+        )
 
     @app.get("/")
     async def index_page():
