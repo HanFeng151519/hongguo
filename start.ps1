@@ -48,4 +48,12 @@ Write-Host "服务已绑定 0.0.0.0:8000，请在浏览器打开（不要用 0.0
 Write-Host "  http://localhost:8000" -ForegroundColor Cyan
 Write-Host "  http://127.0.0.1:8000" -ForegroundColor Cyan
 Write-Host ""
-& $py -3.12 -m uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+if ($env:HONGGUO_UVICORN_RELOAD -eq "1") {
+    Write-Host "开发模式：已启用 --reload（AI 超分进行中请勿保存代码触发重载）" -ForegroundColor Yellow
+    & $py -3.12 -m uvicorn main:app --host 0.0.0.0 --port 8000 --reload `
+        --reload-exclude "tools/*" --reload-exclude "*/jobs/*" --reload-exclude "*/cache/*"
+} else {
+    Write-Host "生产模式：未启用 --reload（AI 超分任务不会被热重载打断）" -ForegroundColor Yellow
+    Write-Host "开发调试可设环境变量 HONGGUO_UVICORN_RELOAD=1" -ForegroundColor DarkGray
+    & $py -3.12 -m uvicorn main:app --host 0.0.0.0 --port 8000
+}

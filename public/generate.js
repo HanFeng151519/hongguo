@@ -611,6 +611,7 @@ async function readJsonResponse(res) {
 function absoluteUrl(path) {
   if (!path) return "";
   if (path.startsWith("http://") || path.startsWith("https://")) return path;
+  if (window.HongguoApi?.apiUrl) return window.HongguoApi.apiUrl(path);
   return `${location.origin}${path.startsWith("/") ? "" : "/"}${path}`;
 }
 

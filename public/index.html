@@ -2,7 +2,13 @@
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="红果短剧" />
+  <meta name="theme-color" content="#e85d4c" />
+  <link rel="manifest" href="/manifest.webmanifest" />
+  <link rel="apple-touch-icon" href="/icons/icon-192.png" />
   <title>红果短剧检索</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -16,7 +22,7 @@
         <span class="brand-icon">🍅</span>
         <div>
           <h1>红果短剧检索</h1>
-          <p>搜索后自动播报「请搜索《剧名》在红果短剧观看原片」，也可点 🔊 重听</p>
+          <p>搜索后自动播报「请搜索《剧名》在红果短剧观看原片」，也可点 🔊 重听 <span id="platform-badge" class="platform-badge"></span></p>
         </div>
       </div>
     </header>
@@ -39,8 +45,8 @@
 
     <section class="wm-section" aria-labelledby="dy-section-title">
       <div class="wm-head">
-        <h2 id="dy-section-title" class="wm-title">抖音分享爬取</h2>
-        <p class="wm-desc">粘贴分享文案即可。默认<strong>优先无水印</strong>（<code>play</code> 直链，非 <code>playwm</code>），不展示抖音简介文案。成片尾仍有平台贴片时可再用下方「去掉视频水印」。</p>
+        <h2 id="dy-section-title" class="wm-title">抖音 / 头条分享爬取</h2>
+        <p class="wm-desc">粘贴分享文案即可，支持<strong>抖音</strong>与<strong>今日头条</strong>（含 <code>m.toutiao.com/is/…</code> 短链）。抖音默认优先无水印直链。成片尾仍有平台贴片时可再用下方「去掉视频水印」。</p>
       </div>
       <form id="dy-form" class="wm-panel">
         <label class="wm-field wm-field-full">
@@ -49,7 +55,7 @@
             id="dy-share"
             class="wm-share-input dy-cookie-input"
             rows="3"
-            placeholder="粘贴整段分享文案（含 https://v.douyin.com/… 或其它可访问的视频链接）"
+            placeholder="粘贴整段分享文案（抖音 v.douyin.com / 头条 m.toutiao.com/is/… 等）"
             spellcheck="false"
           ></textarea>
         </label>
@@ -71,8 +77,9 @@
           <p id="dy-meta" class="dy-meta"></p>
           <video id="dy-preview" class="wm-preview" controls playsinline></video>
           <div class="wm-result-actions">
-            <a id="dy-download" class="btn-primary" href="#" target="_blank" rel="noopener">下载视频</a>
+            <a id="dy-download" class="btn-primary" href="#" download>下载视频</a>
           </div>
+          <p class="wm-desc mobile-web-only hidden">手机：点「下载视频」后，可用系统菜单「存储到相册」或「存储到文件」。</p>
         </div>
       </form>
     </section>
@@ -80,7 +87,7 @@
     <section class="wm-section" aria-labelledby="wm-section-title">
       <div class="wm-head">
         <h2 id="wm-section-title" class="wm-title">去掉视频水印</h2>
-        <p class="wm-desc">标配 <strong>OCR 自动框</strong> + <strong>逐帧 inpaint</strong>（直接改像素，不贴模糊块）。遮罩外缘宽羽化，避免画中画感。仍有字痕选「强力」。首次需 <code>pip install rapidocr-onnxruntime opencv-python-headless</code>。</p>
+        <p class="wm-desc">标配 <strong>OCR 自动框</strong> + <strong>逐帧 inpaint</strong>。建议先用「快速模式」验证效果，再决定是否开 AI 超分。抖音选「抖音角标」；豆包选「豆包 AI」。</p>
       </div>
       <form id="wm-form" class="wm-panel">
         <label class="wm-upload">
@@ -91,7 +98,8 @@
           <label class="wm-field">
             <span>水印位置</span>
             <select id="wm-position" name="position">
-              <option value="doubao" selected>豆包 AI（右下 + 左上，推荐）</option>
+              <option value="douyin" selected>抖音角标（右下小条，推荐）</option>
+              <option value="doubao">豆包 AI（右下 + 左上）</option>
               <option value="bottom-right">仅右下角</option>
               <option value="top-left">仅左上角</option>
               <option value="bottom-left">仅左下角</option>
@@ -115,6 +123,31 @@
               <option value="strong">强力（去得更干净，块略大）</option>
             </select>
           </label>
+          <label class="wm-field">
+            <span>输出分辨率</span>
+            <select id="wm-output-scale" name="output_scale">
+              <option value="native" selected>跟原片（最快）</option>
+              <option value="1080">1080p 高清</option>
+              <option value="4k">4K 超清（最慢）</option>
+            </select>
+          </label>
+          <label class="wm-field">
+            <span>输出帧率</span>
+            <select id="wm-output-fps" name="output_fps">
+              <option value="native" selected>跟原片（最快）</option>
+              <option value="60">60 帧</option>
+              <option value="120">120 帧（最慢）</option>
+            </select>
+          </label>
+          <label class="wm-field">
+            <span>画质增强</span>
+            <select id="wm-enhance" name="enhance">
+              <option value="off" selected>关闭（最快）</option>
+              <option value="sr">AI 超分 Real-ESRGAN（最慢）</option>
+            </select>
+          </label>
+          <button type="button" id="wm-quick" class="btn-ghost wm-custom-toggle">快速模式</button>
+          <button type="button" id="wm-quality" class="btn-ghost wm-custom-toggle">高画质模式</button>
           <button type="button" id="wm-toggle-custom" class="btn-ghost wm-custom-toggle">自定义区域</button>
         </div>
         <div id="wm-custom" class="wm-custom hidden">
@@ -139,15 +172,95 @@
       </form>
     </section>
 
+    <section class="wm-section" aria-labelledby="wm-img-section-title">
+      <div class="wm-head">
+        <h2 id="wm-img-section-title" class="wm-title">批次圖片去水印（資料夾）</h2>
+        <p class="wm-desc desktop-only">Windows / macOS：選資料夾批次處理，完成後下載 ZIP。</p>
+        <p class="wm-desc mobile-web-only hidden">手機瀏覽器：多選圖片去水印，完成後點<strong>保存到相冊</strong>，在系統分享菜單選「儲存圖像」。</p>
+      </div>
+      <form id="wm-img-form" class="wm-panel">
+        <label class="wm-upload desktop-only">
+          <input id="wm-img-files" type="file" webkitdirectory directory multiple accept="image/png,image/jpeg,image/webp,.png,.jpg,.jpeg,.webp" />
+          <span id="wm-img-label" class="wm-file-label">點擊選擇資料夾（批次圖片）</span>
+        </label>
+        <label class="wm-upload mobile-web-only hidden">
+          <input id="wm-img-files-multi" type="file" multiple accept="image/png,image/jpeg,image/webp,image/*" />
+          <span id="wm-img-label-multi" class="wm-file-label">點擊多選圖片（批次）</span>
+        </label>
+        <div class="wm-row">
+          <label class="wm-field">
+            <span>水印位置</span>
+            <select id="wm-img-position" name="position">
+              <option value="douyin" selected>抖音角標（右下小條）</option>
+              <option value="doubao">豆包 AI（右下 + 左上）</option>
+              <option value="bottom-right">僅右下角</option>
+              <option value="top-left">僅左上角</option>
+              <option value="all-corners">四角都去</option>
+            </select>
+          </label>
+          <label class="wm-field">
+            <span>處理強度</span>
+            <select id="wm-img-strength" name="strength">
+              <option value="tight" selected>精細（推薦）</option>
+              <option value="normal">標準</option>
+              <option value="strong">強力</option>
+            </select>
+          </label>
+        </div>
+        <div class="wm-actions">
+          <button type="submit" id="wm-img-submit" class="btn-primary desktop-only" disabled>批次去水印並打包</button>
+          <button type="submit" id="wm-img-submit-mobile" class="btn-primary mobile-web-only hidden" disabled>去水印並保存到相冊</button>
+        </div>
+        <p id="wm-img-status" class="wm-status hidden" role="status"></p>
+        <div id="wm-img-result" class="wm-result desktop-only hidden">
+          <div class="wm-result-actions">
+            <a id="wm-img-download" class="btn-primary" href="#">下載 ZIP</a>
+          </div>
+        </div>
+        <div id="wm-img-result-mobile" class="wm-result mobile-web-only hidden">
+          <div class="wm-result-actions">
+            <button type="button" id="wm-img-save-photos" class="btn-primary">保存到相冊</button>
+          </div>
+          <p class="wm-desc">優先彈出系統分享；若無法彈出，會顯示預覽圖，<strong>長按圖片</strong>即可存入相冊。</p>
+          <div id="wm-img-preview-gallery" class="wm-img-preview-gallery hidden"></div>
+        </div>
+      </form>
+    </section>
+
     <main>
       <div id="status" class="status hidden"></div>
       <div id="results" class="results"></div>
     </main>
 
+    <section class="wm-section mobile-browser-hint" aria-labelledby="mobile-browser-title">
+      <details open>
+        <summary id="mobile-browser-title">📱 手機瀏覽器訪問</summary>
+        <p class="wm-desc">電腦先啟動後端，手機連<strong>同一 WiFi</strong>（勿用蜂窩數據），在 Safari / Chrome 打開：</p>
+        <p class="wm-desc lan-access-line">
+          <code id="mobile-access-url">載入中…</code>
+          <button type="button" id="lan-access-copy" class="btn-ghost">複製</button>
+        </p>
+        <p id="lan-access-hint" class="wm-desc hidden"></p>
+        <div id="lan-firewall-alert" class="lan-firewall-alert desktop-only">
+          <p><strong>手機打不開？</strong>幾乎都是 Windows 防火牆攔住了，請在電腦上：</p>
+          <ol>
+            <li>打開資料夾 <code>hongguo\scripts</code></li>
+            <li>雙擊 <code>allow-firewall-8000.bat</code></li>
+            <li>彈窗點 <strong>是</strong>（允許管理員權限）</li>
+            <li>看到「已放行」後，手機再開上方地址</li>
+          </ol>
+        </div>
+        <p class="wm-desc mobile-web-only hidden">也可分享 → <strong>加入主屏幕</strong>。圖片用「保存到相冊」，影片用「下載」後儲存。</p>
+      </details>
+    </section>
+
     <footer class="footer">
       <span>数据来源：红果短剧公开搜索接口</span>
     </footer>
   </div>
-  <script src="/app.js?v=17"></script>
+  <script src="/api-base.js?v=3"></script>
+  <script src="/platform.js?v=2"></script>
+  <script src="/mobile-save.js?v=2"></script>
+  <script src="/app.js?v=27"></script>
 </body>
 </html>

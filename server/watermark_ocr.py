@@ -17,11 +17,12 @@ _OCR_ENGINE = None
 
 # 豆包角标常见字样（子串匹配，忽略空格）
 _WM_KEYWORD_RE = re.compile(
-    r"豆包|doubao|ai\s*生成|ai生成|由\s*ai|generated",
+    r"豆包|doubao|ai\s*生成|ai生成|由\s*ai|generated|抖音|douyin|tiktok",
     re.IGNORECASE,
 )
 
 _CORNERS_FOR_PRESET: dict[str, tuple[str, ...]] = {
+    "douyin": ("bottom-right",),
     "doubao": ("bottom-right", "top-left"),
     "top-left": ("top-left",),
     "bottom-right": ("bottom-right",),
@@ -75,6 +76,10 @@ def _is_watermark_text(text: str) -> bool:
         return True
     if re.search(r"ai", t, re.I) and "生成" in t:
         return True
+    if "抖音" in t or re.search(r"douyin", t, re.I):
+        return True
+    if re.fullmatch(r"[@＠][\w\u4e00-\u9fff]{2,24}", t):
+        return True
     # 角区内 OCR 常把「AI」「生成」拆成两段
     if len(t) <= 4 and re.fullmatch(r"(AI|ai|生成|aI|Ai)", t):
         return True
@@ -86,12 +91,19 @@ def _expand_rect_for_logo(
     corner: str,
     vw: int,
     vh: int,
+    *,
+    preset: str = "",
 ) -> tuple[int, int, int, int]:
-    """豆包图标在文字左侧，略向左上扩一圈。"""
+    """豆包图标在文字左侧，略向左上扩一圈；抖音角标更紧。"""
     x, y, w, h = rect
     c = corner.strip().lower()
-    logo_w = min(x, max(28, int(vw * 0.055)))
-    pad_y = max(4, int(h * 0.12))
+    p = (preset or "").strip().lower()
+    if p == "douyin":
+        logo_w = min(x, max(12, int(vw * 0.028)))
+        pad_y = max(2, int(h * 0.06))
+    else:
+        logo_w = min(x, max(28, int(vw * 0.055)))
+        pad_y = max(4, int(h * 0.12))
     if c in ("bottom-right", "top-left", "bottom-left", "top-right"):
         x = max(0, x - logo_w)
         w = min(vw - x, w + logo_w)
@@ -278,7 +290,10 @@ def rects_from_ocr_video(
         return geometric_fallback(vw, vh, preset, strength=strength)
 
     min_score = _env_float("HONGGUO_WM_OCR_MIN_SCORE", 0.35)
-    pad = _env_int("HONGGUO_WM_OCR_PAD", 18)
+    pad = _env_int(
+        "HONGGUO_WM_OCR_PAD",
+        6 if p == "douyin" else 10,
+    )
     times = _sample_times(duration)
 
     fallback_rects = geometric_fallback(vw, vh, preset, strength=strength)
@@ -305,7 +320,7 @@ def rects_from_ocr_video(
     for corner in corners:
         merged = _merge_rects(collected[corner], vw, vh, extra_pad=pad)
         if merged:
-            merged = _expand_rect_for_logo(merged, corner, vw, vh)
+            merged = _expand_rect_for_logo(merged, corner, vw, vh, preset=p)
             logger.info("OCR 水印框 %s: %s", corner, merged)
             out.append(merged)
         elif corner in fb_map:

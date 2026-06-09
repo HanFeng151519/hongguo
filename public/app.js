@@ -1,3 +1,7 @@
+function apiUrl(path) {
+  return window.HongguoApi?.apiUrl ? window.HongguoApi.apiUrl(path) : path;
+}
+
 const form = document.getElementById("search-form");
 const input = document.getElementById("search-input");
 const btn = document.getElementById("search-btn");
@@ -9,7 +13,9 @@ let lastSearchItems = [];
 let hintAudio = null;
 
 function searchHintAudioUrl(title) {
-  return `/api/tts/search-hint.mp3?title=${encodeURIComponent((title || "").trim())}`;
+  return apiUrl(
+    `/api/tts/search-hint.mp3?title=${encodeURIComponent((title || "").trim())}`
+  );
 }
 
 function playSearchHint(title) {
@@ -259,6 +265,11 @@ input.addEventListener("input", () => {
   const wmPosition = document.getElementById("wm-position");
   const wmStrength = document.getElementById("wm-strength");
   const wmMethod = document.getElementById("wm-method");
+  const wmOutputScale = document.getElementById("wm-output-scale");
+  const wmOutputFps = document.getElementById("wm-output-fps");
+  const wmEnhance = document.getElementById("wm-enhance");
+  const wmQuick = document.getElementById("wm-quick");
+  const wmQuality = document.getElementById("wm-quality");
   const wmToggleCustom = document.getElementById("wm-toggle-custom");
   const wmCustom = document.getElementById("wm-custom");
   const wmSubmit = document.getElementById("wm-submit");
@@ -327,6 +338,24 @@ input.addEventListener("input", () => {
     wmToggleCustom.textContent = visible ? "收起自定义" : "自定义区域";
   });
 
+  wmQuick?.addEventListener("click", () => {
+    if (wmMethod) wmMethod.value = "blur_cover";
+    if (wmStrength) wmStrength.value = "tight";
+    if (wmOutputScale) wmOutputScale.value = "native";
+    if (wmOutputFps) wmOutputFps.value = "native";
+    if (wmEnhance) wmEnhance.value = "off";
+    setWmStatus("已切換為快速模式（關閉超分/升幀）");
+  });
+
+  wmQuality?.addEventListener("click", () => {
+    if (wmMethod) wmMethod.value = "";
+    if (wmStrength) wmStrength.value = "normal";
+    if (wmOutputScale) wmOutputScale.value = "4k";
+    if (wmOutputFps) wmOutputFps.value = "120";
+    if (wmEnhance) wmEnhance.value = "sr";
+    setWmStatus("已切換為高畫質模式（較慢）");
+  });
+
   wmForm.addEventListener("submit", async (e) => {
     e.preventDefault();
     if (!selectedFile) {
@@ -341,12 +370,21 @@ input.addEventListener("input", () => {
     if (wmMethod?.value) {
       fd.append("wm_method", wmMethod.value);
     }
+    if (wmOutputScale?.value) {
+      fd.append("output_scale", wmOutputScale.value);
+    }
+    if (wmOutputFps?.value) {
+      fd.append("output_fps", wmOutputFps.value);
+    }
+    if (wmEnhance?.value) {
+      fd.append("enhance", wmEnhance.value);
+    }
 
     const useCustom = wmCustom && !wmCustom.classList.contains("hidden");
     if (useCustom) {
       const x = document.getElementById("wm-x")?.value;
       const y = document.getElementById("wm-y")?.value;
-      const w = document.getElementBy("wm-w")?.value;
+      const w = document.getElementById("wm-w")?.value;
       const h = document.getElementById("wm-h")?.value;
       if (x !== "" && y !== "" && w !== "" && h !== "") {
         fd.append("x", x);
@@ -369,6 +407,13 @@ input.addEventListener("input", () => {
     }
 
     async function pollWmJob(jobId) {
+      const selectedEnhance = (wmEnhance?.value || "").toLowerCase();
+      const selectedScale = (wmOutputScale?.value || "").toLowerCase();
+      const selectedFps = (wmOutputFps?.value || "").toLowerCase();
+      let timeoutSec = 30 * 60;
+      if (selectedEnhance === "sr") timeoutSec += 45 * 60;
+      if (selectedScale === "4k") timeoutSec += 25 * 60;
+      if (selectedFps === "120") timeoutSec += 15 * 60;
       while (true) {
         const elapsed = Math.floor((Date.now() - started) / 1000);
         let res;
@@ -386,30 +431,41 @@ input.addEventListener("input", () => {
 
         if (data.status === "completed") {
           const previewUrl = data.preview_url || data.download_url;
-          wmPreview.src = previewUrl;
-          wmDownload.href = data.download_url || previewUrl;
+          wmPreview.src = apiUrl(previewUrl);
+          wmDownload.href = apiUrl(data.download_url || previewUrl);
           wmDownload.download = `去水印_${selectedFile.name.replace(/\.[^.]+$/, "")}.mp4`;
 
           const regions = data.regions || [];
           const mb = ((data.size || 0) / 1024 / 1024).toFixed(1);
+          const region = data.region || {};
+          const outW = region.output_width;
+          const outH = region.output_height;
+          const outFps = region.output_fps;
+          const backend = region.enhance_backend || "";
+      const outHint =
+            outW && outH
+              ? `${outW}×${outH}${outFps ? ` · ${outFps}fps` : ""}${backend && backend !== "lanczos" ? ` · ${backend}` : ""}`
+              : "";
           const regionHint =
             regions.length > 1
               ? `已去除 ${regions.length} 个区域`
               : regions[0]
                 ? `区域 ${regions[0].w}×${regions[0].h}`
                 : "";
-          setWmStatus(
-            `完成（约 ${mb} MB，用时 ${formatElapsed(elapsed)}）${regionHint ? "。" + regionHint : ""}`,
-            "ok"
-          );
+          const parts = [
+            `完成（约 ${mb} MB，用时 ${formatElapsed(elapsed)}）`,
+            outHint,
+            regionHint,
+          ].filter(Boolean);
+          setWmStatus(parts.join(" · "), "ok");
           wmResult.classList.remove("hidden");
           return;
         }
         if (data.status === "failed") {
           throw new Error(data.error || "去水印失败");
         }
-        if (elapsed > 1200) {
-          throw new Error("处理超过 20 分钟，请换更短视频或先试「仅右下角」单区域");
+        if (elapsed > timeoutSec) {
+          throw new Error("處理時間過長：建議先用「快速模式」，或關閉 AI 超分 / 4K / 120fps");
         }
         await new Promise((r) => {
           pollTimer = setTimeout(r, 1500);
@@ -443,6 +499,199 @@ input.addEventListener("input", () => {
   });
 })();
 
+/* —— 批次圖片去水印 —— */
+(function initImageBatchTool() {
+  const form = document.getElementById("wm-img-form");
+  const filesInput = document.getElementById("wm-img-files");
+  const filesMultiInput = document.getElementById("wm-img-files-multi");
+  const label = document.getElementById("wm-img-label");
+  const labelMulti = document.getElementById("wm-img-label-multi");
+  const position = document.getElementById("wm-img-position");
+  const strength = document.getElementById("wm-img-strength");
+  const submit = document.getElementById("wm-img-submit");
+  const submitMobile = document.getElementById("wm-img-submit-mobile");
+  const status = document.getElementById("wm-img-status");
+  const result = document.getElementById("wm-img-result");
+  const resultMobile = document.getElementById("wm-img-result-mobile");
+  const savePhotosBtn = document.getElementById("wm-img-save-photos");
+  const previewGallery = document.getElementById("wm-img-preview-gallery");
+  const download = document.getElementById("wm-img-download");
+  const isMobileWeb = Boolean(window.HongguoPlatform?.get()?.isMobileWeb);
+  if (!form || (!filesInput && !filesMultiInput)) return;
+
+  let picked = [];
+  let mobileProcessedFiles = [];
+
+  function setStatus(text, type = "") {
+    status.textContent = text;
+    status.className = `wm-status ${type}`.trim();
+    status.classList.remove("hidden");
+  }
+
+  function updatePicked(files, emptyLabel, labelEl) {
+    picked = Array.from(files || []).filter((f) => {
+      const n = (f.name || "").toLowerCase();
+      return (
+        (f.type || "").startsWith("image/") ||
+        /\.(png|jpe?g|webp|gif|bmp|heic|heif)$/i.test(n)
+      );
+    });
+    const total = picked.reduce((s, f) => s + (f.size || 0), 0);
+    const mb = (total / 1024 / 1024).toFixed(1);
+    if (labelEl) {
+      labelEl.textContent = picked.length
+        ? `已選 ${picked.length} 張圖片（${mb} MB）`
+        : emptyLabel;
+    }
+    if (submit) submit.disabled = picked.length < 1;
+    if (submitMobile) submitMobile.disabled = picked.length < 1;
+    result?.classList.add("hidden");
+    resultMobile?.classList.add("hidden");
+    previewGallery?.classList.add("hidden");
+    window.HongguoMobileSave?.revokePreviews?.();
+    mobileProcessedFiles = [];
+  }
+
+  filesInput?.addEventListener("change", () => {
+    updatePicked(filesInput.files, "點擊選擇資料夾（批次圖片）", label);
+  });
+
+  filesMultiInput?.addEventListener("change", () => {
+    updatePicked(filesMultiInput.files, "點擊多選圖片（批次）", labelMulti);
+  });
+
+  async function processOneImage(file) {
+    const fd = new FormData();
+    fd.append("file", file);
+    fd.append("position", position?.value || "douyin");
+    fd.append("strength", strength?.value || "tight");
+    const res = await fetch("/api/tools/remove-watermark-image", {
+      method: "POST",
+      body: fd,
+    });
+    if (!res.ok) {
+      let msg = `去水印失敗（HTTP ${res.status}）`;
+      try {
+        const j = await res.json();
+        msg = j.detail || msg;
+      } catch {
+        /* ignore */
+      }
+      throw new Error(msg);
+    }
+    let blob = await res.blob();
+    if (!blob.size) throw new Error("服務器返回空圖片");
+    const mime = (res.headers.get("content-type") || blob.type || "image/jpeg").split(";")[0];
+    if (!blob.type && mime) blob = new Blob([blob], { type: mime });
+    return window.HongguoMobileSave?.blobToFile
+      ? window.HongguoMobileSave.blobToFile(blob, file.name)
+      : new File([blob], `${file.name || "image"}_wm.jpg`, {
+          type: blob.type || "image/jpeg",
+        });
+  }
+
+  async function runMobileBatch() {
+    mobileProcessedFiles = [];
+    resultMobile?.classList.add("hidden");
+    const errors = [];
+    for (let i = 0; i < picked.length; i += 1) {
+      const file = picked[i];
+      setStatus(`正在處理 ${i + 1}/${picked.length} 張…`);
+      try {
+        mobileProcessedFiles.push(await processOneImage(file));
+      } catch (err) {
+        errors.push(`${file.name}: ${err.message || err}`);
+      }
+    }
+    if (!mobileProcessedFiles.length) {
+      throw new Error(errors[0] || "全部處理失敗");
+    }
+    resultMobile?.classList.remove("hidden");
+    setStatus(
+      `完成 ${mobileProcessedFiles.length} 張${errors.length ? `，${errors.length} 張失敗` : ""}，請點「保存到相冊」或長按下方預覽圖`,
+      errors.length ? "error" : "ok"
+    );
+    window.HongguoMobileSave?.renderGallery?.(previewGallery, mobileProcessedFiles);
+  }
+
+  async function saveMobileToPhotos() {
+    if (!mobileProcessedFiles.length) {
+      setStatus("請先完成去水印", "error");
+      return;
+    }
+    if (!window.HongguoMobileSave?.saveFiles) {
+      window.HongguoMobileSave?.renderGallery?.(previewGallery, mobileProcessedFiles);
+      setStatus("請長按下方預覽圖保存到相冊", "ok");
+      return;
+    }
+    savePhotosBtn.disabled = true;
+    setStatus("正在打開保存方式…");
+    try {
+      const out = await window.HongguoMobileSave.saveFiles(mobileProcessedFiles, {
+        title: "去水印圖片",
+        galleryEl: previewGallery,
+      });
+      if (out.mode === "share") {
+        setStatus(`已發起分享（${out.count} 張），請在系統菜單選「儲存圖像」`, "ok");
+      } else {
+        setStatus(`請長按下方 ${out.count} 張預覽圖 → 加入照片`, "ok");
+      }
+    } catch (err) {
+      if (err?.name === "AbortError") {
+        setStatus("已取消，可長按預覽圖保存", "error");
+      } else {
+        setStatus(err.message || "保存失敗，請長按預覽圖", "error");
+      }
+    } finally {
+      savePhotosBtn.disabled = false;
+    }
+  }
+
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    if (!picked.length) {
+      setStatus(isMobileWeb ? "請先多選圖片" : "請先選擇資料夾", "error");
+      return;
+    }
+    if (submit) submit.disabled = true;
+    if (submitMobile) submitMobile.disabled = true;
+    result?.classList.add("hidden");
+    resultMobile?.classList.add("hidden");
+    try {
+      if (isMobileWeb) {
+        await runMobileBatch();
+      } else {
+        setStatus("正在批次處理圖片…");
+        const fd = new FormData();
+        for (const f of picked) fd.append("files", f);
+        fd.append("position", position?.value || "douyin");
+        fd.append("strength", strength?.value || "tight");
+        const res = await fetch("/api/tools/remove-watermark-images", {
+          method: "POST",
+          body: fd,
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data.detail || "批次處理失敗");
+        }
+        download.href = apiUrl(data.zip_url);
+        download.setAttribute("download", "wm_images.zip");
+        result?.classList.remove("hidden");
+        const failCount = Array.isArray(data.failed) ? data.failed.length : 0;
+        setStatus(`完成：成功 ${data.processed} 張，失敗 ${failCount} 張`, "ok");
+      }
+    } catch (err) {
+      setStatus(err.message || "批次處理失敗", "error");
+    } finally {
+      if (submit) submit.disabled = picked.length < 1;
+      if (submitMobile) submitMobile.disabled = picked.length < 1;
+    }
+  });
+
+  savePhotosBtn?.addEventListener("click", saveMobileToPhotos);
+
+})();
+
 /* —— 抖音分享缓存 —— */
 (function initDouyinCacheTool() {
   const dyForm = document.getElementById("dy-form");
@@ -464,7 +713,6 @@ input.addEventListener("input", () => {
   const dyPreview = document.getElementById("dy-preview");
   const dyDownload = document.getElementById("dy-download");
   const dyMeta = document.getElementById("dy-meta");
-
   if (!dyForm || !dyShare) return;
 
   function setDyStatus(text, type = "") {
@@ -525,11 +773,11 @@ input.addEventListener("input", () => {
       if (!previewUrl) {
         throw new Error("服务器未返回视频地址");
       }
-      const bust = `${previewUrl}${previewUrl.includes("?") ? "&" : "?"}t=${Date.now()}`;
+      const bust = `${apiUrl(previewUrl)}${previewUrl.includes("?") ? "&" : "?"}t=${Date.now()}`;
       dyPreview.removeAttribute("src");
       dyPreview.load();
       dyPreview.src = bust;
-      dyDownload.href = downloadUrl;
+      dyDownload.href = apiUrl(downloadUrl);
       dyDownload.removeAttribute("download");
       const nameBase = String(data.aweme_id || "douyin").replace(/\D/g, "") || "douyin";
       dyDownload.setAttribute("download", `douyin_${nameBase}.mp4`);
@@ -550,4 +798,52 @@ input.addEventListener("input", () => {
       dySubmit.disabled = false;
     }
   });
+
+})();
+
+/* —— 手機 / 局域網訪問地址 —— */
+(function initLanAccessHint() {
+  const el = document.getElementById("mobile-access-url");
+  const hint = document.getElementById("lan-access-hint");
+  const copyBtn = document.getElementById("lan-access-copy");
+  if (!el) return;
+
+  async function loadLanAccess() {
+    const host = globalThis.location?.hostname;
+    const port = globalThis.location?.port || "8000";
+    if (host && host !== "localhost" && host !== "127.0.0.1") {
+      el.textContent = globalThis.location.origin;
+      return globalThis.location.origin;
+    }
+    try {
+      const res = await fetch("/api/lan-access");
+      const data = await res.json();
+      const url = data.lan_url || `http://${data.lan_ip || "你的電腦IP"}:${data.port || port}`;
+      el.textContent = url;
+      if (hint && data.hint && window.HongguoPlatform?.get()?.isDesktopBrowser) {
+        hint.textContent = "請把手機連到與電腦相同的 WiFi，再打開上方地址。";
+        hint.classList.remove("hidden");
+      }
+      return url;
+    } catch {
+      el.textContent = `http://你的電腦IP:${port}`;
+      return null;
+    }
+  }
+
+  copyBtn?.addEventListener("click", async () => {
+    const url = el.textContent || (await loadLanAccess());
+    if (!url || url.includes("你的電腦")) return;
+    try {
+      await navigator.clipboard.writeText(url);
+      copyBtn.textContent = "已複製";
+      setTimeout(() => {
+        copyBtn.textContent = "複製";
+      }, 1500);
+    } catch {
+      /* ignore */
+    }
+  });
+
+  loadLanAccess();
 })();

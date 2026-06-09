@@ -1,0 +1,4 @@
+# 可选：画质增强依赖（默认使用内置 ncnn-vulkan，无需安装本文件）
+# 若需 PyTorch 版 Real-ESRGAN，可手动安装：
+# py -3.12 -m pip install -r requirements-enhance.txt
+httpx>=0.28.0

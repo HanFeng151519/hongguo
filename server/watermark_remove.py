@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextvars
+import json
 import logging
 import os
 import re
@@ -19,7 +21,19 @@ logger = logging.getLogger(__name__)
 
 _delogo_caps_cache: dict[str, bool] | None = None
 
+# 单次去水印任务输出（线程内 contextvars，避免并发互相覆盖）
+_wm_job_scale: contextvars.ContextVar[str] = contextvars.ContextVar("wm_job_scale", default="")
+_wm_job_fps: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "wm_job_fps", default=-2
+)  # -2=未设用环境变量, -1=跟原片, >0=指定帧率
+_wm_source_fps: contextvars.ContextVar[float] = contextvars.ContextVar("wm_source_fps", default=0.0)
+_wm_job_enhance: contextvars.ContextVar[str] = contextvars.ContextVar("wm_job_enhance", default="")
+
+PORTRAIT_4K = (2160, 3840)
+LANDSCAPE_4K = (3840, 2160)
+
 PositionPreset = Literal[
+    "douyin",
     "doubao",
     "bottom-right",
     "bottom-left",
@@ -30,6 +44,7 @@ PositionPreset = Literal[
 ]
 
 PRESET_LABELS: dict[str, str] = {
+    "douyin": "抖音角标（仅右下小条，推荐）",
     "doubao": "豆包 AI（右下 + 左上，位置不固定时推荐）",
     "bottom-right": "仅右下角",
     "bottom-left": "仅左下角",
@@ -157,7 +172,139 @@ def _hqdn3d_vf(*, for_delogo: bool) -> str:
     return f"hqdn3d={luma}:{chroma}:{tc}:{cc}"
 
 
+def _parse_fps_value(raw: str) -> float:
+    raw = (raw or "").strip()
+    if not raw:
+        return 0.0
+    if "/" in raw:
+        num, den = raw.split("/", 1)
+        try:
+            d = float(den)
+            return float(num) / d if d > 0 else 0.0
+        except ValueError:
+            return 0.0
+    try:
+        return float(raw)
+    except ValueError:
+        return 0.0
+
+
+def probe_video_fps(path: Path) -> float:
+    """读取源片帧率；失败时回退 30。"""
+    ffprobe = resolve_ffprobe_exe()
+    if ffprobe:
+        try:
+            proc = subprocess.run(
+                [
+                    ffprobe,
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "stream=avg_frame_rate,r_frame_rate",
+                    "-of",
+                    "json",
+                    str(path),
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+            )
+            if proc.returncode == 0 and proc.stdout:
+                data = json.loads(proc.stdout)
+                streams = data.get("streams") or []
+                if streams:
+                    st = streams[0]
+                    for key in ("avg_frame_rate", "r_frame_rate"):
+                        fps = _parse_fps_value(str(st.get(key) or ""))
+                        if fps >= 1:
+                            return fps
+        except (ValueError, OSError, json.JSONDecodeError):
+            pass
+
+    ffmpeg = resolve_ffmpeg_exe()
+    proc = subprocess.run(
+        [ffmpeg, "-hide_banner", "-i", str(path)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+    )
+    for line in (proc.stderr or "").splitlines():
+        m = re.search(r"(\d+(?:\.\d+)?)\s*fps", line, re.I)
+        if m:
+            return max(1.0, float(m.group(1)))
+    return 30.0
+
+
+def normalize_output_scale(value: str | None) -> str:
+    v = (value or "").strip().lower()
+    if v in ("native", "source", "原画", "0", "original"):
+        return "native"
+    if v in ("4k", "2160", "uhd", "4khd"):
+        return "4k"
+    if v in ("1080", "1080p", "standard", "hd", ""):
+        return "1080"
+    return "1080"
+
+
+def normalize_output_fps_choice(value: str | int | None) -> int:
+    """
+    返回 context 用的帧率选择：
+    -2 未指定（读环境变量）
+    -1 跟原片
+    >0 目标帧率（上限 120）
+    """
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return -2
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in ("native", "source", "原片", "0", "original"):
+            return -1
+        try:
+            n = int(v)
+        except ValueError:
+            return -2
+        if n <= 0:
+            return -1
+        return max(1, min(120, n))
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return -2
+    if n <= 0:
+        return -1
+    return max(1, min(120, n))
+
+
+def resolve_wm_output_spec(src_w: int, src_h: int, scale: str):
+    from output_canvas import CanvasSpec, PORTRAIT_SIZE, LANDSCAPE_SIZE, _label_for
+
+    portrait = src_h > src_w * 1.05
+    key = normalize_output_scale(scale)
+    if key == "native":
+        w, h = _even(src_w), _even(src_h)
+        return CanvasSpec(w, h, _label_for(w, h))
+    if key == "4k":
+        w, h = (PORTRAIT_4K if portrait else LANDSCAPE_4K)
+        return CanvasSpec(_even(w), _even(h), f"{'9:16' if portrait else '16:9'} 4K")
+    w, h = (PORTRAIT_SIZE if portrait else LANDSCAPE_SIZE)
+    return CanvasSpec(w, h, f"{'9:16' if portrait else '16:9'}")
+
+
 def output_fps() -> int:
+    job_fps = _wm_job_fps.get()
+    if job_fps == -1:
+        src_fps = _wm_source_fps.get()
+        if src_fps >= 1:
+            return max(1, min(120, int(round(src_fps))))
+        return 30
+    if job_fps >= 1:
+        return min(120, job_fps)
     try:
         raw = os.getenv("HONGGUO_WM_OUTPUT_FPS") or os.getenv("HONGGUO_OUTPUT_FPS", "60")
         return max(1, min(120, int(raw or 60)))
@@ -170,6 +317,10 @@ def _fps_vf() -> str:
 
 
 def _output_canvas_spec(src_w: int, src_h: int):
+    job_scale = _wm_job_scale.get()
+    if job_scale:
+        return resolve_wm_output_spec(src_w, src_h, job_scale)
+
     from output_canvas import canvas_from_source_size
 
     w_env = os.getenv("HONGGUO_WM_OUTPUT_WIDTH", "").strip()
@@ -555,16 +706,39 @@ def _doubao_scales(profile: _WmProfile) -> tuple[float, float]:
     return max(0.12, min(0.38, sw)), max(0.05, min(0.18, sh))
 
 
-def _scales_for_corner(corner: str, profile: _WmProfile) -> tuple[float, float]:
-    """豆包：左上是横条，右下「豆包AI生成」条需更宽、略上移。"""
+def _douyin_scales(strength: str | None = None) -> tuple[float, float]:
+    """抖音角标多为右下小条（OCR 常识别不到图形 logo）。"""
+    key = wm_strength(strength)
+    table = {
+        # 右下水印（你这类截图）通常“很靠右、很靠下、宽但不高”
+        # 需要给宽度足够空间，否则会出现“漏掉一截”的漏洞。
+        "tight": (0.26, 0.038),
+        "normal": (0.28, 0.042),
+        "strong": (0.30, 0.048),
+    }
+    sw, sh = table.get(key, table["normal"])
+    sw = _env_float("HONGGUO_WM_DOUYIN_SCALE_W", sw)
+    sh = _env_float("HONGGUO_WM_DOUYIN_SCALE_H", sh)
+    return max(0.10, min(0.45, sw)), max(0.03, min(0.14, sh))
+
+
+def _scales_for_corner(
+    corner: str,
+    profile: _WmProfile,
+    *,
+    preset: str = "",
+) -> tuple[float, float]:
+    """豆包预设才放大底角；普通「仅右下角」用 profile 默认比例。"""
     c = corner.strip().lower()
+    p = (preset or "").strip().lower()
     sw, sh = profile.scale_w, profile.scale_h
-    if c == "top-left":
-        sw = max(sw, _env_float("HONGGUO_WM_TOPLEFT_SCALE_W", 0.28))
-        sh = max(sh, _env_float("HONGGUO_WM_TOPLEFT_SCALE_H", 0.075))
-    elif c in ("bottom-right", "bottom-left"):
-        sw = max(sw, _env_float("HONGGUO_WM_BOTTOM_SCALE_W", 0.42))
-        sh = max(sh, _env_float("HONGGUO_WM_BOTTOM_SCALE_H", 0.145))
+    if p == "doubao":
+        if c == "top-left":
+            sw = max(sw, _env_float("HONGGUO_WM_TOPLEFT_SCALE_W", 0.28))
+            sh = max(sh, _env_float("HONGGUO_WM_TOPLEFT_SCALE_H", 0.075))
+        elif c in ("bottom-right", "bottom-left"):
+            sw = max(sw, _env_float("HONGGUO_WM_BOTTOM_SCALE_W", 0.42))
+            sh = max(sh, _env_float("HONGGUO_WM_BOTTOM_SCALE_H", 0.145))
     return sw, sh
 
 
@@ -583,6 +757,58 @@ def _expand_rect(
     w = min(vw - x, w + 2 * p)
     h = min(vh - y, h + 2 * p)
     return _even(x), _even(y), _even(w), _even(h)
+
+
+def refine_douyin_rects(
+    frame,
+    rects: list[tuple[int, int, int, int]],
+    *,
+    pad: int = 8,
+) -> list[tuple[int, int, int, int]]:
+    """根据右下白色角标（小云雀AI 等）自动框选，必须盖住整段白字。"""
+    import cv2
+    import numpy as np
+
+    if frame is None or not rects:
+        return rects
+
+    vh, vw = frame.shape[:2]
+    zsy = max(0, int(vh * 0.91))
+    zsx = max(0, int(vw * 0.72))
+    zone = frame[zsy:vh, zsx:vw]
+    if zone.size < 64:
+        return rects
+
+    gray = cv2.cvtColor(zone, cv2.COLOR_BGR2GRAY)
+    _, th = cv2.threshold(gray, 198, 255, cv2.THRESH_BINARY)
+    k = cv2.getStructuringElement(cv2.MORPH_RECT, (11, 3))
+    th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, k, iterations=2)
+    cnts, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return rects
+
+    pick: tuple[int, int, int, int] | None = None
+    for c in cnts:
+        bx, by, bw, bh = cv2.boundingRect(c)
+        if bw * bh < 100 or bw < 40 or bh < 8 or bh > 80:
+            continue
+        gx = zsx + bx
+        if gx < int(vw * 0.68):
+            continue
+        if pick is None or gx + bw > pick[0]:
+            pick = (gx + bw, bx, by, bw, bh)
+
+    if pick is None:
+        return rects
+
+    _, bx, by, bw, bh = pick
+    nx = max(int(vw * 0.68), zsx + bx - pad)
+    ny = max(0, zsy + by - pad)
+    x2 = min(vw, zsx + bx + bw + pad)
+    y2 = vh
+    nw = min(max(48, x2 - nx), int(vw * 0.22))
+    nh = max(18, y2 - ny)
+    return [(nx, ny, nw, nh)]
 
 
 def rects_for_preset_geometric(
@@ -605,9 +831,22 @@ def rects_for_preset_geometric(
         raw = (0, y, _even(width), h)
         return [_expand_rect(width, height, raw, pad=pad)]
 
+    if p == "douyin":
+        dsw, dsh = _douyin_scales(strength)
+        raw = _corner_rect(
+            width, height, "bottom-right", margin_pct=0.0, scale_w=dsw, scale_h=dsh
+        )
+        x, y, rw, rh = raw
+        right_gap = _env_int("HONGGUO_WM_DOUYIN_RIGHT_MARGIN", 4)
+        y = _even(max(0, height - rh))
+        x = _even(max(0, width - rw - right_gap))
+        raw = (x, y, rw, rh)
+        dy_pad = min(pad, _env_int("HONGGUO_WM_DOUYIN_PAD", 6))
+        return [_expand_rect(width, height, raw, pad=dy_pad)]
+
     if p == "doubao":
-        br_sw, br_sh = _scales_for_corner("bottom-right", prof)
-        tl_sw, tl_sh = _scales_for_corner("top-left", prof)
+        br_sw, br_sh = _scales_for_corner("bottom-right", prof, preset=p)
+        tl_sw, tl_sh = _scales_for_corner("top-left", prof, preset=p)
         raw = [
             _corner_rect(
                 width, height, "bottom-right", margin_pct=margin_pct, scale_w=br_sw, scale_h=br_sh
@@ -622,13 +861,13 @@ def rects_for_preset_geometric(
         corners = ("top-left", "top-right", "bottom-left", "bottom-right")
         raw = []
         for c in corners:
-            csw, csh = _scales_for_corner(c, prof)
+            csw, csh = _scales_for_corner(c, prof, preset=p)
             raw.append(
                 _corner_rect(width, height, c, margin_pct=margin_pct, scale_w=csw, scale_h=csh)
             )
         return [_expand_rect(width, height, r, pad=pad) for r in raw]
 
-    csw, csh = _scales_for_corner(p, prof)
+    csw, csh = _scales_for_corner(p, prof, preset=p)
     raw = _corner_rect(width, height, p, margin_pct=margin_pct, scale_w=csw, scale_h=csh)
     return [_expand_rect(width, height, raw, pad=pad)]
 
@@ -728,6 +967,7 @@ def _build_delogo_vf(
     out_w: int,
     out_h: int,
     scale_first: bool,
+    defer_output: bool = False,
 ) -> str:
     band = _env_int("HONGGUO_WM_DELOGO_BAND", profile.delogo_band)
     parts: list[str] = []
@@ -739,11 +979,12 @@ def _build_delogo_vf(
         if _env_int("HONGGUO_WM_DEFLICKER", 1):
             chain += f",{_hqdn3d_vf(for_delogo=True)}"
         chain += f",{_tmix_vf()}"
-    chain += f",{_fps_vf()}"
-    if not scale_first:
-        scale = _scale_vf(src_w, src_h)
-        if scale:
-            chain += f",{scale}"
+    if not defer_output:
+        chain += f",{_fps_vf()}"
+        if not scale_first:
+            scale = _scale_vf(src_w, src_h)
+            if scale:
+                chain += f",{scale}"
     return chain
 
 
@@ -756,6 +997,7 @@ def _build_blur_cover_filter_complex(
     out_w: int,
     out_h: int,
     scale_first: bool,
+    defer_output: bool = False,
 ) -> tuple[str, str]:
     """
     高斯模糊后不透明叠回（默认）；HONGGUO_WM_FEATHER>0 时边缘羽化。
@@ -793,12 +1035,15 @@ def _build_blur_cover_filter_complex(
         steps.append(f"[b{i}][p{i}]overlay={ox}:{oy}{out}")
         current = out
 
-    tail = _fps_vf()
-    if not scale_first:
-        scale = _scale_vf(src_w, src_h)
-        if scale:
-            tail += f",{scale}"
-    steps.append(f"{current}{tail}[vout]")
+    if defer_output:
+        steps.append(f"{current}null[vout]")
+    else:
+        tail = _fps_vf()
+        if not scale_first:
+            scale = _scale_vf(src_w, src_h)
+            if scale:
+                tail += f",{scale}"
+        steps.append(f"{current}{tail}[vout]")
 
     return ";".join(steps), "[vout]"
 
@@ -871,6 +1116,48 @@ def _run_ffmpeg(
         raise RuntimeError(f"去水印失败: {tail}")
 
 
+def _current_enhance() -> str:
+    from video_enhance import normalize_enhance
+
+    job = _wm_job_enhance.get()
+    return normalize_enhance(job if job else None)
+
+
+def _emit_final_output(
+    video: Path,
+    audio_src: Path,
+    dest: Path,
+    *,
+    src_w: int,
+    src_h: int,
+    out_w: int,
+    out_h: int,
+) -> str:
+    """OpenCV/FFmpeg 中间片 → 可选 Real-ESRGAN 超分 → 缩放/插帧 → 混音。"""
+    from video_enhance import apply_sr_output, mux_video, sr_enabled
+
+    fps = output_fps()
+    if sr_enabled(_current_enhance()):
+        return apply_sr_output(
+            video,
+            audio_src,
+            dest,
+            src_w=src_w,
+            src_h=src_h,
+            out_w=out_w,
+            out_h=out_h,
+            fps=fps,
+        )
+
+    vf_parts: list[str] = []
+    if out_w != src_w or out_h != src_h:
+        vf_parts.append(f"scale={out_w}:{out_h}:flags=lanczos")
+    if fps > 0:
+        vf_parts.append(f"fps={fps}")
+    mux_video(video, audio_src, dest, vf=",".join(vf_parts) if vf_parts else None)
+    return "lanczos"
+
+
 def _finalize_inpaint_video(
     video: Path,
     audio_src: Path,
@@ -880,50 +1167,17 @@ def _finalize_inpaint_video(
     src_h: int,
     out_w: int,
     out_h: int,
-) -> None:
-    """OpenCV 输出后：缩放、帧率、音频、H.264。"""
-    vf_parts: list[str] = []
-    if out_w != src_w or out_h != src_h:
-        vf_parts.append(f"scale={out_w}:{out_h}:flags=lanczos")
-    vf_parts.append(_fps_vf())
-    vf = ",".join(vf_parts)
-    ffmpeg = resolve_ffmpeg_exe()
-    crf = os.getenv("HONGGUO_WM_CRF", "21").strip() or "21"
-    preset = os.getenv("HONGGUO_WM_ENCODE_PRESET", "medium").strip() or "medium"
-    args = [
-        ffmpeg,
-        "-y",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-i",
-        str(video),
-        "-i",
-        str(audio_src),
-        "-vf",
-        vf,
-        "-map",
-        "0:v",
-        "-map",
-        "1:a?",
-        "-c:v",
-        "libx264",
-        "-preset",
-        preset,
-        "-crf",
-        crf,
-        "-pix_fmt",
-        "yuv420p",
-        "-c:a",
-        "copy",
-        "-movflags",
-        "+faststart",
-        str(dest),
-    ]
-    proc = subprocess.run(args, capture_output=True, text=True, timeout=2400)
-    if proc.returncode != 0:
-        tail = (proc.stderr or proc.stdout or "")[-800:]
-        raise RuntimeError(f"合成输出失败: {tail}")
+) -> str:
+    """OpenCV 输出后：超分/缩放、帧率、音频、H.264。"""
+    return _emit_final_output(
+        video,
+        audio_src,
+        dest,
+        src_w=src_w,
+        src_h=src_h,
+        out_w=out_w,
+        out_h=out_h,
+    )
 
 
 def remove_watermark(
@@ -937,12 +1191,54 @@ def remove_watermark(
     y: int | None = None,
     w: int | None = None,
     h: int | None = None,
+    output_scale: str | None = None,
+    output_fps_choice: str | int | None = None,
+    enhance: str | None = None,
 ) -> dict[str, int | str | list]:
     if not src.is_file():
         raise RuntimeError("源视频不存在")
     if src.stat().st_size < 10_000:
         raise RuntimeError("视频文件过小或已损坏")
 
+    from video_enhance import normalize_enhance
+
+    scale_tok = _wm_job_scale.set(normalize_output_scale(output_scale) if output_scale else "")
+    fps_tok = _wm_job_fps.set(normalize_output_fps_choice(output_fps_choice))
+    src_fps_tok = _wm_source_fps.set(probe_video_fps(src))
+    enhance_tok = _wm_job_enhance.set(
+        normalize_enhance(enhance) if enhance else normalize_enhance(None)
+    )
+    try:
+        return _remove_watermark_impl(
+            src,
+            dest,
+            preset=preset,
+            strength=strength,
+            method=method,
+            x=x,
+            y=y,
+            w=w,
+            h=h,
+        )
+    finally:
+        _wm_job_scale.reset(scale_tok)
+        _wm_job_fps.reset(fps_tok)
+        _wm_source_fps.reset(src_fps_tok)
+        _wm_job_enhance.reset(enhance_tok)
+
+
+def _remove_watermark_impl(
+    src: Path,
+    dest: Path,
+    *,
+    preset: str,
+    strength: str,
+    method: str | None,
+    x: int | None,
+    y: int | None,
+    w: int | None,
+    h: int | None,
+) -> dict[str, int | str | list]:
     vw, vh = probe_video_size(src)
     if x is not None and y is not None and w is not None and h is not None:
         rects = [rect_from_custom(vw, vh, x, y, w, h)]
@@ -964,6 +1260,10 @@ def remove_watermark(
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.unlink(missing_ok=True)
 
+    use_sr = _current_enhance() == "sr"
+    defer_output = use_sr
+    output_backend = "lanczos"
+
     method = wm_method(method)
     if method == "inpaint":
         if not opencv_inpaint_available():
@@ -980,11 +1280,11 @@ def remove_watermark(
         )
         dilate = _env_int(
             "HONGGUO_WM_INPAINT_DILATE",
-            16 if strength_used == "strong" else 13,
+            {"tight": 4, "normal": 6, "strong": 10}.get(strength_used, 6),
         )
         _validate_rects(vw, vh, rects_src)
         inpaint_video(src, work, rects_src, radius=radius, dilate_px=dilate, strength=strength_used)
-        _finalize_inpaint_video(
+        output_backend = _finalize_inpaint_video(
             work,
             src,
             dest,
@@ -1003,9 +1303,24 @@ def remove_watermark(
             src_h=vh,
             out_w=ow,
             out_h=oh,
-            scale_first=scale_first,
+            scale_first=scale_first and not defer_output,
+            defer_output=defer_output,
         )
-        _run_ffmpeg(src, dest, filter_complex=fc, map_video=vlabel)
+        if defer_output:
+            work = dest.with_suffix(".wmwork.mp4")
+            _run_ffmpeg(
+                src,
+                work,
+                filter_complex=fc,
+                map_video=vlabel,
+                apply_output_fps=False,
+            )
+            output_backend = _emit_final_output(
+                work, src, dest, src_w=vw, src_h=vh, out_w=ow, out_h=oh
+            )
+            work.unlink(missing_ok=True)
+        else:
+            _run_ffmpeg(src, dest, filter_complex=fc, map_video=vlabel)
         method_used = "blur_cover"
     else:
         vf = _build_delogo_vf(
@@ -1015,9 +1330,18 @@ def remove_watermark(
             src_h=vh,
             out_w=ow,
             out_h=oh,
-            scale_first=scale_first,
+            scale_first=scale_first and not defer_output,
+            defer_output=defer_output,
         )
-        _run_ffmpeg(src, dest, vf=vf)
+        if defer_output:
+            work = dest.with_suffix(".wmwork.mp4")
+            _run_ffmpeg(src, work, vf=vf, apply_output_fps=False)
+            output_backend = _emit_final_output(
+                work, src, dest, src_w=vw, src_h=vh, out_w=ow, out_h=oh
+            )
+            work.unlink(missing_ok=True)
+        else:
+            _run_ffmpeg(src, dest, vf=vf)
         method_used = "delogo"
 
     if not dest.is_file() or dest.stat().st_size < 10_000:
@@ -1057,6 +1381,10 @@ def remove_watermark(
         "video_height": vh,
         "output_width": out_spec.width,
         "output_height": out_spec.height,
+        "output_fps": output_fps(),
+        "output_label": out_spec.label,
+        "enhance": _current_enhance(),
+        "enhance_backend": output_backend,
         "regions": regions,
         "ocr": src is not None and mode != "custom",
         "tl_refine_segments": [

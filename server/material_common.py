@@ -146,6 +146,17 @@ def extract_douyin_share_url(text: str) -> str:
     return ""
 
 
+def is_toutiao_url(url: str) -> bool:
+    u = (url or "").lower()
+    return any(x in u for x in ("toutiao.com", "toutiaocdn.com"))
+
+
+def extract_toutiao_share_url(text: str) -> str:
+    from toutiao_crawler import extract_toutiao_share_url as _extract
+
+    return _extract(text)
+
+
 def is_kuaishou_url(url: str) -> bool:
     u = url.lower()
     return any(x in u for x in ("kuaishou.com", "kuaishou.cn", "chenzhongtech.com"))

@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -25,7 +26,9 @@ load_koc_session()
 import re
 import secrets
 import shutil
+import socket
 import subprocess
+import zipfile
 from datetime import date
 from pathlib import Path
 from typing import Any, Optional
@@ -64,7 +67,12 @@ from douyin_material import (
     fetch_douyin_body_source,
     resolve_share_url as resolve_douyin_share,
 )
-from material_common import extract_douyin_share_url, is_douyin_url, is_kuaishou_url
+from material_common import (
+    extract_douyin_share_url,
+    extract_toutiao_share_url,
+    is_douyin_url,
+    is_kuaishou_url,
+)
 from external_material import fetch_external_body_source
 from kuaishou_material import (
     MATERIAL_DIR,
@@ -130,9 +138,36 @@ DOWNLOAD_DIR = STATIC_DIR / "downloads"
 WM_UPLOAD_DIR = STATIC_DIR / "uploads" / "watermark"
 DOUYIN_CACHE_DIR = STATIC_DIR / "cache" / "douyin"
 WM_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+WM_JOBS_DIR = WM_UPLOAD_DIR / "jobs"
+WM_JOBS_DIR.mkdir(parents=True, exist_ok=True)
 WM_MAX_BYTES = 500 * 1024 * 1024
 WM_JOBS: dict[str, dict[str, Any]] = {}
 WM_JOBS_LOCK = asyncio.Lock()
+
+
+def _wm_job_file(job_id: str) -> Path:
+    safe = re.sub(r"[^\w\-]", "", job_id) or "job"
+    return WM_JOBS_DIR / f"{safe}.json"
+
+
+def _load_wm_job(job_id: str) -> dict[str, Any] | None:
+    path = _wm_job_file(job_id)
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except (OSError, json.JSONDecodeError, TypeError):
+        return None
+
+
+def _save_wm_job(job_id: str, job: dict[str, Any]) -> None:
+    path = _wm_job_file(job_id)
+    try:
+        payload = {**job, "job_id": job_id}
+        path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass
 TTS_CACHE_DIR = STATIC_DIR / "tts_cache"
 TTS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 DOWNLOAD_TTL_SEC = 3600
@@ -141,6 +176,15 @@ GENERATE_JOBS_LOCK = asyncio.Lock()
 
 @asynccontextmanager
 async def _app_lifespan(app: FastAPI):
+    if sys.platform == "win32":
+        lan = _lan_ipv4()
+        if lan:
+            port = int(os.environ.get("PORT", "8000"))
+            logging.getLogger("uvicorn.error").warning(
+                "【手机访问】http://%s:%s — 若手机打不开，请双击 scripts\\allow-firewall-8000.bat 并点「是」放行防火墙",
+                lan,
+                port,
+            )
     yield
     if browser_sync_available():
         await close_koc_browser()
@@ -356,12 +400,64 @@ async def search_dramas(
     }
 
 
+def _lan_ipv4() -> Optional[str]:
+    """本机局域网 IPv4（供手机浏览器访问）。"""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("8.8.8.8", 80))
+            return sock.getsockname()[0]
+    except OSError:
+        return None
+
+
+def _ascii_download_name(filename: str, fallback: str = "download") -> str:
+    safe = Path(filename).name
+    ascii_only = "".join(
+        c for c in safe if ord(c) < 128 and c not in ('"', "\\", "\r", "\n")
+    )
+    if not ascii_only.strip(". "):
+        suffix = Path(safe).suffix
+        return f"{fallback}{suffix}" if suffix else fallback
+    return ascii_only
+
+
+def _content_disposition(disposition: str, filename: str, fallback: str = "download") -> str:
+    """HTTP 头仅支持 latin-1；中文文件名用 filename* (RFC 5987)。"""
+    from urllib.parse import quote
+
+    safe = Path(filename).name
+    ascii_name = _ascii_download_name(safe, fallback=fallback)
+    if safe == ascii_name:
+        return f'{disposition}; filename="{ascii_name}"'
+    encoded = quote(safe, safe="")
+    return f'{disposition}; filename="{ascii_name}"; filename*=UTF-8\'\'{encoded}'
+
+
 @app.get("/api/health")
 async def health():
     return {
         "status": "ok",
         "api_base": API_BASE,
         "ffmpeg": FFMPEG,
+    }
+
+
+@app.get("/api/lan-access")
+async def lan_access(request: Request):
+    """返回手机在同一 WiFi 下应使用的访问地址。"""
+    host = request.url.hostname or "localhost"
+    port = request.url.port or 8000
+    lan_ip = _lan_ipv4()
+    lan_url = f"http://{lan_ip}:{port}" if lan_ip else None
+    return {
+        "lan_ip": lan_ip,
+        "lan_url": lan_url,
+        "port": port,
+        "local_url": f"http://127.0.0.1:{port}",
+        "hint": (
+            "手机与电脑连同一 WiFi，在浏览器打开 lan_url。"
+            "若打不开，请在 Windows 以管理员运行 scripts/allow-firewall-8000.ps1 放行 8000 端口。"
+        ),
     }
 
 
@@ -1322,7 +1418,11 @@ async def cache_douyin_from_share(body: DouyinCacheRequest):
             detail="文案中未找到 http 链接，请粘贴含 https:// 的分享内容",
         )
 
-    share = extract_douyin_share_url(share_text) or extract_all_http_urls(share_text)[0]
+    share = (
+        extract_douyin_share_url(share_text)
+        or extract_toutiao_share_url(share_text)
+        or extract_all_http_urls(share_text)[0]
+    )
     cookie = body.douyin_cookie.strip() or effective_douyin_cookie()
 
     DOUYIN_CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -1392,6 +1492,20 @@ async def cache_douyin_from_share(body: DouyinCacheRequest):
     }
 
 
+@app.get("/api/tools/sr-status")
+async def sr_status():
+    from video_enhance import SR_PIPELINE_VERSION, find_ncnn_exe, sr_available
+
+    exe = find_ncnn_exe()
+    return {
+        "ok": True,
+        "pipeline_version": SR_PIPELINE_VERSION,
+        "available": sr_available(),
+        "exe": str(exe) if exe else None,
+        "mode": "frames",
+    }
+
+
 @app.get("/api/tools/watermark-presets")
 async def list_watermark_presets():
     from watermark_remove import PRESET_LABELS
@@ -1408,6 +1522,7 @@ async def _set_wm_job(job_id: str, **fields: Any) -> None:
     async with WM_JOBS_LOCK:
         job = WM_JOBS.setdefault(job_id, {})
         job.update(fields)
+        _save_wm_job(job_id, job)
 
 
 async def _run_wm_job(
@@ -1423,17 +1538,27 @@ async def _run_wm_job(
     y: Optional[int],
     w: Optional[int],
     h: Optional[int],
+    output_scale: str = "",
+    output_fps_choice: str = "",
+    enhance: str = "",
 ) -> None:
     from watermark_remove import remove_watermark
 
     from watermark_remove import wm_method as resolve_wm_method
 
     method = resolve_wm_method(wm_method or None)
-    progress = (
-        "正在 OCR 定位水印并智能修复（逐帧计算，请耐心等待）…"
-        if method == "inpaint"
-        else "正在 OCR 定位水印并去水印（整段重编码，请耐心等待）…"
-    )
+    from video_enhance import sr_enabled
+
+    use_sr = sr_enabled(enhance or None)
+    if use_sr:
+        progress = (
+            "去水印后 Real-ESRGAN AI 超分中（可能 10–30 分钟，"
+            "请勿重启服务或使用 --reload）…"
+        )
+    elif method == "inpaint":
+        progress = "正在 OCR 定位水印并智能修复（逐帧计算，请耐心等待）…"
+    else:
+        progress = "正在 OCR 定位水印并去水印（整段重编码，请耐心等待）…"
     await _set_wm_job(job_id, status="running", progress=progress)
     try:
         meta = await asyncio.to_thread(
@@ -1447,6 +1572,9 @@ async def _run_wm_job(
             y=y if use_custom_rect else None,
             w=w if use_custom_rect else None,
             h=h if use_custom_rect else None,
+            output_scale=output_scale or None,
+            output_fps_choice=output_fps_choice or None,
+            enhance=enhance or None,
         )
         await _set_wm_job(
             job_id,
@@ -1461,11 +1589,14 @@ async def _run_wm_job(
     except Exception as exc:
         logging.getLogger(__name__).exception("watermark job %s failed", job_id)
         out.unlink(missing_ok=True)
+        err = str(exc)
+        if len(err) > 500:
+            err = err[:500] + "…"
         await _set_wm_job(
             job_id,
             status="failed",
             progress="处理失败",
-            error=str(exc),
+            error=err,
         )
     finally:
         src.unlink(missing_ok=True)
@@ -1475,9 +1606,21 @@ async def _run_wm_job(
 async def remove_video_watermark(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(..., description="本地 MP4/MOV 等视频"),
-    position: str = Form("doubao", description="水印位置预设"),
+    position: str = Form("douyin", description="水印位置预设"),
     strength: str = Form("normal", description="处理强度：tight/normal/strong"),
     wm_method: str = Form("", description="inpaint=智能修复 / blur_cover=快速模糊"),
+    output_scale: str = Form(
+        "",
+        description="输出分辨率：native/1080/4k（竖横屏自动）",
+    ),
+    output_fps: str = Form(
+        "",
+        description="输出帧率：native/60/120",
+    ),
+    enhance: str = Form(
+        "",
+        description="画质增强：off/sr（Real-ESRGAN AI 超分）",
+    ),
     x: Optional[int] = Form(None, description="自定义区域左上角 X（像素）"),
     y: Optional[int] = Form(None, description="自定义区域左上角 Y"),
     w: Optional[int] = Form(None, description="区域宽度"),
@@ -1526,6 +1669,16 @@ async def remove_video_watermark(
     est_sec = max(30, int(total / (1024 * 1024) * 45))
     if position in ("doubao", "all-corners"):
         est_sec = int(est_sec * 1.3)
+    scale_key = (output_scale or "").strip().lower()
+    if scale_key in ("4k", "2160", "uhd", "4khd"):
+        est_sec = int(est_sec * 2.2)
+    fps_key = (output_fps or "").strip().lower()
+    if fps_key in ("120", "120fps"):
+        est_sec = int(est_sec * 1.6)
+    elif fps_key in ("60", "60fps"):
+        est_sec = int(est_sec * 1.15)
+    if (enhance or "").strip().lower() in ("sr", "ai", "realesrgan", "超分", "1", "true", "on"):
+        est_sec = int(est_sec * 4)
 
     await _set_wm_job(
         job_id,
@@ -1547,6 +1700,9 @@ async def remove_video_watermark(
         y=y,
         w=w,
         h=h,
+        output_scale=output_scale,
+        output_fps_choice=output_fps,
+        enhance=enhance,
     )
 
     return {"ok": True, "job_id": job_id, "estimated_sec": est_sec}
@@ -1557,8 +1713,186 @@ async def get_watermark_job(job_id: str):
     async with WM_JOBS_LOCK:
         job = WM_JOBS.get(job_id)
     if not job:
+        job = _load_wm_job(job_id)
+        if job:
+            async with WM_JOBS_LOCK:
+                WM_JOBS[job_id] = job
+    if not job:
         raise HTTPException(status_code=404, detail="任务不存在或已过期，请重新上传")
     return {"ok": True, "job_id": job_id, **job}
+
+
+@app.get("/downloads/images/{job_id}.zip")
+async def download_wm_images_zip(job_id: str):
+    safe = re.sub(r"[^\w\-]", "", job_id)
+    if not safe:
+        raise HTTPException(status_code=404, detail="文件不存在或已过期")
+    path = DOWNLOAD_DIR / f"wm_images_{safe}.zip"
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="文件不存在或已过期")
+    return FileResponse(
+        path,
+        media_type="application/zip",
+        filename=path.name,
+        headers={"Content-Disposition": f'attachment; filename="{path.name}"'},
+    )
+
+
+@app.post("/api/tools/remove-watermark-images")
+async def remove_watermark_images(
+    background_tasks: BackgroundTasks,
+    files: list[UploadFile] = File(..., description="图片文件列表（可由文件夹批量选择）"),
+    position: str = Form("douyin", description="水印位置预设"),
+    strength: str = Form("normal", description="处理强度：tight/normal/strong"),
+    x: Optional[int] = Form(None, description="自定义区域左上角 X（像素）"),
+    y: Optional[int] = Form(None, description="自定义区域左上角 Y"),
+    w: Optional[int] = Form(None, description="区域宽度"),
+    h: Optional[int] = Form(None, description="区域高度"),
+):
+    from watermark_image import remove_watermark_image_bytes
+    from watermark_remove import PRESET_LABELS, wm_strength
+
+    if not files:
+        raise HTTPException(status_code=400, detail="请至少选择一张图片")
+    if len(files) > 500:
+        raise HTTPException(status_code=400, detail="单次最多处理 500 张图片")
+    use_custom_rect = all(v is not None for v in (x, y, w, h))
+    if not use_custom_rect and position not in PRESET_LABELS:
+        raise HTTPException(status_code=400, detail=f"未知预设 {position!r}")
+    strength = wm_strength(strength)
+
+    job_id = secrets.token_urlsafe(8)
+    work_dir = WM_UPLOAD_DIR / f"img_batch_{job_id}"
+    out_dir = work_dir / "out"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    total_bytes = 0
+    ok_files = 0
+    failed: list[dict[str, str]] = []
+    previews: list[str] = []
+    zip_path = DOWNLOAD_DIR / f"wm_images_{job_id}.zip"
+    zip_path.unlink(missing_ok=True)
+
+    try:
+        for idx, uf in enumerate(files, start=1):
+            name = Path(uf.filename or f"image_{idx}.png").name
+            raw = await uf.read()
+            await uf.close()
+            if not raw:
+                failed.append({"name": name, "error": "空文件"})
+                continue
+            total_bytes += len(raw)
+            if total_bytes > 300 * 1024 * 1024:
+                raise HTTPException(status_code=413, detail="图片总大小超过 300MB 上限")
+            try:
+                out_bytes, ext, _meta = await asyncio.to_thread(
+                    remove_watermark_image_bytes,
+                    raw,
+                    name,
+                    preset=position,
+                    strength=strength,
+                    x=x if use_custom_rect else None,
+                    y=y if use_custom_rect else None,
+                    w=w if use_custom_rect else None,
+                    h=h if use_custom_rect else None,
+                )
+                out_name = f"{Path(name).stem}_wm{ext}"
+                out_file = out_dir / out_name
+                out_file.write_bytes(out_bytes)
+                ok_files += 1
+                if len(previews) < 6:
+                    previews.append(out_name)
+            except Exception as exc:
+                failed.append({"name": name, "error": str(exc)})
+
+        if ok_files < 1:
+            raise HTTPException(status_code=400, detail="没有可处理的图片，请检查文件格式")
+
+        DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for p in sorted(out_dir.iterdir()):
+                if p.is_file():
+                    zf.write(p, arcname=p.name)
+
+        async def _cleanup() -> None:
+            await asyncio.sleep(DOWNLOAD_TTL_SEC)
+            zip_path.unlink(missing_ok=True)
+            shutil.rmtree(work_dir, ignore_errors=True)
+
+        background_tasks.add_task(_cleanup)
+        return {
+            "ok": True,
+            "job_id": job_id,
+            "processed": ok_files,
+            "failed": failed,
+            "zip_url": f"/downloads/images/{job_id}.zip",
+            "preview_names": previews,
+            "zip_size": zip_path.stat().st_size if zip_path.is_file() else 0,
+        }
+    except HTTPException:
+        shutil.rmtree(work_dir, ignore_errors=True)
+        zip_path.unlink(missing_ok=True)
+        raise
+
+
+@app.post("/api/tools/remove-watermark-image")
+async def remove_watermark_image_single(
+    file: UploadFile = File(..., description="单张图片"),
+    position: str = Form("douyin", description="水印位置预设"),
+    strength: str = Form("normal", description="处理强度：tight/normal/strong"),
+    x: Optional[int] = Form(None),
+    y: Optional[int] = Form(None),
+    w: Optional[int] = Form(None),
+    h: Optional[int] = Form(None),
+):
+    """单张图片去水印，直接返回处理后的图片字节（供 iOS 相册保存）。"""
+    from watermark_image import remove_watermark_image_bytes
+    from watermark_remove import PRESET_LABELS, wm_strength
+
+    use_custom_rect = all(v is not None for v in (x, y, w, h))
+    if not use_custom_rect and position not in PRESET_LABELS:
+        raise HTTPException(status_code=400, detail=f"未知预设 {position!r}")
+    strength = wm_strength(strength)
+
+    name = Path(file.filename or "image.png").name
+    raw = await file.read()
+    await file.close()
+    if not raw:
+        raise HTTPException(status_code=400, detail="空文件")
+    if len(raw) > 30 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="单张图片不能超过 30MB")
+
+    try:
+        out_bytes, ext, meta = await asyncio.to_thread(
+            remove_watermark_image_bytes,
+            raw,
+            name,
+            preset=position,
+            strength=strength,
+            x=x if use_custom_rect else None,
+            y=y if use_custom_rect else None,
+            w=w if use_custom_rect else None,
+            h=h if use_custom_rect else None,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    media = {
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".webp": "image/webp",
+    }.get(ext.lower(), "application/octet-stream")
+    out_name = f"{Path(name).stem}_wm{ext}"
+    return Response(
+        content=out_bytes,
+        media_type=media,
+        headers={
+            "Content-Disposition": _content_disposition("inline", out_name, fallback="image_wm"),
+            "X-Wm-Method": str(meta.get("method", "") or ""),
+        },
+    )
 
 
 @app.get("/api/tts/search-hint.mp3")
@@ -1850,6 +2184,14 @@ if STATIC_DIR.is_dir():
             name="cache",
         )
 
+    _icons_root = STATIC_DIR / "icons"
+    if _icons_root.is_dir():
+        app.mount(
+            "/icons",
+            StaticFiles(directory=str(_icons_root)),
+            name="icons",
+        )
+
     @app.get("/")
     async def index_page():
         return FileResponse(STATIC_DIR / "index.html")
@@ -1858,9 +2200,16 @@ if STATIC_DIR.is_dir():
     async def generate_page():
         return FileResponse(STATIC_DIR / "generate.html")
 
+    @app.get("/favicon.ico")
+    async def favicon():
+        icon = STATIC_DIR / "icons" / "icon-192.png"
+        if icon.is_file():
+            return FileResponse(icon, media_type="image/png")
+        raise HTTPException(status_code=404, detail="Not Found")
+
     @app.get("/{filename}")
     async def public_file(filename: str):
-        if filename.startswith("api") or "/" in filename or ".." in filename:
+        if "/" in filename or ".." in filename or filename == "api":
             raise HTTPException(status_code=404, detail="Not Found")
         path = STATIC_DIR / filename
         if not path.is_file():

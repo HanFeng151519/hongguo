@@ -443,6 +443,12 @@ async def crawl_and_download(
     share_text: str,
     dest: Path,
 ) -> dict[str, Any]:
+    from toutiao_crawler import try_crawl_toutiao
+
+    toutiao = await try_crawl_toutiao(client, share_text, dest)
+    if toutiao:
+        return toutiao
+
     urls = extract_all_http_urls(share_text)
     if not urls:
         raise RuntimeError("文案中未找到 http 链接")

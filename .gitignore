@@ -5,9 +5,17 @@ __pycache__/
 .DS_Store
 public/materials/
 public/downloads/*.mp4
+public/downloads/*.zip
 !public/downloads/.gitkeep
+server/public/
 public/cache/
 !public/cache/.gitkeep
+server/tools/realesrgan-ncnn-vulkan/
+public/uploads/watermark/
 public/tts_cache/*.mp3
 !public/tts_cache/.gitkeep
 public copy/
+mobile/node_modules/
+mobile/www/
+mobile/ios/App/Pods/
+mobile/ios/App/build/
