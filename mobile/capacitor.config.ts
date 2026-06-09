@@ -16,7 +16,7 @@ const config: CapacitorConfig = {
   appName: "红果短剧",
   webDir: "www",
   server: {
-    url: "http://172.31.2.23:8000",
+    url: "http://192.168.3.56:8000",
     cleartext: true,
     androidScheme: "https",
   },

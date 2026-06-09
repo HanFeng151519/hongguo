@@ -712,7 +712,10 @@ input.addEventListener("input", () => {
   const dyResult = document.getElementById("dy-result");
   const dyPreview = document.getElementById("dy-preview");
   const dyDownload = document.getElementById("dy-download");
+  const dySavePhotos = document.getElementById("dy-save-photos");
   const dyMeta = document.getElementById("dy-meta");
+  let lastDyDownloadUrl = "";
+  let lastDyFilename = "video.mp4";
   if (!dyForm || !dyShare) return;
 
   function setDyStatus(text, type = "") {
@@ -781,6 +784,8 @@ input.addEventListener("input", () => {
       dyDownload.removeAttribute("download");
       const nameBase = String(data.aweme_id || "douyin").replace(/\D/g, "") || "douyin";
       dyDownload.setAttribute("download", `douyin_${nameBase}.mp4`);
+      lastDyDownloadUrl = downloadUrl;
+      lastDyFilename = `douyin_${nameBase}.mp4`;
 
       const mb = ((data.size || 0) / 1024 / 1024).toFixed(1);
       const dur = data.duration ? `${Math.round(data.duration)} 秒` : "";
@@ -796,6 +801,31 @@ input.addEventListener("input", () => {
       setDyStatus(err.message || "抖音解析失败", "error");
     } finally {
       dySubmit.disabled = false;
+    }
+  });
+
+  dySavePhotos?.addEventListener("click", async () => {
+    if (!lastDyDownloadUrl) {
+      setDyStatus("請先爬取視頻", "error");
+      return;
+    }
+    if (!window.HongguoMobileSave?.saveVideoFromUrl) {
+      setDyStatus("請用 Safari 長按視頻預覽 → 儲存到照片", "error");
+      return;
+    }
+    dySavePhotos.disabled = true;
+    setDyStatus("正在準備視頻，請在彈出菜單選「儲存視頻」…");
+    try {
+      await window.HongguoMobileSave.saveVideoFromUrl(lastDyDownloadUrl, lastDyFilename);
+      setDyStatus("已發起保存，請在系統菜單確認", "ok");
+    } catch (err) {
+      if (err?.name === "AbortError") {
+        setDyStatus("已取消，可長按視頻預覽保存", "error");
+      } else {
+        setDyStatus(err.message || "保存到相冊失敗", "error");
+      }
+    } finally {
+      dySavePhotos.disabled = false;
     }
   });
 

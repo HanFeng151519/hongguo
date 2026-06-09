@@ -126,11 +126,39 @@
     return { mode: "gallery", count: files.length };
   }
 
+  async function saveVideoFromUrl(url, filename = "video.mp4") {
+    const full = global.HongguoApi?.apiUrl ? global.HongguoApi.apiUrl(url) : url;
+    const res = await fetch(full);
+    if (!res.ok) throw new Error(`下載失敗（HTTP ${res.status}）`);
+    let blob = await res.blob();
+    if (!blob.size) throw new Error("視頻為空");
+    const mime = (res.headers.get("content-type") || blob.type || "video/mp4").split(";")[0];
+    if (!blob.type && mime) blob = new Blob([blob], { type: mime });
+    const name = String(filename || "video.mp4").replace(/[/\\]/g, "_");
+    const file = new File([blob], name.endsWith(".mp4") ? name : `${name}.mp4`, {
+      type: mime.includes("video") ? mime : "video/mp4",
+    });
+
+    if (canTryShare()) {
+      try {
+        const shared = await tryShareFiles([file], name);
+        if (shared) return { mode: "share", count: 1 };
+      } catch (err) {
+        if (err?.name === "AbortError") throw err;
+      }
+    }
+
+    throw new Error(
+      "無法彈出分享菜單。請用 Safari 打開，長按上方視頻預覽 →「儲存到照片」。"
+    );
+  }
+
   global.HongguoMobileSave = {
     blobToFile,
     canTryShare,
     renderGallery,
     saveFiles,
+    saveVideoFromUrl,
     revokePreviews,
   };
 })(window);
