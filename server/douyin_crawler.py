@@ -443,11 +443,21 @@ async def crawl_and_download(
     share_text: str,
     dest: Path,
 ) -> dict[str, Any]:
+    from kuaishou_crawler import try_crawl_kuaishou
     from toutiao_crawler import try_crawl_toutiao
+    from xhs_crawler import try_crawl_xhs
+
+    kuaishou = await try_crawl_kuaishou(client, share_text, dest)
+    if kuaishou:
+        return kuaishou
 
     toutiao = await try_crawl_toutiao(client, share_text, dest)
     if toutiao:
         return toutiao
+
+    xhs = await try_crawl_xhs(client, share_text, dest)
+    if xhs:
+        return xhs
 
     urls = extract_all_http_urls(share_text)
     if not urls:

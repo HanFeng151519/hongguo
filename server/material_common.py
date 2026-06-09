@@ -157,6 +157,24 @@ def extract_toutiao_share_url(text: str) -> str:
     return _extract(text)
 
 
+def extract_kuaishou_share_url(text: str) -> str:
+    from kuaishou_crawler import extract_kuaishou_share_url as _extract
+
+    return _extract(text)
+
+
+def is_xhs_url(url: str) -> bool:
+    from xhs_crawler import is_xhs_share_url
+
+    return is_xhs_share_url(url)
+
+
+def extract_xhs_share_url(text: str) -> str:
+    from xhs_crawler import extract_xhs_share_url as _extract
+
+    return _extract(text)
+
+
 def is_kuaishou_url(url: str) -> bool:
     u = url.lower()
     return any(x in u for x in ("kuaishou.com", "kuaishou.cn", "chenzhongtech.com"))

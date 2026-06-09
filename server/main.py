@@ -69,7 +69,9 @@ from douyin_material import (
 )
 from material_common import (
     extract_douyin_share_url,
+    extract_kuaishou_share_url,
     extract_toutiao_share_url,
+    extract_xhs_share_url,
     is_douyin_url,
     is_kuaishou_url,
 )
@@ -1421,6 +1423,8 @@ async def cache_douyin_from_share(body: DouyinCacheRequest):
     share = (
         extract_douyin_share_url(share_text)
         or extract_toutiao_share_url(share_text)
+        or extract_kuaishou_share_url(share_text)
+        or extract_xhs_share_url(share_text)
         or extract_all_http_urls(share_text)[0]
     )
     cookie = body.douyin_cookie.strip() or effective_douyin_cookie()
