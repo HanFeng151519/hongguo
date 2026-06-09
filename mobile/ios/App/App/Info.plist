@@ -5,7 +5,7 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
 	<key>CFBundleDisplayName</key>
-        <string>红果短剧</string>
+        <string>视频爬取</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -46,9 +46,9 @@
 	<key>UIViewControllerBasedStatusBarAppearance</key>
 	<true/>
 	<key>NSPhotoLibraryUsageDescription</key>
-	<string>需要访问相册以选择图片进行去水印处理</string>
+	<string>需要访问相册以保存爬取的视频</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>
-	<string>需要保存去水印后的图片和抖音视频到您的相册</string>
+	<string>需要保存爬取的视频到您的相册</string>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsArbitraryLoads</key>

@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="theme-color" content="#e85d4c" />
+  <title>视频爬取</title>
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <div class="page">
+    <header class="header">
+      <div class="brand">
+        <span class="brand-icon">📥</span>
+        <div>
+          <h1>视频爬取</h1>
+          <p>抖音 · 快手 · 头条 · 小红书 · 纯本地解析，无需电脑后端</p>
+        </div>
+      </div>
+    </header>
+
+    <section class="wm-section">
+      <form id="crawl-form" class="wm-panel">
+        <label class="wm-field wm-field-full">
+          <span>分享文案 / 链接</span>
+          <textarea
+            id="share-input"
+            class="wm-share-input"
+            rows="4"
+            placeholder="粘贴整段分享文案（支持 v.douyin.com / v.kuaishou.com / m.toutiao.com / xhslink.com 等）"
+            spellcheck="false"
+          ></textarea>
+        </label>
+
+        <details class="cookie-details">
+          <summary>Cookie（可选）</summary>
+          <label class="wm-field wm-field-full">
+            <span>抖音 Cookie</span>
+            <textarea id="dy-cookie" class="wm-share-input" rows="2" placeholder="短链无法直访时填写" spellcheck="false"></textarea>
+          </label>
+          <label class="wm-field wm-field-full">
+            <span>小红书 Cookie</span>
+            <textarea id="xhs-cookie" class="wm-share-input" rows="2" placeholder="xhslink 解析失败时填写" spellcheck="false"></textarea>
+          </label>
+        </details>
+
+        <div class="wm-actions">
+          <button type="submit" id="submit-btn" class="btn-primary">爬取视频</button>
+        </div>
+
+        <p id="status" class="wm-status hidden" role="status"></p>
+
+        <div id="result" class="wm-result hidden">
+          <p id="meta" class="meta-line"></p>
+          <video id="preview" class="wm-preview" controls playsinline></video>
+          <div class="wm-result-actions">
+            <button type="button" id="save-btn" class="btn-primary">保存到相册</button>
+          </div>
+          <p class="wm-hint">点「保存到相册」后在系统菜单选「储存视频」。</p>
+        </div>
+      </form>
+    </section>
+  </div>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>
