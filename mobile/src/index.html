@@ -10,13 +10,25 @@
   <link rel="stylesheet" href="./style.css" />
 </head>
 <body>
+  <svg aria-hidden="true" focusable="false" class="svg-filters">
+    <defs>
+      <filter id="video-sharpen-filter" color-interpolation-filters="sRGB">
+        <!-- 轻度 unsharp，避免硬卷积的 halo -->
+        <feConvolveMatrix
+          order="3"
+          kernelMatrix="0 -0.35 0 -0.35 2.4 -0.35 0 -0.35 0"
+          preserveAlpha="true"
+        />
+      </filter>
+    </defs>
+  </svg>
   <div class="page">
     <header class="header">
       <div class="brand">
         <span class="brand-icon">📥</span>
         <div>
           <h1>视频爬取</h1>
-          <p>抖音 · 快手 · 头条 · 小红书 · 纯本地解析，无需电脑后端</p>
+          <p>抖音 · 快手 · 头条 · 小红书 · 百度 · 纯本地解析，无需电脑后端</p>
         </div>
       </div>
     </header>
@@ -24,15 +36,46 @@
     <section class="wm-section">
       <form id="crawl-form" class="wm-panel">
         <label class="wm-field wm-field-full">
-          <span>分享文案 / 链接</span>
-          <textarea
-            id="share-input"
-            class="wm-share-input"
-            rows="4"
-            placeholder="粘贴整段分享文案（支持 v.douyin.com / v.kuaishou.com / m.toutiao.com / xhslink.com 等）"
-            spellcheck="false"
-          ></textarea>
+          <div class="field-label-row">
+            <span>分享文案 / 链接</span>
+            <button type="button" id="share-paste" class="btn-paste">粘贴剪贴板</button>
+          </div>
+          <div class="input-clear-wrap">
+            <textarea
+              id="share-input"
+              class="wm-share-input"
+              rows="4"
+              placeholder="粘贴整段分享文案（支持 v.douyin.com / m.toutiao.com / mr.baidu.com / xhslink.com 等）"
+              spellcheck="false"
+            ></textarea>
+            <button type="button" id="share-clear" class="input-clear-btn hidden" aria-label="清空">×</button>
+          </div>
         </label>
+
+        <details class="cookie-details">
+          <summary>Mac 后端超分（可选，长视频 / 4K）</summary>
+          <p class="sr-setup-hint">爬取完成后点下方对应按钮：本机超分（较慢）或 Mac 超分（需同一 Wi‑Fi 运行 <code>./start.sh</code>）</p>
+          <label class="wm-field wm-field-full">
+            <span>Mac 后端地址</span>
+            <input
+              id="sr-server"
+              class="wm-share-input wm-input-single"
+              type="url"
+              inputmode="url"
+              placeholder="http://192.168.x.x:8000"
+              spellcheck="false"
+            />
+          </label>
+          <label class="wm-field">
+            <span>超分输出</span>
+            <select id="sr-scale" class="wm-share-input">
+              <option value="1080" selected>1080p</option>
+              <option value="4k">4K（更慢）</option>
+            </select>
+          </label>
+          <button type="button" id="sr-test" class="btn-adjust-reset">测试连接</button>
+          <p id="sr-mac-status" class="sr-mac-status hidden"></p>
+        </details>
 
         <details class="cookie-details">
           <summary>Cookie（可选）</summary>
@@ -51,14 +94,64 @@
         </div>
 
         <p id="status" class="wm-status hidden" role="status"></p>
+        <div id="sr-progress-wrap" class="sr-progress-wrap hidden" aria-live="polite">
+          <div class="sr-progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+            <div id="sr-progress-bar" class="sr-progress-bar"></div>
+          </div>
+          <p id="sr-progress-label" class="sr-progress-label"></p>
+        </div>
 
         <div id="result" class="wm-result hidden">
           <p id="meta" class="meta-line"></p>
-          <video id="preview" class="wm-preview" controls playsinline></video>
+          <div class="video-stage is-loading" id="video-stage">
+            <div class="video-stage-bg hidden" id="video-stage-bg" aria-hidden="true"></div>
+            <div class="video-wrap">
+              <div class="video-poster-layer hidden" id="video-poster-layer" aria-hidden="true"></div>
+              <video
+                id="preview"
+                class="wm-preview"
+                controls
+                playsinline
+                webkit-playsinline
+                preload="auto"
+                disablePictureInPicture
+              ></video>
+              <span id="video-badge" class="video-badge hidden"></span>
+              <button type="button" id="fullscreen-btn" class="video-fs-btn hidden" aria-label="全屏播放">⛶</button>
+            </div>
+          </div>
+          <div class="video-enhance-bar" role="group" aria-label="预览画质">
+            <span class="video-enhance-label">画质模式</span>
+            <div class="video-enhance-tabs">
+              <button type="button" class="enhance-tab active" data-enhance="off">原片</button>
+              <button type="button" class="enhance-tab" data-enhance="clear">清晰</button>
+              <button type="button" class="enhance-tab" data-enhance="sharp">细节</button>
+              <button type="button" class="enhance-tab" data-enhance="cinema">影院</button>
+            </div>
+          </div>
+          <div class="video-adjust-panel">
+            <div class="adjust-row">
+              <label for="adj-contrast">对比度 <output id="adj-contrast-val">100</output></label>
+              <input type="range" id="adj-contrast" min="50" max="150" step="1" value="100" />
+            </div>
+            <div class="adjust-row">
+              <label for="adj-saturate">饱和度 <output id="adj-saturate-val">100</output></label>
+              <input type="range" id="adj-saturate" min="50" max="150" step="1" value="100" />
+            </div>
+            <div class="adjust-row">
+              <label for="adj-brightness">亮度 <output id="adj-brightness-val">100</output></label>
+              <input type="range" id="adj-brightness" min="50" max="150" step="1" value="100" />
+            </div>
+            <button type="button" id="adj-reset" class="btn-adjust-reset">重置为原片</button>
+          </div>
           <div class="wm-result-actions">
             <button type="button" id="save-btn" class="btn-primary">保存到相册</button>
+            <div id="sr-buttons" class="sr-action-row hidden">
+              <button type="button" id="sr-native-btn" class="btn-secondary">本机超分并保存</button>
+              <button type="button" id="sr-mac-btn" class="btn-secondary btn-mac-sr hidden">Mac 超分并保存</button>
+            </div>
           </div>
-          <p class="wm-hint">点「保存到相册」后在系统菜单选「储存视频」。</p>
+          <p class="wm-hint">上方预览是爬取原片，卡顿≠超分结果。两个超分按钮互不影响，请按需点「本机」或「Mac」。</p>
         </div>
       </form>
     </section>

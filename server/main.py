@@ -1397,7 +1397,8 @@ async def preview_douyin_cache(aweme_id: str):
 @app.get("/downloads/douyin/{aweme_id}.mp4")
 async def download_douyin_cache(aweme_id: str):
     path = _douyin_cache_path(aweme_id)
-    name = f"douyin_{re.sub(r'[^\\d]', '', aweme_id) or 'video'}.mp4"
+    safe_aweme = re.sub(r"[^\d]", "", str(aweme_id or "")) or "video"
+    name = f"douyin_{safe_aweme}.mp4"
     return FileResponse(
         path,
         media_type="video/mp4",
@@ -1710,6 +1711,166 @@ async def remove_video_watermark(
     )
 
     return {"ok": True, "job_id": job_id, "estimated_sec": est_sec}
+
+
+async def _run_sr_job(
+    job_id: str,
+    src: Path,
+    out: Path,
+    *,
+    output_scale: str = "1080",
+    output_fps_choice: str = "",
+) -> None:
+    from video_enhance import super_resolve_video
+
+    await _set_wm_job(
+        job_id,
+        status="running",
+        progress="正在准备 Real-ESRGAN 超分…",
+        progress_pct=0,
+    )
+    loop = asyncio.get_running_loop()
+
+    def on_progress(msg: str, frac: float, eta_sec: int | None = None) -> None:
+        fields: dict[str, Any] = {
+            "status": "running",
+            "progress": msg,
+            "progress_pct": round(max(0.0, min(1.0, frac)) * 100, 1),
+        }
+        if eta_sec is not None and eta_sec > 0:
+            fields["eta_sec"] = int(eta_sec)
+        asyncio.run_coroutine_threadsafe(_set_wm_job(job_id, **fields), loop)
+
+    try:
+        meta = await asyncio.to_thread(
+            super_resolve_video,
+            src,
+            out,
+            output_scale=output_scale or "1080",
+            output_fps_choice=output_fps_choice or None,
+            on_progress=on_progress,
+        )
+        await _set_wm_job(
+            job_id,
+            status="completed",
+            progress="超分完成",
+            download_url=f"/downloads/sr_{job_id}.mp4",
+            preview_url=f"/preview/sr_{job_id}.mp4",
+            size=out.stat().st_size,
+            region=meta,
+            regions=[],
+        )
+    except Exception as exc:
+        logging.getLogger(__name__).exception("sr job %s failed", job_id)
+        out.unlink(missing_ok=True)
+        err = str(exc)
+        if len(err) > 500:
+            err = err[:500] + "…"
+        await _set_wm_job(
+            job_id,
+            status="failed",
+            progress="超分失败",
+            error=err,
+        )
+    finally:
+        src.unlink(missing_ok=True)
+
+
+@app.post("/api/tools/super-resolution")
+async def super_resolution_video(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(..., description="本地 MP4/MOV 等视频"),
+    output_scale: str = Form(
+        "1080",
+        description="输出分辨率：native/1080/4k（竖横屏自动）",
+    ),
+    output_fps: str = Form(
+        "",
+        description="输出帧率：native/60/120",
+    ),
+):
+    """上传视频，后台 Real-ESRGAN 超分（App / 网页均可调用）。"""
+    from video_enhance import sr_available
+
+    if not sr_available():
+        raise HTTPException(
+            status_code=503,
+            detail="Real-ESRGAN 未就绪，请先在 Mac 上运行 ./start.sh",
+        )
+
+    suffix = Path(file.filename or "video.mp4").suffix.lower()
+    if suffix not in (".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"):
+        suffix = ".mp4"
+
+    job_id = secrets.token_urlsafe(10)
+    src = WM_UPLOAD_DIR / f"sr_{job_id}_in{suffix}"
+    out = DOWNLOAD_DIR / f"sr_{job_id}.mp4"
+
+    try:
+        total = 0
+        with src.open("wb") as fh:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > WM_MAX_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail="视频超过 500MB 上限",
+                    )
+                fh.write(chunk)
+    finally:
+        await file.close()
+
+    if total < 10_000:
+        src.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="文件过小或为空")
+
+    est_sec = max(60, int(total / (1024 * 1024) * 60))
+    scale_key = (output_scale or "").strip().lower()
+    if scale_key in ("4k", "2160", "uhd", "4khd"):
+        est_sec = int(est_sec * 2.2)
+    fps_key = (output_fps or "").strip().lower()
+    if fps_key in ("120", "120fps"):
+        est_sec = int(est_sec * 1.4)
+    elif fps_key in ("60", "60fps"):
+        est_sec = int(est_sec * 1.1)
+
+    await _set_wm_job(
+        job_id,
+        status="queued",
+        progress=(
+            f"已上传，排队 AI 超分…（约 {total // (1024 * 1024)} MB，"
+            f"预计 {est_sec // 60}–{(est_sec * 2) // 60 + 1} 分钟）"
+        ),
+        size_mb=round(total / (1024 * 1024), 1),
+    )
+
+    background_tasks.add_task(
+        _run_sr_job,
+        job_id,
+        src,
+        out,
+        output_scale=output_scale,
+        output_fps_choice=output_fps,
+    )
+
+    return {"ok": True, "job_id": job_id, "estimated_sec": est_sec}
+
+
+@app.get("/api/tools/super-resolution/job/{job_id}")
+async def get_super_resolution_job(job_id: str):
+    async with WM_JOBS_LOCK:
+        job = WM_JOBS.get(job_id)
+    if not job:
+        job = _load_wm_job(job_id)
+        if job:
+            async with WM_JOBS_LOCK:
+                WM_JOBS[job_id] = job
+    if not job:
+        raise HTTPException(status_code=404, detail="任务不存在或已过期，请重新上传")
+    return {"ok": True, "job_id": job_id, **job}
 
 
 @app.get("/api/tools/remove-watermark/job/{job_id}")

@@ -7,11 +7,28 @@ import os
 import platform
 import re
 import shutil
+import stat
 import subprocess
 import zipfile
+import time
+from collections.abc import Callable
 from pathlib import Path
 
 import httpx
+
+ProgressFn = Callable[[str, float, int | None], None]
+
+
+def _eta_from_frac(elapsed: float, frac: float) -> int | None:
+    if frac <= 0.03 or frac >= 0.99 or elapsed < 1:
+        return None
+    return max(1, int(elapsed / frac * (1.0 - frac)))
+
+
+def _eta_from_frames(elapsed: float, done: int, total: int) -> int | None:
+    if done < 1 or total <= done:
+        return None
+    return max(1, int(elapsed / done * (total - done)))
 
 from ffmpeg_util import resolve_ffmpeg_exe
 
@@ -73,9 +90,28 @@ def _ncnn_exe_name() -> str:
     return "realesrgan-ncnn-vulkan.exe" if _platform_key() == "windows" else "realesrgan-ncnn-vulkan"
 
 
+def _ensure_executable(path: Path) -> None:
+    """zip 解压后 macOS/Linux 可执行位可能丢失。"""
+    if platform.system() == "Windows" or not path.is_file():
+        return
+    mode = path.stat().st_mode
+    if mode & stat.S_IXUSR:
+        return
+    path.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+
+def _chmod_ncnn_tree(root: Path) -> None:
+    if platform.system() == "Windows":
+        return
+    for candidate in root.rglob(_ncnn_exe_name()):
+        if candidate.is_file():
+            _ensure_executable(candidate)
+
+
 def find_ncnn_exe() -> Path | None:
     bundled = TOOLS_DIR / _ncnn_exe_name()
     if bundled.is_file():
+        _ensure_executable(bundled)
         return bundled
     env = os.getenv("HONGGUO_REALESRGAN_BIN", "").strip()
     if env:
@@ -111,11 +147,13 @@ def ensure_ncnn_bundle() -> Path:
     with zipfile.ZipFile(zip_path, "r") as zf:
         zf.extractall(TOOLS_DIR)
     zip_path.unlink(missing_ok=True)
+    _chmod_ncnn_tree(TOOLS_DIR)
 
     exe = find_ncnn_exe()
     if exe is None:
         for candidate in TOOLS_DIR.rglob(_ncnn_exe_name()):
             if candidate.is_file():
+                _ensure_executable(candidate)
                 return candidate
         raise RuntimeError("Real-ESRGAN 解压后未找到可执行文件")
     return exe
@@ -133,6 +171,33 @@ def _env_int(name: str, default: int) -> int:
         return int(os.getenv(name, str(default)) or default)
     except ValueError:
         return default
+
+
+def _sr_max_input_long_edge() -> int:
+    """与 iOS 本机超分一致：先缩小再 AI，显著提速。"""
+    return max(128, _env_int("HONGGUO_SR_MAX_INPUT_LONG_EDGE", 512))
+
+
+def _prep_scale_dims(w: int, h: int, max_long: int) -> tuple[int, int] | None:
+    w, h = max(2, w), max(2, h)
+    if max(w, h) <= max_long:
+        return None
+    if w >= h:
+        new_h = max_long
+        new_w = max(2, int(round(w * max_long / h)))
+    else:
+        new_w = max_long
+        new_h = max(2, int(round(h * max_long / w)))
+    new_w -= new_w % 2
+    new_h -= new_h % 2
+    return new_w, new_h
+
+
+def _vf_cap_long_edge(w: int, h: int, max_long: int) -> str | None:
+    dims = _prep_scale_dims(w, h, max_long)
+    if not dims:
+        return None
+    return f"scale={dims[0]}:{dims[1]}:flags=lanczos"
 
 
 def _probe_video_fps(path: Path) -> float:
@@ -196,9 +261,9 @@ def _probe_video_fps(path: Path) -> float:
 
 
 def _resolve_model_name(model: str, models_dir: Path) -> str:
-    raw = (model or os.getenv("HONGGUO_REALESRGAN_MODEL", "realesrgan-x4plus")).strip()
+    raw = (model or os.getenv("HONGGUO_REALESRGAN_MODEL", "realesr-animevideov3")).strip()
     name = _MODEL_ALIASES.get(raw, raw)
-    candidates = [name, "realesrgan-x4plus", "realesr-animevideov3", "realesrgan-x4plus-anime"]
+    candidates = [name, "realesr-animevideov3", "realesrgan-x4plus", "realesrgan-x4plus-anime"]
     seen: set[str] = set()
     for cand in candidates:
         if cand in seen:
@@ -234,29 +299,39 @@ def _ncnn_scale(model_name: str, desired: int) -> int:
     return desired
 
 
-def _extract_frames(src: Path, frames_dir: Path, *, fmt: str) -> float:
+def _extract_frames(
+    src: Path,
+    frames_dir: Path,
+    *,
+    fmt: str,
+    vf: str | None = None,
+) -> float:
     frames_dir.mkdir(parents=True, exist_ok=True)
     ffmpeg = resolve_ffmpeg_exe()
     pattern = frames_dir / f"frame%08d.{fmt}"
-    proc = subprocess.run(
+    jpeg_q = max(2, min(5, _env_int("HONGGUO_REALESRGAN_JPEG_QUALITY", 2)))
+    args = [
+        ffmpeg,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(src),
+    ]
+    if vf:
+        args.extend(["-vf", vf])
+    args.extend(
         [
-            ffmpeg,
-            "-y",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-i",
-            str(src),
             "-qscale:v",
-            "1",
-            "-qmin",
-            "1",
-            "-qmax",
-            "1",
+            str(jpeg_q),
             "-vsync",
             "0",
             str(pattern),
-        ],
+        ]
+    )
+    proc = subprocess.run(
+        args,
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -320,6 +395,9 @@ def run_ncnn_video_sr(
     *,
     scale: int,
     model: str | None = None,
+    src_w: int = 0,
+    src_h: int = 0,
+    on_progress: ProgressFn | None = None,
 ) -> None:
     """
     ncnn-vulkan 仅支持图片/目录：抽帧 → 目录超分 → 再合成 mp4。
@@ -339,7 +417,26 @@ def run_ncnn_video_sr(
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.unlink(missing_ok=True)
 
-    import time
+    phase_start = time.monotonic()
+    ai_phase_start: float | None = None
+
+    def report(
+        msg: str,
+        frac: float,
+        *,
+        frames_done: int = 0,
+        frames_total: int = 0,
+    ) -> None:
+        if not on_progress:
+            return
+        frac = max(0.0, min(1.0, frac))
+        eta_sec: int | None = None
+        if frames_total > 0 and frames_done > 0:
+            base = ai_phase_start if ai_phase_start is not None else phase_start
+            eta_sec = _eta_from_frames(time.monotonic() - base, frames_done, frames_total)
+        else:
+            eta_sec = _eta_from_frac(time.monotonic() - phase_start, frac)
+        on_progress(msg, frac, eta_sec)
 
     jobs_root = exe_parent / "jobs"
     jobs_root.mkdir(parents=True, exist_ok=True)
@@ -354,11 +451,27 @@ def run_ncnn_video_sr(
     out_rel = f"jobs/{work.name}/out"
 
     try:
-        src_fps = _extract_frames(src, in_frames, fmt=fmt)
+        max_long = _sr_max_input_long_edge()
+        prep_vf = None
+        prep_dims = None
+        if src_w > 1 and src_h > 1:
+            prep_dims = _prep_scale_dims(src_w, src_h, max_long)
+            if prep_dims:
+                prep_vf = f"scale={prep_dims[0]}:{prep_dims[1]}:flags=lanczos"
+                report(
+                    f"正在抽帧并缩至 {prep_dims[0]}×{prep_dims[1]}（最长边 {max_long}px）…",
+                    0.02,
+                )
+        else:
+            report("正在抽帧…", 0.02)
+        src_fps = _extract_frames(src, in_frames, fmt=fmt, vf=prep_vf)
         in_count = len(list(in_frames.glob(f"*.{fmt}")))
         if in_count < 1:
             raise RuntimeError("抽帧失败：未得到任何画面，无法超分")
+        prep_hint = f"（{prep_dims[0]}×{prep_dims[1]}）" if prep_dims else ""
+        report(f"抽帧完成，共 {in_count} 帧{prep_hint}", 0.05)
 
+        threads = (os.getenv("HONGGUO_REALESRGAN_THREADS", "4:4:4") or "").strip()
         cmd = [
             str(exe),
             "-i",
@@ -376,28 +489,53 @@ def run_ncnn_video_sr(
         ]
         if tile > 0:
             cmd.extend(["-t", str(tile)])
+        if threads:
+            cmd.extend(["-j", threads])
 
         logger.info(
-            "Real-ESRGAN v%d 超分 %s（%d 帧）→ %sx 模型 %s cwd=%s",
+            "Real-ESRGAN v%d 超分 %s（%d 帧）→ %sx 模型 %s prep_long<=%s threads=%s cwd=%s",
             SR_PIPELINE_VERSION,
             src.name,
             in_count,
             scale,
             model_name,
+            max_long if prep_vf else "full",
+            threads or "default",
             exe_parent,
         )
-        proc = subprocess.run(
+        ai_phase_start = time.monotonic()
+        timeout = _env_int("HONGGUO_REALESRGAN_TIMEOUT", 7200)
+        proc = subprocess.Popen(
             cmd,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=_env_int("HONGGUO_REALESRGAN_TIMEOUT", 7200),
             cwd=str(exe_parent),
         )
+        started = time.monotonic()
+        last_report = 0.0
+        while proc.poll() is None:
+            if time.monotonic() - started > timeout:
+                proc.kill()
+                raise RuntimeError(f"Real-ESRGAN 超分超时（>{timeout}s）")
+            out_count = len(list(out_frames.glob(f"*.{fmt}")))
+            if in_count > 0 and time.monotonic() - last_report >= 1.0:
+                frac = 0.05 + 0.82 * min(1.0, out_count / in_count)
+                report(
+                    f"AI 超分 {out_count}/{in_count} 帧",
+                    frac,
+                    frames_done=out_count,
+                    frames_total=in_count,
+                )
+                last_report = time.monotonic()
+            time.sleep(0.4)
+
+        stdout, stderr = proc.communicate(timeout=30)
         out_count = len(list(out_frames.glob(f"*.{fmt}")))
         combined = "\n".join(
-            x for x in ((proc.stderr or "").strip(), (proc.stdout or "").strip()) if x
+            x for x in ((stderr or "").strip(), (stdout or "").strip()) if x
         )
         if proc.returncode != 0:
             tail = combined[-800:]
@@ -429,7 +567,9 @@ def run_ncnn_video_sr(
         if out_count < 1:
             raise RuntimeError("Real-ESRGAN 未输出任何超分帧")
 
+        report("正在合成超分视频…", 0.9)
         _merge_frames(out_frames, dest, fmt=fmt, fps=src_fps)
+        report("超分视频合成完成", 0.95)
         if not dest.is_file() or dest.stat().st_size < 10_000:
             raise RuntimeError("超分后视频为空")
     finally:
@@ -528,6 +668,7 @@ def apply_sr_output(
     out_w: int,
     out_h: int,
     fps: int,
+    on_progress: ProgressFn | None = None,
 ) -> str:
     """
     Real-ESRGAN 超分 → 精确缩放到目标分辨率 → 插帧 → 混音。
@@ -536,7 +677,14 @@ def apply_sr_output(
     scale = calc_sr_scale(src_w, src_h, out_w, out_h)
     sr_out = dest.with_suffix(".sr.mp4")
     try:
-        run_ncnn_video_sr(video, sr_out, scale=scale)
+        run_ncnn_video_sr(
+            video,
+            sr_out,
+            scale=scale,
+            src_w=src_w,
+            src_h=src_h,
+            on_progress=on_progress,
+        )
         sr_w, sr_h = _probe_size(sr_out)
         if sr_w < 2 or sr_h < 2:
             sr_w, sr_h = src_w * scale, src_h * scale
@@ -547,7 +695,84 @@ def apply_sr_output(
         if fps > 0:
             vf_parts.append(f"fps={fps}")
         vf = ",".join(vf_parts) if vf_parts else None
+        if on_progress:
+            on_progress("正在缩放并合并音轨…", 0.97, None)
         mux_video(sr_out, audio_src, dest, vf=vf, fps=None)
+        if on_progress:
+            on_progress("超分处理完成", 1.0, None)
         return f"realesrgan-x{scale}"
     finally:
         sr_out.unlink(missing_ok=True)
+
+
+def super_resolve_video(
+    src: Path,
+    dest: Path,
+    *,
+    output_scale: str = "1080",
+    output_fps_choice: str | int | None = None,
+    on_progress: ProgressFn | None = None,
+) -> dict[str, int | str]:
+    """仅 AI 超分（不去水印）：Real-ESRGAN → 缩放到目标分辨率 → 保留原声。"""
+    if not src.is_file():
+        raise RuntimeError("源视频不存在")
+    if src.stat().st_size < 10_000:
+        raise RuntimeError("视频文件过小或已损坏")
+    if not sr_available():
+        raise RuntimeError(
+            "Real-ESRGAN 未就绪，请先在 Mac 上运行 ./start.sh（首次会自动下载工具）"
+        )
+    ensure_ncnn_bundle()
+
+    from watermark_remove import (
+        normalize_output_fps_choice,
+        normalize_output_scale,
+        probe_video_fps,
+        probe_video_size,
+        resolve_wm_output_spec,
+    )
+
+    src_w, src_h = probe_video_size(src)
+    scale_key = normalize_output_scale(output_scale)
+    out_spec = resolve_wm_output_spec(src_w, src_h, scale_key)
+
+    fps_choice = normalize_output_fps_choice(output_fps_choice)
+    if fps_choice == -1:
+        fps = max(1, min(120, int(round(probe_video_fps(src))) or 30))
+    elif fps_choice > 0:
+        fps = fps_choice
+    else:
+        src_fps = probe_video_fps(src)
+        fps = max(1, min(120, int(round(src_fps)))) if src_fps >= 1 else 30
+
+    job_start = time.monotonic()
+
+    def relay_progress(msg: str, frac: float, eta_sec: int | None = None) -> None:
+        if not on_progress:
+            return
+        if eta_sec is None:
+            eta_sec = _eta_from_frac(time.monotonic() - job_start, frac)
+        on_progress(msg, frac, eta_sec)
+
+    relay_progress("正在准备超分…", 0.01, None)
+
+    backend = apply_sr_output(
+        src,
+        src,
+        dest,
+        src_w=src_w,
+        src_h=src_h,
+        out_w=out_spec.width,
+        out_h=out_spec.height,
+        fps=fps,
+        on_progress=relay_progress,
+    )
+    return {
+        "output_width": out_spec.width,
+        "output_height": out_spec.height,
+        "output_fps": fps,
+        "enhance_backend": backend,
+        "source_width": src_w,
+        "source_height": src_h,
+        "enhance": "sr",
+    }

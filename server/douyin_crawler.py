@@ -519,9 +519,37 @@ async def crawl_and_download(
     share_text: str,
     dest: Path,
 ) -> dict[str, Any]:
-    from kuaishou_crawler import try_crawl_kuaishou
-    from toutiao_crawler import try_crawl_toutiao
-    from xhs_crawler import try_crawl_xhs
+    from kuaishou_crawler import (
+        crawl_kuaishou_and_download,
+        extract_kuaishou_share_url,
+        try_crawl_kuaishou,
+    )
+    from toutiao_crawler import (
+        crawl_toutiao_and_download,
+        extract_toutiao_share_url,
+        try_crawl_toutiao,
+    )
+    from xhs_crawler import extract_xhs_share_url, try_crawl_xhs
+
+    urls = extract_all_http_urls(share_text)
+    is_toutiao = bool(extract_toutiao_share_url(share_text)) or any(
+        "toutiao.com" in u.lower() for u in urls
+    )
+    is_kuaishou = bool(extract_kuaishou_share_url(share_text)) or any(
+        "kuaishou" in u.lower() or "chenzhongtech.com" in u.lower() for u in urls
+    )
+    is_xhs = bool(extract_xhs_share_url(share_text)) or any(
+        "xhslink.com" in u.lower() or "xiaohongshu.com" in u.lower() for u in urls
+    )
+
+    if is_toutiao:
+        return await crawl_toutiao_and_download(client, share_text, dest)
+    if is_kuaishou:
+        return await crawl_kuaishou_and_download(client, share_text, dest)
+    if is_xhs:
+        from xhs_crawler import crawl_xhs_and_download
+
+        return await crawl_xhs_and_download(client, share_text, dest)
 
     kuaishou = await try_crawl_kuaishou(client, share_text, dest)
     if kuaishou:
@@ -535,7 +563,6 @@ async def crawl_and_download(
     if xhs:
         return xhs
 
-    urls = extract_all_http_urls(share_text)
     if not urls:
         raise RuntimeError("文案中未找到 http 链接")
 
@@ -556,6 +583,18 @@ async def crawl_and_download(
             )
             return {**meta, "local_path": dest, "source": "douyin_crawl"}
 
-    raise RuntimeError(
-        "无法获取视频。若需无水印，请确认链接有效或填写可选 Cookie 后重试。"
-    )
+    from toutiao_crawler import extract_toutiao_share_url as _tt_share
+    from kuaishou_crawler import extract_kuaishou_share_url as _ks_share
+    from xhs_crawler import extract_xhs_share_url as _xhs_share
+
+    if _tt_share(share_text) or any(
+        "toutiao.com" in u.lower() for u in extract_all_http_urls(share_text)
+    ):
+        hint = "今日头条链接解析失败，请确认链接未过期后重试。"
+    elif _ks_share(share_text):
+        hint = "快手链接解析失败，请确认链接有效。"
+    elif _xhs_share(share_text):
+        hint = "小红书链接解析失败，可展开填写 Cookie 后重试。"
+    else:
+        hint = "若需无水印，请确认链接有效或填写可选 Cookie 后重试。"
+    raise RuntimeError(f"无法获取视频。{hint}")

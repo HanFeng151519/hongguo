@@ -5,9 +5,11 @@
   "description": "视频爬取 iOS App（Capacitor，内置爬虫逻辑，无需 Python 后端）",
   "scripts": {
     "build:web": "node scripts/copy-web.js",
-    "cap:sync": "npm run build:web && npx cap sync ios",
+    "ensure:sr-model": "bash scripts/ensure-sr-model.sh",
+    "cap:sync": "npm run build:web && (npm run ensure:sr-model || true) && npx cap sync ios && node scripts/patch-ios-plugins.js",
     "cap:ios": "npx cap open ios",
-    "cap:run:ios": "npx cap run ios"
+    "cap:run:ios": "npx cap run ios",
+    "install:device": "bash scripts/install-ios-device.sh"
   },
   "dependencies": {
     "@capacitor/app": "^6.0.2",

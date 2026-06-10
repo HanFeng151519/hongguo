@@ -50,14 +50,20 @@
       </div>
       <form id="dy-form" class="wm-panel">
         <label class="wm-field wm-field-full">
-          <span>分享文案 / 链接</span>
-          <textarea
-            id="dy-share"
-            class="wm-share-input dy-cookie-input"
-            rows="3"
-            placeholder="粘贴整段分享文案（抖音 / 快手 / 头条 / 小红书 xhslink.com 等）"
-            spellcheck="false"
-          ></textarea>
+          <div class="field-label-row">
+            <span>分享文案 / 链接</span>
+            <button type="button" id="dy-share-paste" class="btn-paste">粘贴剪贴板</button>
+          </div>
+          <div class="input-clear-wrap">
+            <textarea
+              id="dy-share"
+              class="wm-share-input dy-cookie-input"
+              rows="3"
+              placeholder="粘贴整段分享文案（抖音 / 快手 / 头条 / 小红书 xhslink.com 等）"
+              spellcheck="false"
+            ></textarea>
+            <button type="button" id="dy-share-clear" class="input-clear-btn hidden" aria-label="清空">×</button>
+          </div>
         </label>
         <details class="dy-cookie-optional">
           <summary>Cookie（可选，仅短链无法直访时）</summary>
@@ -262,6 +268,7 @@
   <script src="/api-base.js?v=3"></script>
   <script src="/platform.js?v=2"></script>
   <script src="/mobile-save.js?v=3"></script>
-  <script src="/app.js?v=28"></script>
+  <script type="module" src="/crawl/bootstrap.js?v=2"></script>
+  <script src="/app.js?v=30"></script>
 </body>
 </html>

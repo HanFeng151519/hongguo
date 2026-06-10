@@ -1,0 +1,22 @@
+{
+	"appId": "com.hongguo.crawl",
+	"appName": "视频爬取",
+	"webDir": "www",
+	"packageClassList": [
+		"AppPlugin",
+		"FilesystemPlugin",
+		"PreferencesPlugin",
+		"SharePlugin",
+		"StatusBarPlugin",
+		"RealEsrganPlugin"
+	],
+	"ios": {
+		"contentInset": "automatic",
+		"allowsLinkPreview": true
+	},
+	"plugins": {
+		"CapacitorHttp": {
+			"enabled": true
+		}
+	}
+}

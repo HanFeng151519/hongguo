@@ -696,6 +696,8 @@ input.addEventListener("input", () => {
 (function initDouyinCacheTool() {
   const dyForm = document.getElementById("dy-form");
   const dyShare = document.getElementById("dy-share");
+  const dyShareClear = document.getElementById("dy-share-clear");
+  const dySharePaste = document.getElementById("dy-share-paste");
   const dyCookie = document.getElementById("dy-cookie");
   const dySubmit = document.getElementById("dy-submit");
   const DY_COOKIE_KEY = "hongguo_dy_cookie";
@@ -716,7 +718,82 @@ input.addEventListener("input", () => {
   const dyMeta = document.getElementById("dy-meta");
   let lastDyDownloadUrl = "";
   let lastDyFilename = "video.mp4";
+  let lastDyBlobUrl = "";
   if (!dyForm || !dyShare) return;
+
+  function bindClearInput(input, clearBtn) {
+    if (!input || !clearBtn) return () => {};
+    const sync = () => clearBtn.classList.toggle("hidden", !input.value.trim());
+    input.addEventListener("input", sync);
+    clearBtn.addEventListener("click", () => {
+      input.value = "";
+      sync();
+      input.focus();
+    });
+    sync();
+    return sync;
+  }
+
+  async function pasteClipboardReplace(input, onSynced) {
+    if (!input) return;
+    if (!navigator.clipboard?.readText) {
+      throw new Error("当前环境不支持读取剪贴板");
+    }
+    let text;
+    try {
+      text = await navigator.clipboard.readText();
+    } catch (err) {
+      const denied = /denied|permission|NotAllowed/i.test(String(err?.message || err));
+      throw new Error(denied ? "无法读取剪贴板，请在系统设置中允许访问" : "读取剪贴板失败");
+    }
+    input.value = String(text || "").trim();
+    if (onSynced) onSynced();
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    input.focus();
+  }
+
+  const syncDyShareClear = bindClearInput(dyShare, dyShareClear);
+
+  dySharePaste?.addEventListener("click", async () => {
+    try {
+      await pasteClipboardReplace(dyShare, syncDyShareClear);
+      setDyStatus("已从剪贴板粘贴", "ok");
+    } catch (err) {
+      setDyStatus(err.message || "粘贴失败", "error");
+    }
+  });
+
+  function revokeDyBlob() {
+    if (lastDyBlobUrl) {
+      try {
+        URL.revokeObjectURL(lastDyBlobUrl);
+      } catch {
+        /* ignore */
+      }
+      lastDyBlobUrl = "";
+    }
+  }
+
+  function waitForLocalCrawl(ms = 10000) {
+    return new Promise((resolve) => {
+      if (window.HongguoCrawl?.crawlAndDownload) {
+        resolve(window.HongguoCrawl);
+        return;
+      }
+      const done = () => resolve(window.HongguoCrawl || null);
+      window.addEventListener("hongguo-crawl-ready", done, { once: true });
+      setTimeout(done, ms);
+    });
+  }
+
+  if (window.HongguoCrawl?.useLocalCrawl?.()) {
+    dySubmit.textContent = "爬取视频";
+    const desc = document.querySelector("#dy-section-title + .wm-desc, .wm-head .wm-desc");
+    if (desc?.closest("section")?.querySelector("#dy-form")) {
+      desc.innerHTML =
+        "粘贴分享文案即可，支持<strong>抖音</strong>、<strong>快手</strong>、<strong>今日头条</strong>、<strong>小红书</strong>。视频在<strong>本机 App 内</strong>解析，无需 Mac 后端。";
+    }
+  }
 
   function setDyStatus(text, type = "") {
     dyStatus.textContent = text;
@@ -734,6 +811,7 @@ input.addEventListener("input", () => {
     }
     dySubmit.disabled = true;
     dyResult.classList.add("hidden");
+    revokeDyBlob();
 
     try {
       try {
@@ -741,7 +819,55 @@ input.addEventListener("input", () => {
       } catch {
         /* ignore */
       }
-      setDyStatus("正在爬取（解析链接 → 获取直链 → 下载），请稍候…");
+
+      const useLocal = window.Capacitor?.isNativePlatform?.();
+      if (useLocal) {
+        const crawl = await waitForLocalCrawl();
+        if (crawl?.crawlAndDownload) {
+          const isTt = /toutiao\.com/i.test(raw);
+          setDyStatus(
+            isTt
+              ? "正在爬取头条（本机解析，无需 Cookie）…"
+              : "正在爬取（本机解析链接 → 下载）…"
+          );
+          const result = await crawl.crawlAndDownload(raw, {
+            douyinCookie: cookie,
+            onProgress(done) {
+              if (done > 0) {
+                setDyStatus(`正在下载视频… ${(done / 1024 / 1024).toFixed(1)} MB`);
+              }
+            },
+          });
+          const blob = new Blob([result.buffer], { type: "video/mp4" });
+          lastDyBlobUrl = URL.createObjectURL(blob);
+          dyPreview.removeAttribute("src");
+          dyPreview.load();
+          dyPreview.src = lastDyBlobUrl;
+          dyDownload.href = lastDyBlobUrl;
+          const nameBase = String(result.aweme_id || "video").replace(/\D/g, "") || "video";
+          lastDyFilename = `${result.source || "video"}_${nameBase}.mp4`;
+          dyDownload.setAttribute("download", lastDyFilename);
+          lastDyDownloadUrl = lastDyBlobUrl;
+          const mb = ((result.size || 0) / 1024 / 1024).toFixed(1);
+          const dur = result.duration ? `${Math.round(result.duration)} 秒` : "";
+          const wmHint = result.watermark_free ? "无水印" : "含水印/平台流";
+          dyMeta.textContent = [
+            `来源：${result.source || "—"}`,
+            dur,
+            `${mb} MB`,
+            wmHint,
+            result.crawl_method ? `(${result.crawl_method})` : "",
+          ]
+            .filter(Boolean)
+            .join(" · ");
+          setDyStatus(`爬取完成 · ${wmHint}`, "ok");
+          dyResult.classList.remove("hidden");
+          return;
+        }
+        setDyStatus("本机爬虫未加载，改走 Mac 后端…", "error");
+      }
+
+      setDyStatus("正在爬取（经 Mac 后端，请保持同一 WiFi）…");
       const res = await fetch("/api/tools/douyin-cache", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -798,7 +924,12 @@ input.addEventListener("input", () => {
       setDyStatus(`爬取完成${method} · ${wmHint}，可预览或下载`, "ok");
       dyResult.classList.remove("hidden");
     } catch (err) {
-      setDyStatus(err.message || "抖音解析失败", "error");
+      let msg = err.message || "爬取失败";
+      if (/fetch|network|Failed|无法连接|Load/i.test(msg)) {
+        msg =
+          "无法连接 Mac 后端。请确认：① Mac 已运行 ./start.sh；② 手机与 Mac 同一 WiFi；③ 浏览器地址为 Mac 局域网 IP（非 localhost）。";
+      }
+      setDyStatus(msg, "error");
     } finally {
       dySubmit.disabled = false;
     }

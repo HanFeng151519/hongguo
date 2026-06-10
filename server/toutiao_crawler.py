@@ -63,14 +63,42 @@ def _group_id_from_url(url: str) -> str:
     return m.group(1) if m else ""
 
 
-async def _resolve_share_url(client: httpx.AsyncClient, share_url: str) -> str:
+def _group_id_from_content(url: str, html: str = "") -> str:
+    gid = _group_id_from_url(url)
+    if gid:
+        return gid
+    text = html or ""
+    for pat in (
+        r"/video/(\d{8,})",
+        r'"group_id"\s*:\s*"?(\d{8,})"?',
+        r'"item_id"\s*:\s*"?(\d{8,})"?',
+        r'"gid"\s*:\s*"?(\d{8,})"?',
+    ):
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            return m.group(1)
+    return ""
+
+
+async def _resolve_share_page(
+    client: httpx.AsyncClient, share_url: str
+) -> tuple[str, str]:
     resp = await client.get(
         share_url.strip(),
         headers=_mobile_headers("https://www.toutiao.com/"),
         follow_redirects=True,
         timeout=30.0,
     )
-    return str(resp.url)
+    html = resp.text
+    final_url = str(resp.url)
+    group_id = _group_id_from_content(final_url, html) or _group_id_from_content(
+        share_url, html
+    )
+    if not group_id:
+        raise RuntimeError("无法解析头条作品 ID")
+    if not _group_id_from_url(final_url):
+        final_url = f"https://m.toutiao.com/video/{group_id}/"
+    return final_url, group_id
 
 
 async def _fetch_article_info(
@@ -186,10 +214,7 @@ async def crawl_toutiao_and_download(
     if not share_url:
         raise RuntimeError("文案中未找到今日头条链接")
 
-    final_url = await _resolve_share_url(client, share_url)
-    group_id = _group_id_from_url(final_url) or _group_id_from_url(share_url)
-    if not group_id:
-        raise RuntimeError("无法解析头条作品 ID")
+    final_url, group_id = await _resolve_share_page(client, share_url)
 
     article = await _fetch_article_info(client, group_id, final_url)
     play_urls, duration, cover = await _resolve_play_urls(client, article, final_url)
