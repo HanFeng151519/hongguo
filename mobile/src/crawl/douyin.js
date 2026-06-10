@@ -42,9 +42,53 @@ function isCdnVideoUrl(url) {
   return CDN_HOST_HINTS.some((h) => u.includes(h)) || u.split("?")[0].endsWith(".mp4");
 }
 
-function playApiUrl(vid, watermark) {
+const PREFER_QUALITY = true;
+
+function playApiUrl(vid, watermark, ratio = "720p") {
   const path = watermark ? "playwm" : "play";
-  return `https://aweme.snssdk.com/aweme/v1/${path}/?video_id=${vid}&ratio=720p&line=0`;
+  return `https://aweme.snssdk.com/aweme/v1/${path}/?video_id=${vid}&ratio=${ratio}&line=0`;
+}
+
+function urlQualityScore(url) {
+  const u = String(url || "").toLowerCase();
+  let score = 0;
+  for (const [token, pts] of [
+    ["2160", 400],
+    ["1080", 300],
+    ["720", 200],
+    ["540", 120],
+    ["480", 80],
+  ]) {
+    if (u.includes(token)) score = Math.max(score, pts);
+  }
+  if (u.includes("ratio=1080") || u.includes("1080p")) score = Math.max(score, 300);
+  if (u.includes("ratio=720") || u.includes("720p")) score = Math.max(score, 200);
+  const br = u.match(/br=(\d+)/);
+  if (br) score = Math.max(score, Math.floor(Number(br[1]) / 8000));
+  return score;
+}
+
+function bitRateUrlsFromVideo(video) {
+  const ranked = [];
+  for (const entry of video?.bit_rate || []) {
+    if (!entry || typeof entry !== "object") continue;
+    const br = Number(entry.bit_rate || 0);
+    const gear = String(entry.gear_name || "");
+    let gearScore = 0;
+    for (const [token, pts] of [
+      ["1080", 300],
+      ["720", 200],
+      ["540", 120],
+    ]) {
+      if (gear.includes(token)) gearScore = Math.max(gearScore, pts);
+    }
+    const q = Math.max(Math.floor(br / 1000), gearScore);
+    for (const u of entry.play_addr?.url_list || []) {
+      if (isHttpUrl(u)) ranked.push([String(u).trim(), q + urlQualityScore(u)]);
+    }
+  }
+  ranked.sort((a, b) => b[1] - a[1]);
+  return ranked;
 }
 
 function scoreCandidate(url) {
@@ -58,6 +102,19 @@ function scoreCandidate(url) {
   return 40;
 }
 
+function sortCandidates(urls) {
+  if (!PREFER_QUALITY) return [...urls].sort((a, b) => scoreCandidate(a) - scoreCandidate(b));
+  return [...urls].sort((a, b) => {
+    const qa = urlQualityScore(a);
+    const qb = urlQualityScore(b);
+    if (qb !== qa) return qb - qa;
+    const wma = a.toLowerCase().includes("playwm") ? 1 : 0;
+    const wmb = b.toLowerCase().includes("playwm") ? 1 : 0;
+    if (wma !== wmb) return wma - wmb;
+    return scoreCandidate(a) - scoreCandidate(b);
+  });
+}
+
 function urlsFromJson(obj, out, preferDownload = true) {
   if (!obj || typeof obj !== "object") return;
   if (Array.isArray(obj)) {
@@ -66,6 +123,9 @@ function urlsFromJson(obj, out, preferDownload = true) {
   }
   const video = obj.video;
   if (video && typeof video === "object") {
+    if (PREFER_QUALITY) {
+      for (const [u] of bitRateUrlsFromVideo(video)) out.push(u);
+    }
     const keys = preferDownload
       ? ["download_addr", "play_addr", "play_addr_h264"]
       : ["play_addr", "download_addr", "play_addr_h264"];
@@ -109,11 +169,14 @@ function collectCandidatesFromHtml(html) {
       if (u[1].includes("playwm") || isCdnVideoUrl(u[1]) || u[1].includes("aweme/v1/play")) add(u[1]);
     }
   }
+  const ratios = PREFER_QUALITY ? ["1080p", "720p"] : ["720p"];
   for (const m of html.matchAll(/video_id=(v[0-9a-zA-Z]+)/g)) {
-    add(playApiUrl(m[1], false));
+    for (const ratio of ratios) add(playApiUrl(m[1], false, ratio));
+    add(playApiUrl(m[1], true));
   }
   for (const m of html.matchAll(/"uri"\s*:\s*"(v[0-9][^"]+)"/g)) {
-    add(playApiUrl(m[1], false));
+    for (const ratio of ratios) add(playApiUrl(m[1], false, ratio));
+    add(playApiUrl(m[1], true));
   }
 
   const render = html.match(/<script[^>]+id=["']RENDER_DATA["'][^>]*>([^<]+)<\/script>/i);
@@ -128,8 +191,7 @@ function collectCandidatesFromHtml(html) {
     }
   }
 
-  found.sort((a, b) => scoreCandidate(a) - scoreCandidate(b));
-  return found;
+  return sortCandidates(found);
 }
 
 async function fetchShareHtml(shareLink) {
@@ -176,17 +238,23 @@ async function resolveFromShareLink(shareLink) {
     }
   }
 
-  candidates.sort((a, b) => scoreCandidate(a) - scoreCandidate(b));
+  candidates = sortCandidates(candidates);
   return { candidates, referer: finalUrl };
 }
 
 function playUrlFromAwemeDetail(aweme) {
   const video = aweme?.video || {};
+  if (PREFER_QUALITY) {
+    const ranked = bitRateUrlsFromVideo(video);
+    if (ranked.length) return ranked[0][0];
+  }
   for (const key of ["download_addr", "play_addr"]) {
     for (const u of video[key]?.url_list || []) {
       if (isHttpUrl(u)) return String(u).trim();
     }
   }
+  const ranked = bitRateUrlsFromVideo(video);
+  if (ranked.length) return ranked[0][0];
   return "";
 }
 

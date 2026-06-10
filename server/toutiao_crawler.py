@@ -13,6 +13,7 @@ from urllib.parse import parse_qs
 import httpx
 
 from douyin_crawler import _download_video, _mobile_headers, extract_all_http_urls
+from material_common import is_http_url
 
 logger = logging.getLogger(__name__)
 
@@ -101,25 +102,63 @@ def _vod_params_from_token(token_b64: str) -> dict[str, str]:
     return {k: v[0] for k, v in parse_qs(inner).items() if v}
 
 
-def _pick_play_url(vod_payload: dict[str, Any]) -> str:
+def _play_item_quality(item: dict[str, Any]) -> int:
+    br = int(item.get("Bitrate") or 0)
+    height = int(item.get("Height") or 0)
+    width = int(item.get("Width") or 0)
+    meta = item.get("VideoMeta") or {}
+    if isinstance(meta, dict):
+        height = max(height, int(meta.get("Height") or 0))
+        width = max(width, int(meta.get("Width") or 0))
+    definition = str(item.get("Definition") or "").lower()
+    def_score = 0
+    if "1080" in definition:
+        def_score = 300_000
+    elif "720" in definition:
+        def_score = 200_000
+    elif "540" in definition:
+        def_score = 120_000
+    return max(br, height * width, def_score)
+
+
+def _pick_play_urls(vod_payload: dict[str, Any]) -> list[str]:
     result = vod_payload.get("Result") or {}
     data = result.get("Data") or {}
     items = data.get("PlayInfoList") or []
     if not isinstance(items, list) or not items:
         raise RuntimeError("头条未返回可播放地址")
-    best = max(
+    ranked = sorted(
         (x for x in items if isinstance(x, dict) and x.get("MainPlayUrl")),
-        key=lambda x: int(x.get("Bitrate") or 0),
-        default=None,
+        key=_play_item_quality,
+        reverse=True,
     )
-    if not best:
+    if not ranked:
         raise RuntimeError("头条播放列表为空")
-    return str(best["MainPlayUrl"])
+    urls: list[str] = []
+    seen: set[str] = set()
+    for item in ranked:
+        main = str(item.get("MainPlayUrl") or "").strip()
+        if is_http_url(main) and main not in seen:
+            seen.add(main)
+            urls.append(main)
+        backup = item.get("BackupPlayUrl")
+        if isinstance(backup, list):
+            for u in backup:
+                u = str(u).strip()
+                if is_http_url(u) and u not in seen:
+                    seen.add(u)
+                    urls.append(u)
+        elif is_http_url(str(backup or "")):
+            u = str(backup).strip()
+            if u not in seen:
+                seen.add(u)
+                urls.append(u)
+    return urls[:6]
 
 
-async def _resolve_play_url(
+async def _resolve_play_urls(
     client: httpx.AsyncClient, article: dict[str, Any], referer: str
-) -> tuple[str, float, str]:
+) -> tuple[list[str], float, str]:
     token = str(article.get("play_auth_token_v2") or "")
     params = _vod_params_from_token(token)
     resp = await client.get(
@@ -129,10 +168,10 @@ async def _resolve_play_url(
         timeout=30.0,
     )
     resp.raise_for_status()
-    play_url = _pick_play_url(resp.json())
+    play_urls = _pick_play_urls(resp.json())
     duration = float(article.get("video_duration") or 0)
     cover = str(article.get("poster_url") or "")
-    return play_url, duration, cover
+    return play_urls, duration, cover
 
 
 async def crawl_toutiao_and_download(
@@ -153,15 +192,26 @@ async def crawl_toutiao_and_download(
         raise RuntimeError("无法解析头条作品 ID")
 
     article = await _fetch_article_info(client, group_id, final_url)
-    play_url, duration, cover = await _resolve_play_url(client, article, final_url)
+    play_urls, duration, cover = await _resolve_play_urls(client, article, final_url)
 
-    meta = await _download_video(
-        client,
-        play_url,
-        dest,
-        referer=final_url,
-        crawl_method="toutiao_vod",
-    )
+    last_err: Optional[Exception] = None
+    meta: Optional[dict[str, Any]] = None
+    for play_url in play_urls:
+        try:
+            meta = await _download_video(
+                client,
+                play_url,
+                dest,
+                referer=final_url,
+                crawl_method="toutiao_vod_hd",
+            )
+            break
+        except (RuntimeError, httpx.HTTPError) as exc:
+            last_err = exc
+            logger.info("头条候选下载失败: %s", exc)
+    if not meta:
+        raise RuntimeError(str(last_err or "头条视频下载失败"))
+
     meta.update(
         {
             "aweme_id": group_id,

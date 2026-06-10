@@ -70,6 +70,15 @@ def prefer_no_watermark() -> bool:
     )
 
 
+def prefer_crawl_quality() -> bool:
+    """默认优先清晰度（可设 HONGGUO_CRAWL_PREFER_QUALITY=0 恢复旧策略）。"""
+    return os.getenv("HONGGUO_CRAWL_PREFER_QUALITY", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+    )
+
+
 def crawl_only_default() -> bool:
     v = os.getenv("HONGGUO_DOUYIN_CRAWL_ONLY", "1").strip().lower()
     return v not in ("0", "false", "no")
@@ -120,14 +129,71 @@ def _is_cdn_video_url(url: str) -> bool:
     return any(h in u for h in _CDN_HOST_HINTS) or u.split("?")[0].endswith(".mp4")
 
 
-def _play_api_url(vid: str, *, watermark: bool) -> str:
+def _play_api_url(vid: str, *, watermark: bool, ratio: str = "720p") -> str:
     vid = vid.strip()
     if not vid:
         return ""
     path = "playwm" if watermark else "play"
     return (
         f"https://aweme.snssdk.com/aweme/v1/{path}/"
-        f"?video_id={vid}&ratio=720p&line=0"
+        f"?video_id={vid}&ratio={ratio}&line=0"
+    )
+
+
+def _url_quality_score(url: str) -> int:
+    u = (url or "").lower()
+    score = 0
+    for token, pts in (
+        ("2160", 400),
+        ("1080", 300),
+        ("720", 200),
+        ("540", 120),
+        ("480", 80),
+    ):
+        if token in u:
+            score = max(score, pts)
+    if "ratio=1080" in u or "1080p" in u:
+        score = max(score, 300)
+    if "ratio=720" in u or "720p" in u:
+        score = max(score, 200)
+    m = re.search(r"br=(\d+)", u)
+    if m:
+        score = max(score, int(m.group(1)) // 8000)
+    return score
+
+
+def _bit_rate_urls_from_video(video: dict[str, Any]) -> list[tuple[str, int]]:
+    ranked: list[tuple[str, int]] = []
+    for entry in video.get("bit_rate") or []:
+        if not isinstance(entry, dict):
+            continue
+        br = int(entry.get("bit_rate") or 0)
+        gear = str(entry.get("gear_name") or "")
+        gear_score = 0
+        for token, pts in (("1080", 300), ("720", 200), ("540", 120)):
+            if token in gear:
+                gear_score = max(gear_score, pts)
+        q = max(br // 1000, gear_score)
+        addr = entry.get("play_addr") or {}
+        if isinstance(addr, dict):
+            for u in addr.get("url_list") or []:
+                u = str(u).strip()
+                if is_http_url(u):
+                    ranked.append((u, q + _url_quality_score(u)))
+    ranked.sort(key=lambda x: x[1], reverse=True)
+    return ranked
+
+
+def _sort_candidates(urls: list[str]) -> list[str]:
+    if not prefer_crawl_quality():
+        return sorted(urls, key=_score_candidate)
+    return sorted(
+        urls,
+        key=lambda u: (
+            -_url_quality_score(u),
+            1 if "playwm" in u.lower() else 0,
+            _score_candidate(u),
+        ),
     )
 
 
@@ -156,6 +222,9 @@ def _urls_from_json(obj: Any, out: list[str], *, prefer_download: bool) -> None:
     if isinstance(obj, dict):
         video = obj.get("video") if "video" in obj else None
         if isinstance(video, dict):
+            if prefer_crawl_quality():
+                for u, _ in _bit_rate_urls_from_video(video):
+                    out.append(u)
             keys = ("download_addr", "play_addr", "play_addr_h264")
             if not prefer_download:
                 keys = ("play_addr", "download_addr", "play_addr_h264")
@@ -213,14 +282,17 @@ def _collect_candidates_from_html_full(html: str) -> list[str]:
             if "playwm" in u or _is_cdn_video_url(u) or "aweme/v1/play" in u:
                 add(u)
 
+    ratios = ("1080p", "720p") if prefer_crawl_quality() else ("720p",)
     for m in _VIDEO_ID_RE.finditer(html):
         if no_wm:
-            add(_play_api_url(m.group(1), watermark=False))
+            for ratio in ratios:
+                add(_play_api_url(m.group(1), watermark=False, ratio=ratio))
         add(_play_api_url(m.group(1), watermark=True))
 
     for m in _URI_RE.finditer(html):
         if no_wm:
-            add(_play_api_url(m.group(1), watermark=False))
+            for ratio in ratios:
+                add(_play_api_url(m.group(1), watermark=False, ratio=ratio))
         add(_play_api_url(m.group(1), watermark=True))
 
     if not no_wm:
@@ -238,8 +310,7 @@ def _collect_candidates_from_html_full(html: str) -> list[str]:
         except (json.JSONDecodeError, ValueError):
             pass
 
-    found.sort(key=_score_candidate)
-    return found
+    return _sort_candidates(found)
 
 
 def _mobile_headers(referer: str = "https://www.douyin.com/") -> dict[str, str]:
@@ -363,7 +434,7 @@ async def _resolve_from_share_link(
         except httpx.HTTPError:
             pass
 
-    candidates.sort(key=_score_candidate)
+    candidates = _sort_candidates(candidates)
     return candidates, final_url
 
 
@@ -390,8 +461,11 @@ async def _try_share_urls(
 
 
 def _play_url_from_aweme_detail(aweme: dict[str, Any]) -> str:
-    """API 详情：优先 download_addr（通常无水印）。"""
+    """API 详情：清晰度模式下优先 bit_rate 最高档。"""
     video = aweme.get("video") or {}
+    if prefer_crawl_quality():
+        for u, _ in _bit_rate_urls_from_video(video):
+            return u
     keys = (
         ("download_addr", "play_addr")
         if prefer_no_watermark()
@@ -403,6 +477,8 @@ def _play_url_from_aweme_detail(aweme: dict[str, Any]) -> str:
             u = str(u).strip()
             if u.startswith("http"):
                 return u
+    for u, _ in _bit_rate_urls_from_video(video):
+        return u
     return ""
 
 

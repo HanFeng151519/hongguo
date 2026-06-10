@@ -1,5 +1,5 @@
 import { downloadBinary, httpGet } from "./http.js";
-import { extractAllHttpUrls } from "./utils.js";
+import { extractAllHttpUrls, isHttpUrl } from "./utils.js";
 
 const MOBILE_UA =
   "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/537.36 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1";
@@ -71,17 +71,51 @@ function vodParamsFromToken(tokenB64) {
   return params;
 }
 
-function pickPlayUrl(vodPayload) {
-  const items = vodPayload?.Result?.Data?.PlayInfoList;
-  if (!Array.isArray(items) || !items.length) throw new Error("头条未返回可播放地址");
-  const best = items
-    .filter((x) => x?.MainPlayUrl)
-    .sort((a, b) => Number(b.Bitrate || 0) - Number(a.Bitrate || 0))[0];
-  if (!best) throw new Error("头条播放列表为空");
-  return String(best.MainPlayUrl);
+function playItemQuality(item) {
+  const br = Number(item.Bitrate || 0);
+  let height = Number(item.Height || 0);
+  let width = Number(item.Width || 0);
+  const meta = item.VideoMeta;
+  if (meta && typeof meta === "object") {
+    height = Math.max(height, Number(meta.Height || 0));
+    width = Math.max(width, Number(meta.Width || 0));
+  }
+  const definition = String(item.Definition || "").toLowerCase();
+  let defScore = 0;
+  if (definition.includes("1080")) defScore = 300000;
+  else if (definition.includes("720")) defScore = 200000;
+  else if (definition.includes("540")) defScore = 120000;
+  return Math.max(br, height * width, defScore);
 }
 
-async function resolvePlayUrl(article, referer) {
+function pickPlayUrls(vodPayload) {
+  const items = vodPayload?.Result?.Data?.PlayInfoList;
+  if (!Array.isArray(items) || !items.length) throw new Error("头条未返回可播放地址");
+  const ranked = items
+    .filter((x) => x?.MainPlayUrl)
+    .sort((a, b) => playItemQuality(b) - playItemQuality(a));
+  if (!ranked.length) throw new Error("头条播放列表为空");
+
+  const urls = [];
+  const seen = new Set();
+  const push = (u) => {
+    const s = String(u || "").trim();
+    if (isHttpUrl(s) && !seen.has(s)) {
+      seen.add(s);
+      urls.push(s);
+    }
+  };
+
+  for (const item of ranked) {
+    push(item.MainPlayUrl);
+    const backup = item.BackupPlayUrl;
+    if (Array.isArray(backup)) backup.forEach(push);
+    else push(backup);
+  }
+  return urls.slice(0, 6);
+}
+
+async function resolvePlayUrls(article, referer) {
   const token = String(article.play_auth_token_v2 || "");
   const params = vodParamsFromToken(token);
   const qs = new URLSearchParams(params).toString();
@@ -89,10 +123,10 @@ async function resolvePlayUrl(article, referer) {
     headers: mobileHeaders(referer),
     responseType: "json",
   });
-  const playUrl = pickPlayUrl(res.data);
+  const playUrls = pickPlayUrls(res.data);
   const duration = Number(article.video_duration || 0);
   const cover = String(article.poster_url || "");
-  return { playUrl, duration, cover };
+  return { playUrls, duration, cover };
 }
 
 export async function tryCrawlToutiao(shareText, onProgress) {
@@ -109,24 +143,33 @@ export async function tryCrawlToutiao(shareText, onProgress) {
     if (!groupId) throw new Error("无法解析头条作品 ID");
 
     const article = await fetchArticleInfo(groupId, finalUrl);
-    const { playUrl, duration, cover } = await resolvePlayUrl(article, finalUrl);
-    const { buffer, size, finalUrl: dlUrl } = await downloadBinary(
-      playUrl,
-      mobileHeaders(finalUrl),
-      onProgress
-    );
-    return {
-      buffer,
-      size,
-      aweme_id: groupId,
-      caption: "",
-      play_url: dlUrl,
-      duration,
-      cover_url: cover,
-      crawl_method: "toutiao_vod",
-      watermark_free: true,
-      source: "toutiao_crawl",
-    };
+    const { playUrls, duration, cover } = await resolvePlayUrls(article, finalUrl);
+
+    let lastErr = null;
+    for (const playUrl of playUrls) {
+      try {
+        const { buffer, size, finalUrl: dlUrl } = await downloadBinary(
+          playUrl,
+          mobileHeaders(finalUrl),
+          onProgress
+        );
+        return {
+          buffer,
+          size,
+          aweme_id: groupId,
+          caption: "",
+          play_url: dlUrl,
+          duration,
+          cover_url: cover,
+          crawl_method: "toutiao_vod_hd",
+          watermark_free: true,
+          source: "toutiao_crawl",
+        };
+      } catch (err) {
+        lastErr = err;
+      }
+    }
+    throw lastErr || new Error("头条视频下载失败");
   } catch (err) {
     console.info("头条爬取失败:", err);
     return null;
