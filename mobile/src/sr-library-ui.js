@@ -75,6 +75,13 @@ export function bindSrLibraryUI({
     }
   });
 
-  if (panel) panel.open = (await loadSrLibrary()).length > 0;
+  // Initialize panel visibility based on library items
+  (async () => {
+    if (panel) {
+      const items = await loadSrLibrary();
+      panel.open = items.length > 0;
+    }
+  })();
+  
   return render;
 }
