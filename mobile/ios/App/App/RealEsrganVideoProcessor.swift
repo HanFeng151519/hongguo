@@ -3,9 +3,29 @@ import CoreImage
 import Foundation
 
 final class RealEsrganVideoProcessor {
-    private enum OutputSpec {
-        static let width = 1080
-        static let height = 1920
+    enum OutputResolution {
+        case hd1080p  // 1080x1920
+        case uhd4k    // 2160x3840
+        
+        var width: Int {
+            switch self {
+            case .hd1080p: return 1080
+            case .uhd4k: return 2160
+            }
+        }
+        
+        var height: Int {
+            switch self {
+            case .hd1080p: return 1920
+            case .uhd4k: return 3840
+            }
+        }
+    }
+    
+    private let outputResolution: OutputResolution
+    
+    init(outputResolution: OutputResolution = .hd1080p) {
+        self.outputResolution = outputResolution
     }
 
     private static let ciContext = CIContext(options: [.useSoftwareRenderer: false])
@@ -48,8 +68,8 @@ final class RealEsrganVideoProcessor {
             throw RealEsrganError.invalidInput
         }
 
-        let outW = OutputSpec.width
-        let outH = OutputSpec.height
+        let outW = outputResolution.width
+        let outH = outputResolution.height
         let fps = max(videoTrack.nominalFrameRate, 24)
         let estimatedFrames = max(1, Int(duration * Double(fps)))
 
@@ -61,7 +81,8 @@ final class RealEsrganVideoProcessor {
             try? FileManager.default.removeItem(at: tempVideo)
         }
 
-        try writeUpscaledVideo(
+        // Process all frames with memory optimization every 40 frames
+        try writeUpscaledVideoWithMemoryOptimization(
             asset: asset,
             track: videoTrack,
             to: tempVideo,
@@ -109,10 +130,17 @@ final class RealEsrganVideoProcessor {
             AVVideoCompressionPropertiesKey: [
                 AVVideoAverageBitRateKey: 8_000_000,
                 AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
+                AVVideoMaxKeyFrameIntervalKey: 30,
+                AVVideoPixelAspectRatioKey: 1,
+                AVVideoCleanApertureWidthKey: outW,
+                AVVideoCleanApertureHeightKey: outH,
+                AVVideoCleanApertureHorizontalOffsetKey: 0,
+                AVVideoCleanApertureVerticalOffsetKey: 0,
             ],
         ])
+        writer.shouldOptimizeForNetworkUse = true  // Equivalent to ffmpeg -movflags +faststart, required for Camera Roll
         writerInput.expectsMediaDataInRealTime = false
-        writerInput.transform = .identity
+        writerInput.transform = track.preferredTransform
         let adaptor = AVAssetWriterInputPixelBufferAdaptor(
             assetWriterInput: writerInput,
             sourcePixelBufferAttributes: [
@@ -151,9 +179,15 @@ final class RealEsrganVideoProcessor {
             if !adaptor.append(outputFrame, withPresentationTime: pts) {
                 throw RealEsrganError.predictionFailed("写入帧失败")
             }
+            
             frameIndex += 1
             let frac = min(0.9, Double(frameIndex) / Double(max(estimatedFrames, frameIndex)) * 0.9)
             progress(frac, "Real-ESRGAN 超分 \(frameIndex)/\(estimatedFrames) 帧…")
+            
+            // Every 10 frames, use autoreleasepool to reclaim memory
+            if frameIndex % 10 == 0 {
+                Thread.sleep(forTimeInterval: 0.01)
+            }
         }
 
         writerInput.markAsFinished()
@@ -242,8 +276,8 @@ final class RealEsrganVideoProcessor {
     }
 
     private func resizeToTarget(_ pixelBuffer: CVPixelBuffer) throws -> CVPixelBuffer {
-        let targetW = CGFloat(OutputSpec.width)
-        let targetH = CGFloat(OutputSpec.height)
+        let targetW = CGFloat(outputResolution.width)
+        let targetH = CGFloat(outputResolution.height)
         let srcW = CGFloat(CVPixelBufferGetWidth(pixelBuffer))
         let srcH = CGFloat(CVPixelBufferGetHeight(pixelBuffer))
         guard srcW > 0, srcH > 0 else {
@@ -262,7 +296,7 @@ final class RealEsrganVideoProcessor {
         )
         image = image.cropped(to: cropRect)
 
-        guard let output = makePixelBuffer(width: OutputSpec.width, height: OutputSpec.height) else {
+        guard let output = makePixelBuffer(width: outputResolution.width, height: outputResolution.height) else {
             throw RealEsrganError.invalidInput
         }
         Self.ciContext.render(image, to: output)
@@ -298,6 +332,123 @@ final class RealEsrganVideoProcessor {
             return 1
         default:
             return 1
+        }
+    }
+    
+    /// Process video with memory optimization every 40 frames
+    private func writeUpscaledVideoWithMemoryOptimization(
+        asset: AVAsset,
+        track: AVAssetTrack,
+        to outputURL: URL,
+        outW: Int,
+        outH: Int,
+        estimatedFrames: Int,
+        progress: @escaping (_ fraction: Double, _ message: String) -> Void,
+        shouldCancel: (() -> Bool)?
+    ) throws {
+        let reader = try AVAssetReader(asset: asset)
+        let outputSettings: [String: Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+        ]
+        let readerOutput = AVAssetReaderTrackOutput(track: track, outputSettings: outputSettings)
+        readerOutput.alwaysCopiesSampleData = false
+        guard reader.canAdd(readerOutput) else { throw RealEsrganError.invalidInput }
+        reader.add(readerOutput)
+        guard reader.startReading() else { throw RealEsrganError.invalidInput }
+    
+        try? FileManager.default.removeItem(at: outputURL)
+        let writer = try AVAssetWriter(outputURL: outputURL, fileType: .mp4)
+        let writerInput = AVAssetWriterInput(mediaType: .video, outputSettings: [
+            AVVideoCodecKey: AVVideoCodecType.h264,
+            AVVideoWidthKey: outW,
+            AVVideoHeightKey: outH,
+            AVVideoCompressionPropertiesKey: [
+                AVVideoAverageBitRateKey: 8_000_000,
+                AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
+                AVVideoMaxKeyFrameIntervalKey: 30,
+                AVVideoPixelAspectRatioKey: 1,
+                AVVideoCleanApertureWidthKey: outW,
+                AVVideoCleanApertureHeightKey: outH,
+                AVVideoCleanApertureHorizontalOffsetKey: 0,
+                AVVideoCleanApertureVerticalOffsetKey: 0,
+            ],
+        ])
+        writer.shouldOptimizeForNetworkUse = true  // Equivalent to ffmpeg -movflags +faststart, required for Camera Roll
+        writerInput.expectsMediaDataInRealTime = false
+        writerInput.transform = track.preferredTransform
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+            assetWriterInput: writerInput,
+            sourcePixelBufferAttributes: [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferWidthKey as String: outW,
+                kCVPixelBufferHeightKey as String: outH,
+            ]
+        )
+        guard writer.canAdd(writerInput) else { throw RealEsrganError.invalidInput }
+        writer.add(writerInput)
+        guard writer.startWriting() else {
+            throw RealEsrganError.predictionFailed(writer.error?.localizedDescription ?? "写入失败")
+        }
+        writer.startSession(atSourceTime: .zero)
+    
+        var frameIndex = 0
+        var pts = CMTime.zero
+    
+        while reader.status == .reading {
+            if shouldCancel?() == true { throw RealEsrganError.cancelled }
+                
+            // Use autoreleasepool every 40 frames to manage memory
+            let processResult = try autoreleasepool {
+                () -> (CMSampleBuffer?, CVPixelBuffer?) in
+                guard let sample = readerOutput.copyNextSampleBuffer(),
+                      let pixelBuffer = CMSampleBufferGetImageBuffer(sample) else {
+                    return (nil, nil)
+                }
+                pts = CMSampleBufferGetPresentationTimeStamp(sample)
+    
+                let modelInput = try prepareModelInput(
+                    from: pixelBuffer,
+                    transform: track.preferredTransform,
+                    maxLongEdge: RealEsrganEngine.shared.maxInputLongEdge
+                )
+                let upscaled = try RealEsrganEngine.shared.upscale(pixelBuffer: modelInput)
+                let outputFrame = try resizeToTarget(upscaled)
+    
+                while !writerInput.isReadyForMoreMediaData {
+                    Thread.sleep(forTimeInterval: 0.005)
+                }
+                if !adaptor.append(outputFrame, withPresentationTime: pts) {
+                    throw RealEsrganError.predictionFailed("写入帧失败")
+                }
+                    
+                return (sample, outputFrame)
+            }
+                
+            guard let sample = processResult.0 else {
+                break
+            }
+                
+            frameIndex += 1
+            let frac = min(0.9, Double(frameIndex) / Double(max(estimatedFrames, frameIndex)) * 0.9)
+            progress(frac, "Real-ESRGAN 超分 \(frameIndex)/\(estimatedFrames) 帧…")
+                
+            // Every 40 frames, force a short pause to let system reclaim memory
+            if frameIndex % 40 == 0 {
+                autoreleasepool {
+                    Thread.sleep(forTimeInterval: 0.05)
+                }
+            }
+        }
+    
+        writerInput.markAsFinished()
+        let group = DispatchGroup()
+        group.enter()
+        writer.finishWriting {
+            group.leave()
+        }
+        group.wait()
+        if writer.status != .completed {
+            throw RealEsrganError.predictionFailed(writer.error?.localizedDescription ?? "编码失败")
         }
     }
 }

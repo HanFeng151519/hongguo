@@ -53,6 +53,7 @@ const sharePasteBtn = document.getElementById("share-paste");
 const MAC_SERVER_PRESETS = [
   "http://9.112.85.25:8000",
   "http://192.168.3.56:8000",
+  "http://172.31.12.193:8000",
 ];
 const srServerPreset = document.getElementById("sr-server-preset");
 const srServerCustom = document.getElementById("sr-server-custom");
@@ -103,6 +104,8 @@ const srNativeCancelBtn = document.getElementById("sr-native-cancel-btn");
 const srLibraryPanel = document.getElementById("sr-library-panel");
 const srLibraryList = document.getElementById("sr-library-list");
 const srLibraryCount = document.getElementById("sr-library-count");
+const uploadVideoBtn = document.getElementById("upload-video-btn");
+const videoFileInput = document.getElementById("video-file-input");
 
 let lastFile = null;
 let lastVideoBuffer = null;
@@ -757,6 +760,89 @@ async function runNativeSuperResolution() {
     "ok"
   );
 }
+
+// Handle local video upload for super-resolution
+uploadVideoBtn?.addEventListener("click", () => {
+  if (!isNativePlatform()) {
+    setStatus("请在 iOS App 内使用上传功能", "error");
+    return;
+  }
+  videoFileInput?.click();
+});
+
+videoFileInput?.addEventListener("change", async (e) => {
+  const file = e.target.files?.[0];
+  if (!file) return;
+
+  // Reset input to allow selecting the same file again
+  e.target.value = "";
+
+  if (!file.type.startsWith("video/")) {
+    setStatus("请选择视频文件", "error");
+    return;
+  }
+
+  setSrBusy(true);
+  try {
+    setStatus("正在保存视频到应用目录…");
+    
+    console.log('File selected:', file.name, 'Size:', (file.size / 1024 / 1024).toFixed(2), 'MB');
+    
+    // Show progress for large files
+    const fileSizeMB = file.size / 1024 / 1024;
+    if (fileSizeMB > 10) {
+      setStatus(`文件较大 (${fileSizeMB.toFixed(1)} MB)，正在处理…`);
+    }
+    
+    // Convert File to ArrayBuffer
+    const arrayBuffer = await file.arrayBuffer();
+    console.log('ArrayBuffer created, size:', arrayBuffer.byteLength);
+    
+    // Save video file to app storage
+    console.log('Calling saveVideoBuffer...');
+    setStatus("正在写入文件（大文件可能需要几秒）…");
+    const savedFile = await saveVideoBuffer(arrayBuffer, file.name);
+    console.log('File saved successfully:', savedFile);
+    
+    lastFile = {
+      uri: savedFile.uri,
+      filename: savedFile.filename,
+    };
+    
+    // Load video buffer for preview (use the original file)
+    setStatus("正在加载视频预览…");
+    lastVideoBuffer = arrayBuffer;
+    
+    // Show result section
+    resultEl?.classList.remove("hidden");
+    const videoStage = document.getElementById("video-stage");
+    videoStage?.classList.remove("is-loading");
+    
+    // Setup video preview
+    if (preview) {
+      preview.src = savedFile.uri;
+      preview.load();
+    }
+    
+    // Update meta info
+    if (metaEl) {
+      metaEl.textContent = `${savedFile.filename}`;
+    }
+    
+    // Sync SR buttons
+    nativeSrReady = await isNativeSrAvailable();
+    const modelReady = await isNativeSrModelReady();
+    syncSrButtons(modelReady);
+    
+    setStatus(`视频已加载：${savedFile.filename}，可以点击「本机超分并保存」`, "ok");
+  } catch (err) {
+    console.error("Failed to upload video:", err);
+    console.error("Error details:", err.message, err.stack);
+    setStatus(`上传失败：${err.message || "未知错误"}`, "error");
+  } finally {
+    setSrBusy(false);
+  }
+});
 
 srNativeBtn?.addEventListener("click", async () => {
   if (!lastVideoBuffer || !lastFile) {

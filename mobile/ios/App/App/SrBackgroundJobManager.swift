@@ -92,7 +92,7 @@ final class SrBackgroundJobManager {
         cancelJob()
     }
 
-    func start(inputURL: URL, displayFilename: String) throws -> String {
+    func start(inputURL: URL, displayFilename: String, outputResolution: RealEsrganVideoProcessor.OutputResolution = .hd1080p) throws -> String {
         lock.lock()
         if let existing = job, existing.status == "running" {
             lock.unlock()
@@ -120,12 +120,12 @@ final class SrBackgroundJobManager {
 
         beginBackgroundTask()
         workQueue.async { [weak self] in
-            self?.runJob(inputURL: inputURL, jobId: jobId, displayFilename: displayFilename)
+            self?.runJob(inputURL: inputURL, jobId: jobId, displayFilename: displayFilename, outputResolution: outputResolution)
         }
         return jobId
     }
 
-    private func runJob(inputURL: URL, jobId: String, displayFilename: String) {
+    private func runJob(inputURL: URL, jobId: String, displayFilename: String, outputResolution: RealEsrganVideoProcessor.OutputResolution) {
         defer {
             lock.lock()
             cancelRequested = false
@@ -158,7 +158,7 @@ final class SrBackgroundJobManager {
                 self.emitProgress(message: msg, progress: 0.1)
             }
 
-            let processor = RealEsrganVideoProcessor()
+            let processor = RealEsrganVideoProcessor(outputResolution: outputResolution)
             let result = try processor.process(inputURL: inputURL, progress: { [weak self] fraction, message in
                 guard let self else { return }
                 if self.isCancelRequested() { return }

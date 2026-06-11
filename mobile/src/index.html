@@ -60,6 +60,7 @@
             <select id="sr-server-preset" class="wm-share-input" aria-label="Mac 后端地址">
               <option value="http://9.112.85.25:8000">http://9.112.85.25:8000</option>
               <option value="http://192.168.3.56:8000">http://192.168.3.56:8000</option>
+              <option value="http://172.31.12.193:8000">http://172.31.12.193:8000</option>
               <option value="__custom__">自定义…</option>
             </select>
             <input
@@ -78,8 +79,8 @@
           <label class="wm-field">
             <span>超分输出</span>
             <select id="sr-scale" class="wm-share-input">
-              <option value="1080" selected>1080p</option>
-              <option value="4k">4K（更慢）</option>
+              <option value="1080">1080p</option>
+              <option value="4k" selected>4K（更慢）</option>
             </select>
           </label>
           <button type="button" id="sr-test" class="btn-adjust-reset">测试连接</button>
@@ -100,7 +101,11 @@
 
         <div class="wm-actions">
           <button type="submit" id="submit-btn" class="btn-primary">爬取视频</button>
+          <button type="button" id="upload-video-btn" class="btn-secondary">📁 上传本地视频超分</button>
         </div>
+
+        <!-- Hidden file input for video upload -->
+        <input type="file" id="video-file-input" accept="video/*" class="hidden" />
 
         <p id="status" class="wm-status hidden" role="status"></p>
         <div id="sr-progress-wrap" class="sr-progress-wrap hidden" aria-live="polite">

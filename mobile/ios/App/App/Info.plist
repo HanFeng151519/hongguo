@@ -51,6 +51,8 @@
 	<string>需要保存爬取的视频到您的相册</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>需要访问同一 Wi‑Fi 下 Mac 电脑的 AI 超分服务（./start.sh）</string>
+	<key>NSPasteboardUsageDescription</key>
+	<string>需要读取剪贴板以粘贴视频链接</string>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsArbitraryLoads</key>

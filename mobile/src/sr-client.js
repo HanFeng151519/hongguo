@@ -22,7 +22,7 @@ export async function loadSrSettings() {
   ]);
   return {
     serverUrl: normalizeServerUrl(server.value || ""),
-    outputScale: scale.value === "4k" ? "4k" : "1080",
+    outputScale: scale.value === "1080" ? "1080" : "4k", // 默认为4k
   };
 }
 

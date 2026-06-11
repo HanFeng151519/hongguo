@@ -1,6 +1,6 @@
-# Core ML 模型
-App/Models/.cache/
-App/Models/RealESRGAN.mlmodel
-App/Models/RealESRGAN_x2plus.mlpackage/
-App/Models/*.zip
+# Core ML 模型（npm run ensure:sr-model 本地生成，不提交）
+**/RealESRGAN*.mlpackage/
+**/RealESRGAN.mlmodel
+**/.cache/
+**/*.mlpackage.zip
 scripts/.venv-sr/

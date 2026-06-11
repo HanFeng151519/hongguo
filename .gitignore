@@ -24,7 +24,12 @@ mobile/ios/App/App.xcodeproj/xcuserdata/
 mobile/ios/App/App.xcworkspace/xcuserdata/
 mobile/ios/DerivedData/
 mobile/scripts/.venv-sr/
+mobile/ios/**/RealESRGAN*.mlpackage/
+mobile/ios/**/RealESRGAN.mlmodel
+mobile/ios/**/.cache/
+mobile/ios/**/*.mlpackage.zip
 server/.venv/
+server/hook_*TEMP*.mp4
 tmp/
 *.mp4
 !public/downloads/.gitkeep

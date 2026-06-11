@@ -1,5 +1,6 @@
 import Capacitor
 import Foundation
+import Photos
 
 @objc(RealEsrganPlugin)
 public class RealEsrganPlugin: CAPPlugin, CAPBridgedPlugin {
@@ -14,6 +15,7 @@ public class RealEsrganPlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "getBackgroundJobStatus", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "clearBackgroundJob", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "cancelBackgroundJob", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "saveToPhotos", returnType: CAPPluginReturnPromise),
     ]
 
     public override func load() {
@@ -62,12 +64,22 @@ public class RealEsrganPlugin: CAPPlugin, CAPBridgedPlugin {
             return
         }
         let displayFilename = call.getString("displayFilename") ?? "video_sr.mp4"
+        let outputScale = call.getString("outputScale") ?? "1080"
+        
+        // Parse output resolution
+        let resolution: RealEsrganVideoProcessor.OutputResolution
+        if outputScale.lowercased() == "4k" {
+            resolution = .uhd4k
+        } else {
+            resolution = .hd1080p
+        }
 
         SrNotificationHelper.requestPermission { granted in
             do {
                 let jobId = try SrBackgroundJobManager.shared.start(
                     inputURL: inputURL,
-                    displayFilename: displayFilename
+                    displayFilename: displayFilename,
+                    outputResolution: resolution
                 )
                 call.resolve([
                     "jobId": jobId,
@@ -154,5 +166,80 @@ public class RealEsrganPlugin: CAPPlugin, CAPBridgedPlugin {
             return URL(fileURLWithPath: path)
         }
         return nil
+    }
+    
+    @objc func saveToPhotos(_ call: CAPPluginCall) {
+        guard let videoPath = call.getString("videoPath"), !videoPath.isEmpty else {
+            call.reject("缺少 videoPath")
+            return
+        }
+        
+        guard let videoURL = resolveFileURL(videoPath) else {
+            call.reject("无效的视频路径")
+            return
+        }
+        
+        // Check if file exists
+        guard FileManager.default.fileExists(atPath: videoURL.path) else {
+            call.reject("视频文件不存在")
+            return
+        }
+        
+        // Request permission to write to photo library
+        PHPhotoLibrary.requestAuthorization { [weak self] status in
+            guard let self = self else { return }
+            
+            if status != .authorized && status != .limited {
+                DispatchQueue.main.async {
+                    call.reject("没有相册写入权限，请在设置中授予权限")
+                }
+                return
+            }
+            
+            // Save video to photo library
+            PHPhotoLibrary.shared().performChanges({
+                // First, try to re-encode with AVAssetExportSession for better compatibility
+                let asset = AVURLAsset(url: videoURL)
+                guard let exportSession = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetHighestQuality) else {
+                    NSLog("Failed to create export session")
+                    return
+                }
+                
+                let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent("export_\(UUID().uuidString).mp4")
+                exportSession.outputURL = tempURL
+                exportSession.outputFileType = .mp4
+                exportSession.shouldOptimizeForNetworkUse = true
+                
+                // Wait for export to complete synchronously within the change block
+                let semaphore = DispatchSemaphore(value: 0)
+                exportSession.exportAsynchronously {
+                    semaphore.signal()
+                }
+                semaphore.wait()
+                
+                if exportSession.status == .completed, let exportedURL = exportSession.outputURL {
+                    // Use the re-encoded video
+                    _ = PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: exportedURL)
+                    // Clean up temp file after a delay
+                    DispatchQueue.global().asyncAfter(deadline: .now() + 2) {
+                        try? FileManager.default.removeItem(at: exportedURL)
+                    }
+                } else {
+                    // Fallback to original file
+                    NSLog("Export failed: \(exportSession.error?.localizedDescription ?? "Unknown"), using original file")
+                    _ = PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: videoURL)
+                }
+            }) { success, error in
+                DispatchQueue.main.async {
+                    if success {
+                        NSLog("Video saved to photos successfully: \(videoURL.lastPathComponent)")
+                        call.resolve(["success": true])
+                    } else {
+                        NSLog("Failed to save video: \(error?.localizedDescription ?? "Unknown error")")
+                        call.reject("保存失败：\(error?.localizedDescription ?? "未知错误")")
+                    }
+                }
+            }
+        }
     }
 }

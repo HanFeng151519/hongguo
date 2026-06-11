@@ -9,6 +9,12 @@ LEGACY_MODEL="$MODELS_DIR/RealESRGAN.mlmodel"
 
 if [ -d "$V3_PKG" ]; then
   echo "Real-ESRGAN v3 Core ML 模型已存在: $V3_PKG"
+  # Also copy to App root for Xcode bundling
+  APP_ROOT="$ROOT/ios/App/App"
+  if [ -d "$V3_PKG" ] && [ ! -d "$APP_ROOT/RealESRGAN_v3.mlpackage" ]; then
+    cp -R "$V3_PKG" "$APP_ROOT/"
+    echo "已复制到: $APP_ROOT/RealESRGAN_v3.mlpackage"
+  fi
   exit 0
 fi
 

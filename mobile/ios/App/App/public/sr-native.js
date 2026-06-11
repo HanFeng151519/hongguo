@@ -73,7 +73,7 @@ export async function cancelNativeSrJob() {
 export async function startNativeSuperResolutionBackground(
   inputUri,
   displayFilename,
-  { onStatus, onProgress, onComplete } = {}
+  { onStatus, onProgress, onComplete, outputScale = "4k" } = {}
 ) {
   if (!isNativePlatform()) {
     throw new Error("本机 AI 超分仅支持 iOS App");
@@ -104,6 +104,7 @@ export async function startNativeSuperResolutionBackground(
     const result = await plugin.startSuperResolveInBackground({
       inputPath: inputUri,
       displayFilename,
+      outputScale, // Pass output resolution ("4k" or "1080")
     });
     return result;
   } finally {

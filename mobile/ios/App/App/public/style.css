@@ -390,11 +390,41 @@ body {
 
 .sr-library-item {
   display: flex;
-  flex-direction: column;
-  gap: 8px;
+  gap: 10px;
   padding: 10px 12px;
   border-radius: 10px;
   background: rgba(0, 0, 0, 0.04);
+}
+
+.sr-library-content {
+  display: flex;
+  gap: 10px;
+  width: 100%;
+}
+
+.sr-library-thumb,
+.sr-library-thumb-placeholder {
+  width: 80px;
+  height: 120px;
+  object-fit: cover;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.08);
+  flex-shrink: 0;
+}
+
+.sr-library-thumb-placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 2rem;
+}
+
+.sr-library-info {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
 }
 
 .sr-library-name {
@@ -413,7 +443,8 @@ body {
 
 .sr-library-actions {
   display: flex;
-  gap: 8px;
+  gap: 6px;
+  margin-top: auto;
 }
 
 .btn-library-save,
