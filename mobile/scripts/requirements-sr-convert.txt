@@ -1,0 +1,4 @@
+torch>=2.0
+coremltools>=7.0
+spandrel>=0.3.4
+numpy>=1.24

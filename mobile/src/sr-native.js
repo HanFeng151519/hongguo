@@ -53,6 +53,20 @@ export async function clearNativeSrJob() {
   }
 }
 
+export async function cancelNativeSrJob() {
+  if (!isNativePlatform()) return;
+  try {
+    const plugin = getSrPlugin();
+    if (plugin.cancelBackgroundJob) {
+      await plugin.cancelBackgroundJob();
+    } else {
+      await plugin.clearBackgroundJob();
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
 /**
  * 后台超分：立即返回，完成后系统通知；进度/完成通过回调或 getNativeSrJobStatus 查询。
  */

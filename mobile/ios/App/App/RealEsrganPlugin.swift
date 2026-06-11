@@ -13,6 +13,7 @@ public class RealEsrganPlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "startSuperResolveInBackground", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "getBackgroundJobStatus", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "clearBackgroundJob", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "cancelBackgroundJob", returnType: CAPPluginReturnPromise),
     ]
 
     public override func load() {
@@ -23,8 +24,8 @@ public class RealEsrganPlugin: CAPPlugin, CAPBridgedPlugin {
         let present = RealEsrganModelLoader.isModelPresent()
         call.resolve([
             "available": present,
-            "downloadable": true,
-            "backend": present ? "coreml" : "none",
+            "downloadable": false,
+            "backend": present ? "coreml-v3" : "none",
             "bundled": RealEsrganModelLoader.bundledModelURL() != nil,
         ])
     }
@@ -44,7 +45,7 @@ public class RealEsrganPlugin: CAPPlugin, CAPBridgedPlugin {
                 try RealEsrganEngine.shared.loadModel(at: url) { msg in
                     self.notifyListeners("progress", data: ["message": msg, "progress": 0.08])
                 }
-                call.resolve(["ok": true, "backend": "coreml", "path": url.lastPathComponent])
+                call.resolve(["ok": true, "backend": "coreml-v3", "path": url.lastPathComponent])
             } catch {
                 call.reject(error.localizedDescription)
             }
@@ -99,6 +100,11 @@ public class RealEsrganPlugin: CAPPlugin, CAPBridgedPlugin {
 
     @objc func clearBackgroundJob(_ call: CAPPluginCall) {
         SrBackgroundJobManager.shared.clearJob()
+        call.resolve(["ok": true])
+    }
+
+    @objc func cancelBackgroundJob(_ call: CAPPluginCall) {
+        SrBackgroundJobManager.shared.cancelJob()
         call.resolve(["ok": true])
     }
 

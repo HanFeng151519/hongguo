@@ -7,17 +7,20 @@ enum RealEsrganError: LocalizedError {
     case modelLoad(String)
     case invalidInput
     case predictionFailed(String)
+    case cancelled
 
     var errorDescription: String? {
         switch self {
         case .modelMissing:
-            return "未找到 Real-ESRGAN 模型。请在 Mac 执行 npm run ensure:sr-model，或在 App 内首次超分时联网自动下载"
+            return "未找到 Real-ESRGAN v3 模型。请在 Mac 执行 npm run ensure:sr-model，或在 App 内首次超分时联网自动下载"
         case .modelLoad(let msg):
             return "模型加载失败：\(msg)"
         case .invalidInput:
             return "无法读取视频画面"
         case .predictionFailed(let msg):
             return "AI 推理失败：\(msg)"
+        case .cancelled:
+            return "超分任务已取消"
         }
     }
 }
@@ -106,8 +109,22 @@ final class RealEsrganEngine {
             return
         }
         kind = .multiArray
-        tileSize = 256
-        scale = 2
+        if let inArr = desc.inputDescriptionsByName[inputName]?.multiArrayConstraint,
+           inArr.shape.count >= 2 {
+            let h = inArr.shape[inArr.shape.count - 2].intValue
+            let w = inArr.shape[inArr.shape.count - 1].intValue
+            tileSize = max(1, max(h, w))
+        } else {
+            tileSize = 256
+        }
+        if let outArr = desc.outputDescriptionsByName[outputName]?.multiArrayConstraint,
+           outArr.shape.count >= 2 {
+            let outH = outArr.shape[outArr.shape.count - 2].intValue
+            let outW = outArr.shape[outArr.shape.count - 1].intValue
+            scale = max(1, min(outW, outH) / max(1, tileSize))
+        } else {
+            scale = 4
+        }
     }
 
     func upscale(pixelBuffer: CVPixelBuffer) throws -> CVPixelBuffer {

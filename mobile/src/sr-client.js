@@ -65,13 +65,31 @@ export async function saveSrSettings({ serverUrl = "", outputScale = "1080" } = 
   ]);
 }
 
+function assertReachableMacUrl(url) {
+  if (/localhost|127\.0\.0\.1/i.test(url)) {
+    throw new Error(
+      "iPhone 不能填 localhost。请填 Mac 局域网 IP，例如 http://192.168.1.5:8000（终端运行 ./start.sh 后看本机 IP）"
+    );
+  }
+}
+
 export async function checkSrServer(baseUrl) {
   const url = normalizeServerUrl(baseUrl);
   if (!url) throw new Error("请先填写 Mac 后端地址");
-  const res = await httpGet(`${url}/api/tools/sr-status`, {
-    responseType: "json",
-    readTimeout: 15000,
-  });
+  assertReachableMacUrl(url);
+  let res;
+  try {
+    res = await httpGet(`${url}/api/tools/sr-status`, {
+      responseType: "json",
+      readTimeout: 15000,
+      connectTimeout: 10000,
+    });
+  } catch (err) {
+    const detail = String(err?.message || err || "连接失败");
+    throw new Error(
+      `无法连接 ${url}（${detail}）。请确认：① Mac 已运行 ./start.sh ② 同一 Wi‑Fi ③ 地址为 Mac 的 192.168.x.x ④ 设置 → 隐私与安全性 → 本地网络 → 允许「视频爬取」`
+    );
+  }
   const data = parseJsonPayload(res.data);
   if (!data.available) {
     throw new Error("Mac 后端未安装 Real-ESRGAN，请运行 ./start.sh 等待工具下载完成");

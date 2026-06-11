@@ -1,3 +1,6 @@
-# Core ML 模型（约 64MB 压缩包，不提交 git）
+# Core ML 模型
+App/Models/.cache/
 App/Models/RealESRGAN.mlmodel
 App/Models/RealESRGAN_x2plus.mlpackage/
+App/Models/*.zip
+scripts/.venv-sr/

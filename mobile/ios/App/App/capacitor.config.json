@@ -4,6 +4,7 @@
 	"webDir": "www",
 	"packageClassList": [
 		"AppPlugin",
+		"ClipboardPlugin",
 		"FilesystemPlugin",
 		"PreferencesPlugin",
 		"SharePlugin",

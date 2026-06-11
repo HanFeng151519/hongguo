@@ -27,9 +27,11 @@ import {
   startNativeSuperResolutionBackground,
   getNativeSrJobStatus,
   clearNativeSrJob,
+  cancelNativeSrJob,
   requestSrNotifications,
-  shareNativeOutput,
 } from "./sr-native.js";
+import { saveMacSrToLibrary, saveNativeSrToLibrary } from "./sr-library.js";
+import { bindSrLibraryUI } from "./sr-library-ui.js";
 import { getPlugin, isNativePlatform } from "./crawl/capacitor-bridge.js";
 
 const form = document.getElementById("crawl-form");
@@ -48,13 +50,59 @@ const previewEl = document.getElementById("preview");
 const saveBtn = document.getElementById("save-btn");
 const shareClearBtn = document.getElementById("share-clear");
 const sharePasteBtn = document.getElementById("share-paste");
-const srServerInput = document.getElementById("sr-server");
+const MAC_SERVER_PRESETS = [
+  "http://9.112.85.25:8000",
+  "http://192.168.3.56:8000",
+];
+const srServerPreset = document.getElementById("sr-server-preset");
+const srServerCustom = document.getElementById("sr-server-custom");
+
+function getMacServerUrl() {
+  const preset = srServerPreset?.value;
+  if (preset && preset !== "__custom__") {
+    return normalizeServerUrl(preset);
+  }
+  return normalizeServerUrl(srServerCustom?.value || "");
+}
+
+function applyMacServerUrl(url) {
+  const normalized = normalizeServerUrl(url);
+  if (!srServerPreset) {
+    if (srServerCustom) srServerCustom.value = normalized;
+    return;
+  }
+  if (MAC_SERVER_PRESETS.includes(normalized)) {
+    srServerPreset.value = normalized;
+    srServerCustom?.classList.add("hidden");
+    if (srServerCustom) srServerCustom.value = "";
+  } else if (normalized) {
+    srServerPreset.value = "__custom__";
+    srServerCustom?.classList.remove("hidden");
+    if (srServerCustom) srServerCustom.value = normalized;
+  } else {
+    srServerPreset.value = MAC_SERVER_PRESETS[0];
+    srServerCustom?.classList.add("hidden");
+    if (srServerCustom) srServerCustom.value = "";
+  }
+}
+
+function onMacServerChanged() {
+  macSrVerified = false;
+  syncSrButtons();
+  persistSrSettings();
+}
 const srScaleSelect = document.getElementById("sr-scale");
 const srMacStatus = document.getElementById("sr-mac-status");
 const srTestBtn = document.getElementById("sr-test");
 const srButtons = document.getElementById("sr-buttons");
 const srNativeBtn = document.getElementById("sr-native-btn");
 const srMacBtn = document.getElementById("sr-mac-btn");
+const srNativeTask = document.getElementById("sr-native-task");
+const srNativeTaskText = document.getElementById("sr-native-task-text");
+const srNativeCancelBtn = document.getElementById("sr-native-cancel-btn");
+const srLibraryPanel = document.getElementById("sr-library-panel");
+const srLibraryList = document.getElementById("sr-library-list");
+const srLibraryCount = document.getElementById("sr-library-count");
 
 let lastFile = null;
 let lastVideoBuffer = null;
@@ -64,6 +112,29 @@ let macSrVerified = false;
 let macSrPollActive = false;
 let srShareInProgress = false;
 let nativeSrStartedAt = 0;
+
+const refreshSrLibraryUI = bindSrLibraryUI({
+  panel: srLibraryPanel,
+  listEl: srLibraryList,
+  countEl: srLibraryCount,
+});
+
+function syncNativeTaskPanel(job) {
+  if (!srNativeTask || !isNativePlatform()) return;
+  const show = job && (job.status === "running" || job.status === "failed");
+  srNativeTask.classList.toggle("hidden", !show);
+  if (!show) return;
+  if (job.status === "running") {
+    const pct = Math.round((Number(job.progress) || 0) * 100);
+    srNativeTaskText.textContent = `本机超分进行中：${job.message || "处理中"}${pct > 0 ? `（${pct}%）` : ""}`;
+    if (srNativeCancelBtn) srNativeCancelBtn.textContent = "取消并删除本机任务";
+  } else {
+    srNativeTaskText.textContent = `本机超分失败：${job.error || job.message || "未知错误"}`;
+    if (srNativeCancelBtn) srNativeCancelBtn.textContent = "清除失败任务";
+  }
+}
+
+refreshSrLibraryUI().catch(() => {});
 
 function showSrProgress(pct, message, prefix = "", etaSec = null) {
   const p = Math.min(100, Math.max(0, Number(pct) || 0));
@@ -87,15 +158,33 @@ function hideSrProgress() {
   nativeSrStartedAt = 0;
 }
 
+function syncMacServerCustomVisibility() {
+  if (!srServerPreset || !srServerCustom) return;
+  const isCustom = srServerPreset.value === "__custom__";
+  srServerCustom.classList.toggle("hidden", !isCustom);
+  srServerCustom.disabled = !isCustom;
+  if (isCustom) {
+    requestAnimationFrame(() => {
+      srServerCustom.focus();
+    });
+  }
+}
+
+function setMacFeedback(text, variant = "pending") {
+  if (!srMacStatus) return;
+  srMacStatus.textContent = text;
+  srMacStatus.classList.remove("hidden", "is-pending", "is-ok", "is-error");
+  srMacStatus.classList.add(
+    variant === "ok" ? "is-ok" : variant === "error" ? "is-error" : "is-pending"
+  );
+  srMacStatus.scrollIntoView({ block: "nearest", behavior: "smooth" });
+}
+
 function updateMacStatus() {
   if (!srMacStatus) return;
-  const macUrl = normalizeServerUrl(srServerInput?.value || srSettings.serverUrl);
+  const macUrl = getMacServerUrl();
   if (macSrVerified && macUrl) {
-    srMacStatus.textContent = `Mac 已连通：${macUrl}，可点「Mac 超分并保存」`;
-    srMacStatus.classList.remove("hidden");
-  } else {
-    srMacStatus.classList.add("hidden");
-    srMacStatus.textContent = "";
+    setMacFeedback(`Mac 已连通：${macUrl}，可点「Mac 超分并保存」`, "ok");
   }
 }
 
@@ -114,19 +203,36 @@ function bindClearInput(input, clearBtn) {
 
 const syncShareClear = bindClearInput(shareInput, shareClearBtn);
 
-async function pasteClipboardReplace(input, onSynced) {
-  if (!input) return;
+async function readClipboardText() {
+  if (isNativePlatform()) {
+    try {
+      const Clipboard = getPlugin("Clipboard");
+      const res = await Clipboard.read();
+      return String(res?.value ?? res?.data ?? "").trim();
+    } catch (err) {
+      const msg = String(err?.message || err);
+      if (/denied|permission|NotAllowed/i.test(msg)) {
+        throw new Error("无法读取剪贴板，请在 设置 → 视频爬取 中允许粘贴");
+      }
+      throw new Error(msg || "读取剪贴板失败");
+    }
+  }
   if (!navigator.clipboard?.readText) {
     throw new Error("当前环境不支持读取剪贴板");
   }
-  let text;
   try {
-    text = await navigator.clipboard.readText();
+    return String(await navigator.clipboard.readText()).trim();
   } catch (err) {
     const denied = /denied|permission|NotAllowed/i.test(String(err?.message || err));
     throw new Error(denied ? "无法读取剪贴板，请在系统设置中允许访问" : "读取剪贴板失败");
   }
-  input.value = String(text || "").trim();
+}
+
+async function pasteClipboardReplace(input, onSynced) {
+  if (!input) return;
+  const text = await readClipboardText();
+  if (!text) throw new Error("剪贴板为空，请先在抖音等 App 复制分享文案");
+  input.value = text;
   if (onSynced) onSynced();
   input.dispatchEvent(new Event("input", { bubbles: true }));
   input.focus();
@@ -160,7 +266,7 @@ async function initCookies() {
 initCookies().catch(() => {});
 
 function syncSrButtons(modelReady = nativeSrReady) {
-  const macUrl = normalizeServerUrl(srServerInput?.value || srSettings.serverUrl);
+  const macUrl = getMacServerUrl();
   const hasVideo = !!(lastVideoBuffer && lastFile);
   const showNative = hasVideo && isNativePlatform();
   const showMac = hasVideo && !!macUrl;
@@ -191,33 +297,33 @@ async function refreshSrAvailability() {
 
 async function initSrSettings() {
   srSettings = await loadSrSettings();
-  if (srServerInput) srServerInput.value = srSettings.serverUrl;
+  applyMacServerUrl(srSettings.serverUrl || MAC_SERVER_PRESETS[0]);
+  syncMacServerCustomVisibility();
   if (srScaleSelect) srScaleSelect.value = srSettings.outputScale;
   await refreshSrAvailability();
 }
 
 initSrSettings().catch(() => {});
 
-async function offerSrJobResult(job) {
+async function ingestNativeSrResult(job) {
   if (!job || job.status !== "done" || !job.outputPath || srShareInProgress) return false;
   srShareInProgress = true;
   try {
+    await saveNativeSrToLibrary(job);
+    await clearNativeSrJob();
+    syncNativeTaskPanel(null);
+    hideSrProgress();
+    await refreshSrLibraryUI();
+    if (srLibraryPanel) srLibraryPanel.open = true;
     const w = job.outputWidth;
     const h = job.outputHeight;
     const sizeHint = w && h ? `（${w}×${h}）` : "";
-    setStatus("超分完成，正在打开分享菜单…");
-    await shareNativeOutput(job.outputPath, job.displayFilename || "video_sr.mp4");
-    setStatus(`【本机 Core ML】超分已保存${sizeHint}`, "ok");
+    setStatus(`【本机 Core ML】已加入超分成片库${sizeHint}，可点「存相册」`, "ok");
     return true;
   } catch (err) {
-    if (err?.message?.includes("cancel") || err?.message?.includes("Cancel")) {
-      setStatus("已取消保存", "error");
-    } else {
-      setStatus(err.message || "分享失败", "error");
-    }
+    setStatus(err.message || "入库失败", "error");
     return false;
   } finally {
-    await clearNativeSrJob();
     srShareInProgress = false;
   }
 }
@@ -225,7 +331,12 @@ async function offerSrJobResult(job) {
 async function handlePendingSrJob() {
   if (!isNativePlatform()) return;
   const job = await getNativeSrJobStatus();
+  if (job.status === "idle") {
+    syncNativeTaskPanel(null);
+    return;
+  }
   if (job.status === "running") {
+    syncNativeTaskPanel(job);
     const pct = Math.round((Number(job.progress) || 0) * 100);
     const msg = job.message || "后台超分进行中";
     if (!nativeSrStartedAt) nativeSrStartedAt = Date.now();
@@ -237,23 +348,29 @@ async function handlePendingSrJob() {
   }
   if (job.status === "failed") {
     hideSrProgress();
-    setStatus(`【本机 Core ML】${job.error || "后台超分失败"}`, "error");
-    await clearNativeSrJob();
+    syncNativeTaskPanel(job);
+    setStatus(`【本机 Core ML】${job.error || "后台超分失败"}，可点下方清除`, "error");
+    return;
+  }
+  if (job.status === "cancelled") {
+    hideSrProgress();
+    syncNativeTaskPanel(null);
     return;
   }
   hideSrProgress();
-  await offerSrJobResult(job);
+  syncNativeTaskPanel(null);
+  await ingestNativeSrResult(job);
 }
 
-async function offerMacSrResult({ buffer, meta, filename }) {
+async function ingestMacSrResult({ buffer, meta, filename }) {
+  const srName = String(filename || "video.mp4").replace(/\.mp4$/i, "_sr.mp4");
+  await saveMacSrToLibrary(buffer, srName, meta || {});
+  await refreshSrLibraryUI();
+  if (srLibraryPanel) srLibraryPanel.open = true;
   const outW = meta.output_width;
   const outH = meta.output_height;
-  const srName = String(filename || "video.mp4").replace(/\.mp4$/i, "_sr.mp4");
-  const saved = await saveVideoBuffer(buffer, srName);
-  setStatus("正在打开系统分享菜单，请选择「储存视频」…");
-  await shareVideoFile(saved.uri, saved.filename);
   const sizeHint = outW && outH ? `（${outW}×${outH}）` : "";
-  setStatus(`【Mac 后端】超分已保存${sizeHint}`, "ok");
+  setStatus(`【Mac 后端】已加入超分成片库${sizeHint}，可点「存相册」`, "ok");
 }
 
 async function handlePendingMacSrJob() {
@@ -282,7 +399,7 @@ async function handlePendingMacSrJob() {
       showSrProgress(98, "正在下载超分结果…", "【Mac 后端】");
       const outBuffer = await downloadSuperResolutionResult(pending.serverUrl, data.download_url);
       await clearMacSrJob();
-      await offerMacSrResult({
+      await ingestMacSrResult({
         buffer: outBuffer,
         meta: data.region || {},
         filename: pending.filename,
@@ -317,7 +434,11 @@ async function handlePendingMacSrJob() {
         showSrProgress(progressPct, message, "【Mac 后端】", eta);
       },
     });
-    await offerMacSrResult(result);
+    await ingestMacSrResult({
+      buffer: result.buffer,
+      meta: result.meta,
+      filename: result.filename || pending.filename,
+    });
   } catch (err) {
     if (!err?.message?.includes("cancel") && !err?.message?.includes("Cancel")) {
       setStatus(`【Mac 后端】${err.message || "超分失败"}`, "error");
@@ -349,34 +470,63 @@ async function initSrBackground() {
 
 initSrBackground().catch(() => {});
 
+srNativeCancelBtn?.addEventListener("click", async () => {
+  srNativeCancelBtn.disabled = true;
+  try {
+    await cancelNativeSrJob();
+    hideSrProgress();
+    nativeSrStartedAt = 0;
+    syncNativeTaskPanel(null);
+    setStatus("本机超分任务已取消并删除", "ok");
+  } catch (err) {
+    setStatus(err.message || "取消失败", "error");
+  } finally {
+    srNativeCancelBtn.disabled = false;
+  }
+});
+
 function persistSrSettings() {
   saveSrSettings({
-    serverUrl: srServerInput?.value || "",
+    serverUrl: getMacServerUrl(),
     outputScale: srScaleSelect?.value || "1080",
   }).catch(() => {});
 }
 
-srServerInput?.addEventListener("input", () => {
-  macSrVerified = false;
-  syncSrButtons();
-  persistSrSettings();
-});
+function onMacServerPresetChange() {
+  syncMacServerCustomVisibility();
+  onMacServerChanged();
+}
+
+srServerPreset?.addEventListener("change", onMacServerPresetChange);
+srServerPreset?.addEventListener("input", onMacServerPresetChange);
+
+srServerCustom?.addEventListener("input", onMacServerChanged);
 
 srScaleSelect?.addEventListener("change", persistSrSettings);
 
 srTestBtn?.addEventListener("click", async () => {
+  if (!srTestBtn) return;
   srTestBtn.disabled = true;
+  const url = getMacServerUrl();
+  if (!url) {
+    setMacFeedback("请先选择地址，或在「自定义」里填写 http://192.168.x.x:8000", "error");
+    srTestBtn.disabled = false;
+    return;
+  }
+  setMacFeedback(`正在连接 ${url}…`, "pending");
   try {
-    const url = normalizeServerUrl(srServerInput?.value || "");
     await saveSrSettings({ serverUrl: url, outputScale: srScaleSelect?.value || "1080" });
     await checkSrServer(url);
     macSrVerified = true;
     await refreshSrAvailability();
-    setStatus("Mac 后端连接正常，可点「Mac 超分并保存」", "ok");
+    setMacFeedback("Mac 后端连接正常，可点「Mac 超分并保存」", "ok");
+    setStatus("Mac 后端连接正常", "ok");
   } catch (err) {
     macSrVerified = false;
-    updateMacStatus();
-    setStatus(err.message || "连接失败", "error");
+    syncSrButtons();
+    const msg = err.message || "连接失败";
+    setMacFeedback(msg, "error");
+    setStatus(msg, "error");
   } finally {
     srTestBtn.disabled = false;
   }
@@ -554,7 +704,11 @@ async function runMacSuperResolution(serverUrl) {
         },
       }
     );
-    await offerMacSrResult({ ...result, filename: lastFile.filename });
+    await ingestMacSrResult({
+      buffer: result.buffer,
+      meta: result.meta,
+      filename: lastFile.filename,
+    });
   } finally {
     macSrPollActive = false;
     hideSrProgress();
@@ -572,24 +726,34 @@ async function runNativeSuperResolution() {
     onStatus: (text) => setStatus(`【本机 Core ML】${text}`),
     onComplete: async (ev) => {
       if (ev?.status === "done") {
-        await offerSrJobResult({
+        await ingestNativeSrResult({
           status: "done",
           outputPath: ev.outputPath,
           outputWidth: ev.outputWidth,
           outputHeight: ev.outputHeight,
           displayFilename: ev.displayFilename || srName,
         });
+      } else if (ev?.status === "cancelled") {
+        hideSrProgress();
+        syncNativeTaskPanel(null);
+        setStatus("本机超分已取消", "ok");
       } else if (ev?.status === "failed") {
-        setStatus(`【本机 Core ML】${ev.error || "后台超分失败"}`, "error");
-        await clearNativeSrJob();
+        syncNativeTaskPanel({
+          status: "failed",
+          error: ev.error,
+          message: ev.error,
+        });
+        setStatus(`【本机 Core ML】${ev.error || "后台超分失败"}，可点下方清除`, "error");
       }
     },
   });
   nativeSrReady = true;
   syncSrButtons(true);
   showSrProgress(5, "后台超分已启动", "【本机 Core ML】");
+  const job = await getNativeSrJobStatus();
+  syncNativeTaskPanel(job.status !== "idle" ? job : null);
   setStatus(
-    "【本机 Core ML】已在后台开始超分，完成后将推送通知。可切换其他 App，点通知或回到本 App 即可保存。",
+    "【本机 Core ML】已在后台开始超分，完成后会进入「超分成片库」。卡住可点「取消并删除本机任务」。",
     "ok"
   );
 }
@@ -618,7 +782,7 @@ srMacBtn?.addEventListener("click", async () => {
     setStatus("请先爬取视频", "error");
     return;
   }
-  const serverUrl = normalizeServerUrl(srServerInput?.value || srSettings.serverUrl);
+  const serverUrl = getMacServerUrl();
   if (!serverUrl) {
     setStatus("请先在「Mac 后端超分」里填写地址", "error");
     return;

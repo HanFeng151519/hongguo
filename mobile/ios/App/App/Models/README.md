@@ -1,11 +1,14 @@
 # Real-ESRGAN Core ML 模型
 
-`RealESRGAN.mlmodel`（约 64MB）已下载并随 App 打包，**无需再手动下载或首次联网**。
+本机超分使用 **realesr-animevideov3**（与 Mac 后端默认模型一致），Core ML 包约 **1.2MB**。
 
-若文件丢失，在 `mobile/` 目录执行：
+在 `mobile/` 目录执行：
 
 ```bash
 npm run ensure:sr-model
+npm run cap:sync
 ```
 
-模型来源：[mszpro/CoreML_RealESRGAN](https://huggingface.co/mszpro/CoreML_RealESRGAN)（BSD-3-Clause）
+生成文件：`RealESRGAN_v3.mlpackage`
+
+权重来源：[xinntao/Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN)（BSD-3-Clause）

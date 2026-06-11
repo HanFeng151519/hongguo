@@ -55,17 +55,26 @@
         <details class="cookie-details">
           <summary>Mac 后端超分（可选，长视频 / 4K）</summary>
           <p class="sr-setup-hint">爬取完成后点下方对应按钮：本机超分（较慢）或 Mac 超分（需同一 Wi‑Fi 运行 <code>./start.sh</code>）</p>
-          <label class="wm-field wm-field-full">
-            <span>Mac 后端地址</span>
+          <div class="wm-field wm-field-full sr-server-field">
+            <span class="wm-field-label">Mac 后端地址</span>
+            <select id="sr-server-preset" class="wm-share-input" aria-label="Mac 后端地址">
+              <option value="http://9.112.85.25:8000">http://9.112.85.25:8000</option>
+              <option value="http://192.168.3.56:8000">http://192.168.3.56:8000</option>
+              <option value="__custom__">自定义…</option>
+            </select>
             <input
-              id="sr-server"
-              class="wm-share-input wm-input-single"
-              type="url"
+              id="sr-server-custom"
+              class="wm-share-input wm-input-single sr-server-custom hidden"
+              type="text"
               inputmode="url"
+              autocapitalize="off"
+              autocorrect="off"
+              autocomplete="off"
               placeholder="http://192.168.x.x:8000"
               spellcheck="false"
+              aria-label="自定义 Mac 后端地址"
             />
-          </label>
+          </div>
           <label class="wm-field">
             <span>超分输出</span>
             <select id="sr-scale" class="wm-share-input">
@@ -100,6 +109,17 @@
           </div>
           <p id="sr-progress-label" class="sr-progress-label"></p>
         </div>
+
+        <div id="sr-native-task" class="sr-native-task hidden">
+          <p id="sr-native-task-text" class="sr-native-task-text"></p>
+          <button type="button" id="sr-native-cancel-btn" class="btn-adjust-reset btn-danger-text">取消并删除本机任务</button>
+        </div>
+
+        <details id="sr-library-panel" class="cookie-details sr-library-panel">
+          <summary>超分成片库 (<span id="sr-library-count">0</span>)</summary>
+          <p class="sr-setup-hint">Mac / 本机超分完成后会出现在这里，可点「存相册」或「删除」。</p>
+          <ul id="sr-library-list" class="sr-library-list"></ul>
+        </details>
 
         <div id="result" class="wm-result hidden">
           <p id="meta" class="meta-line"></p>
@@ -151,7 +171,7 @@
               <button type="button" id="sr-mac-btn" class="btn-secondary btn-mac-sr hidden">Mac 超分并保存</button>
             </div>
           </div>
-          <p class="wm-hint">上方预览是爬取原片，卡顿≠超分结果。两个超分按钮互不影响，请按需点「本机」或「Mac」。</p>
+          <p class="wm-hint">超分完成后在「超分成片库」存相册。本机任务卡住可点「取消并删除本机任务」。</p>
         </div>
       </form>
     </section>

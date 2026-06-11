@@ -53,10 +53,12 @@ async function nativeRequest(url, options = {}) {
     method === "GET"
       ? await CapacitorHttp.get(req)
       : await CapacitorHttp.request(req);
-  if (res.status >= 400) {
-    throw new Error(`HTTP ${res.status}`);
-  }
   let data = res.data;
+  if (res.status >= 400) {
+    const snippet =
+      typeof data === "string" ? data.slice(0, 120) : JSON.stringify(data || {}).slice(0, 120);
+    throw new Error(`HTTP ${res.status}${snippet ? `: ${snippet}` : ""}`);
+  }
   if (responseType === "arraybuffer" && typeof data === "string") {
     data = base64ToArrayBuffer(data);
   } else if (responseType === "json") {
@@ -102,7 +104,11 @@ export async function httpGet(url, options = {}) {
     try {
       return await nativeRequest(url, options);
     } catch (err) {
-      console.warn("[http] native GET failed, fallback fetch:", err?.message);
+      const msg = String(err?.message || err);
+      console.warn("[http] native GET failed, fallback fetch:", msg);
+      if (/Plugin|not implemented|UNIMPLEMENTED/i.test(msg)) {
+        throw err;
+      }
     }
   }
   return fetchRequest(url, options);

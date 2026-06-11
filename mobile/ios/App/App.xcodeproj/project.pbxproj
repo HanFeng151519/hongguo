@@ -15,7 +15,7 @@
 		A1SR00052058000100000001 /* RealEsrganPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1SR00062058000100000001 /* RealEsrganPlugin.swift */; };
 		A1SR000A2058000100000001 /* RealEsrganModelLoader.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1SR00092058000100000001 /* RealEsrganModelLoader.swift */; };
 		A1SR00102058000100000001 /* SrBackgroundJobManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1SR00112058000100000001 /* SrBackgroundJobManager.swift */; };
-		A1SR000B2058000100000001 /* RealESRGAN.mlmodel in Resources */ = {isa = PBXBuildFile; fileRef = A1SR000C2058000100000001 /* RealESRGAN.mlmodel */; };
+		A1SR000B2058000100000001 /* RealESRGAN_v3.mlpackage in Resources */ = {isa = PBXBuildFile; fileRef = A1SR000C2058000100000001 /* RealESRGAN_v3.mlpackage */; };
 		504EC30D1FED79650016851F /* Main.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 504EC30B1FED79650016851F /* Main.storyboard */; };
 		504EC30F1FED79650016851F /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 504EC30E1FED79650016851F /* Assets.xcassets */; };
 		504EC3121FED79650016851F /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 504EC3101FED79650016851F /* LaunchScreen.storyboard */; };
@@ -33,7 +33,7 @@
 		A1SR00062058000100000001 /* RealEsrganPlugin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealEsrganPlugin.swift; sourceTree = "<group>"; };
 		A1SR00092058000100000001 /* RealEsrganModelLoader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealEsrganModelLoader.swift; sourceTree = "<group>"; };
 		A1SR00112058000100000001 /* SrBackgroundJobManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SrBackgroundJobManager.swift; sourceTree = "<group>"; };
-		A1SR000C2058000100000001 /* RealESRGAN.mlmodel */ = {isa = PBXFileReference; lastKnownFileType = file.mlmodel; path = RealESRGAN.mlmodel; sourceTree = "<group>"; };
+		A1SR000C2058000100000001 /* RealESRGAN_v3.mlpackage */ = {isa = PBXFileReference; lastKnownFileType = wrapper.mlpackage; path = RealESRGAN_v3.mlpackage; sourceTree = "<group>"; };
 		504EC30C1FED79650016851F /* Base */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; name = Base; path = Base.lproj/Main.storyboard; sourceTree = "<group>"; };
 		504EC30E1FED79650016851F /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		504EC3111FED79650016851F /* Base */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; name = Base; path = Base.lproj/LaunchScreen.storyboard; sourceTree = "<group>"; };
@@ -85,7 +85,7 @@
 		A1SR000D2058000100000001 /* Models */ = {
 			isa = PBXGroup;
 			children = (
-				A1SR000C2058000100000001 /* RealESRGAN.mlmodel */,
+				A1SR000C2058000100000001 /* RealESRGAN_v3.mlpackage */,
 			);
 			path = Models;
 			sourceTree = "<group>";
@@ -190,7 +190,7 @@
 				50379B232058CBB4000EE86E /* capacitor.config.json in Resources */,
 				504EC30D1FED79650016851F /* Main.storyboard in Resources */,
 				2FAD9763203C412B000D30F8 /* config.xml in Resources */,
-				A1SR000B2058000100000001 /* RealESRGAN.mlmodel in Resources */,
+				A1SR000B2058000100000001 /* RealESRGAN_v3.mlpackage in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

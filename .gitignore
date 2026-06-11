@@ -20,3 +20,11 @@ mobile/node_modules/
 mobile/www/
 mobile/ios/App/Pods/
 mobile/ios/App/build/
+mobile/ios/App/App.xcodeproj/xcuserdata/
+mobile/ios/App/App.xcworkspace/xcuserdata/
+mobile/ios/DerivedData/
+mobile/scripts/.venv-sr/
+server/.venv/
+tmp/
+*.mp4
+!public/downloads/.gitkeep

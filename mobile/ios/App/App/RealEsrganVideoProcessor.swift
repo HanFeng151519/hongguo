@@ -19,8 +19,10 @@ final class RealEsrganVideoProcessor {
 
     func process(
         inputURL: URL,
-        progress: @escaping (_ fraction: Double, _ message: String) -> Void
+        progress: @escaping (_ fraction: Double, _ message: String) -> Void,
+        shouldCancel: (() -> Bool)? = nil
     ) throws -> Result {
+        if shouldCancel?() == true { throw RealEsrganError.cancelled }
         if !RealEsrganEngine.shared.isReady {
             try RealEsrganEngine.shared.loadBundledModel()
         }
@@ -66,9 +68,11 @@ final class RealEsrganVideoProcessor {
             outW: outW,
             outH: outH,
             estimatedFrames: estimatedFrames,
-            progress: progress
+            progress: progress,
+            shouldCancel: shouldCancel
         )
 
+        if shouldCancel?() == true { throw RealEsrganError.cancelled }
         progress(0.92, "正在合并原声音轨…")
         try muxAudio(from: asset, videoURL: tempVideo, to: finalURL)
 
@@ -83,7 +87,8 @@ final class RealEsrganVideoProcessor {
         outW: Int,
         outH: Int,
         estimatedFrames: Int,
-        progress: @escaping (_ fraction: Double, _ message: String) -> Void
+        progress: @escaping (_ fraction: Double, _ message: String) -> Void,
+        shouldCancel: (() -> Bool)? = nil
     ) throws {
         let reader = try AVAssetReader(asset: asset)
         let outputSettings: [String: Any] = [
@@ -127,6 +132,7 @@ final class RealEsrganVideoProcessor {
         var pts = CMTime.zero
 
         while reader.status == .reading {
+            if shouldCancel?() == true { throw RealEsrganError.cancelled }
             guard let sample = readerOutput.copyNextSampleBuffer(),
                   let pixelBuffer = CMSampleBufferGetImageBuffer(sample) else { break }
             pts = CMSampleBufferGetPresentationTimeStamp(sample)
