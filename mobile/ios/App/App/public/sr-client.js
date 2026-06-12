@@ -1,11 +1,39 @@
-/** Mac 后端 Real-ESRGAN 超分客户端（需同一 Wi‑Fi + ./start.sh） */
+/** Mac 后端真实感优化客户端（ffmpeg，需同一 Wi‑Fi + ./start.sh） */
 import { getPlugin } from "./crawl/capacitor-bridge.js";
 import { downloadBinary, httpGet, parseJsonPayload } from "./crawl/http.js";
 import { formatSrEta } from "./sr-eta.js";
 
 const SERVER_KEY = "hongguo_sr_server";
 const SCALE_KEY = "hongguo_sr_scale";
+const PROFILE_KEY = "hongguo_sr_profile";
 const MAC_JOB_KEY = "hongguo_mac_sr_job";
+
+let macSrAbort = { poll: false, upload: null };
+
+export class MacSrCancelledError extends Error {
+  constructor(message = "已取消") {
+    super(message);
+    this.name = "MacSrCancelledError";
+  }
+}
+
+export function resetMacSrAbort() {
+  macSrAbort = { poll: false, upload: null };
+}
+
+export function abortMacSrPoll() {
+  macSrAbort.poll = true;
+  if (macSrAbort.upload) {
+    macSrAbort.upload.abort();
+    macSrAbort.upload = null;
+  }
+}
+
+function throwIfMacSrAborted() {
+  if (macSrAbort.poll) {
+    throw new MacSrCancelledError();
+  }
+}
 
 export function normalizeServerUrl(raw) {
   let s = String(raw || "").trim();
@@ -16,19 +44,27 @@ export function normalizeServerUrl(raw) {
 
 export async function loadSrSettings() {
   const Preferences = getPlugin("Preferences");
-  const [server, scale] = await Promise.all([
+  const [server, scale, profile] = await Promise.all([
     Preferences.get({ key: SERVER_KEY }),
     Preferences.get({ key: SCALE_KEY }),
+    Preferences.get({ key: PROFILE_KEY }),
   ]);
+  const profileVal = profile.value === "anime" ? "anime" : "real";
   return {
     serverUrl: normalizeServerUrl(server.value || ""),
-    outputScale: scale.value === "1080" ? "1080" : "4k", // 默认为4k
+    outputScale: scale.value === "4k" ? "4k" : "1080",
+    srProfile: profileVal,
   };
 }
 
 export async function saveMacSrJob(job) {
   const Preferences = getPlugin("Preferences");
   await Preferences.set({ key: MAC_JOB_KEY, value: JSON.stringify(job || {}) });
+}
+
+export async function hasActiveMacSrJob() {
+  const pending = await loadMacSrJob();
+  return !!(pending?.jobId && pending?.serverUrl);
 }
 
 export async function loadMacSrJob() {
@@ -57,11 +93,16 @@ export async function fetchSuperResolutionJob(baseUrl, jobId) {
   return parseJsonPayload(res.data);
 }
 
-export async function saveSrSettings({ serverUrl = "", outputScale = "1080" } = {}) {
+export async function saveSrSettings({
+  serverUrl = "",
+  outputScale = "1080",
+  srProfile = "real",
+} = {}) {
   const Preferences = getPlugin("Preferences");
   await Promise.all([
     Preferences.set({ key: SERVER_KEY, value: normalizeServerUrl(serverUrl) }),
     Preferences.set({ key: SCALE_KEY, value: outputScale === "4k" ? "4k" : "1080" }),
+    Preferences.set({ key: PROFILE_KEY, value: srProfile === "anime" ? "anime" : "real" }),
   ]);
 }
 
@@ -92,13 +133,13 @@ export async function checkSrServer(baseUrl) {
   }
   const data = parseJsonPayload(res.data);
   if (!data.available) {
-    throw new Error("Mac 后端未安装 Real-ESRGAN，请运行 ./start.sh 等待工具下载完成");
+    throw new Error("Mac 后端未就绪，请运行 ./start.sh");
   }
   return data;
 }
 
-async function postMultipart(url, formData) {
-  const resp = await fetch(url, { method: "POST", body: formData });
+async function postMultipart(url, formData, { signal } = {}) {
+  const resp = await fetch(url, { method: "POST", body: formData, signal });
   let data = {};
   try {
     data = await resp.json();
@@ -112,7 +153,12 @@ async function postMultipart(url, formData) {
   return data;
 }
 
-export async function startSuperResolution(baseUrl, buffer, filename, { outputScale = "1080" } = {}) {
+export async function startSuperResolution(
+  baseUrl,
+  buffer,
+  filename,
+  { outputScale = "1080", srProfile = "real" } = {}
+) {
   const root = normalizeServerUrl(baseUrl);
   if (!root) throw new Error("请先填写 Mac 后端地址");
   const blob = new Blob([buffer], { type: "video/mp4" });
@@ -120,13 +166,58 @@ export async function startSuperResolution(baseUrl, buffer, filename, { outputSc
   fd.append("file", blob, filename || "video.mp4");
   fd.append("output_scale", outputScale === "4k" ? "4k" : "1080");
   fd.append("output_fps", "native");
-  return postMultipart(`${root}/api/tools/super-resolution`, fd);
+  fd.append("sr_profile", srProfile === "anime" ? "anime" : "real");
+  const controller = new AbortController();
+  macSrAbort.upload = controller;
+  try {
+    return await postMultipart(`${root}/api/tools/super-resolution`, fd, {
+      signal: controller.signal,
+    });
+  } catch (err) {
+    if (err?.name === "AbortError" || macSrAbort.poll) {
+      throw new MacSrCancelledError();
+    }
+    throw err;
+  } finally {
+    if (macSrAbort.upload === controller) {
+      macSrAbort.upload = null;
+    }
+  }
+}
+
+export async function cancelMacSuperResolutionJob(baseUrl, jobId) {
+  abortMacSrPoll();
+  const root = normalizeServerUrl(baseUrl);
+  if (!root || !jobId) {
+    await clearMacSrJob();
+    return;
+  }
+  try {
+    const resp = await fetch(
+      `${root}/api/tools/super-resolution/job/${encodeURIComponent(jobId)}/cancel`,
+      { method: "POST" }
+    );
+    if (!resp.ok) {
+      const data = await resp.json().catch(() => ({}));
+      const detail = data.detail || data.error;
+      if (resp.status !== 404) {
+        throw new Error(typeof detail === "string" ? detail : `取消失败 HTTP ${resp.status}`);
+      }
+    }
+  } catch (err) {
+    if (err?.name === "MacSrCancelledError") throw err;
+    if (!String(err?.message || "").includes("abort")) {
+      console.warn("[sr] cancel request failed:", err);
+    }
+  }
+  await clearMacSrJob();
 }
 
 export async function pollSuperResolutionJob(baseUrl, jobId, onTick) {
   const root = normalizeServerUrl(baseUrl);
   const started = Date.now();
   while (true) {
+    throwIfMacSrAborted();
     const res = await httpGet(`${root}/api/tools/super-resolution/job/${encodeURIComponent(jobId)}`, {
       responseType: "json",
       readTimeout: 30000,
@@ -155,8 +246,11 @@ export async function pollSuperResolutionJob(baseUrl, jobId, onTick) {
       });
     }
     if (data.status === "completed") return data;
+    if (data.status === "cancelled") {
+      throw new MacSrCancelledError(data.error || "优化已取消");
+    }
     if (data.status === "failed") {
-      throw new Error(data.error || "AI 超分失败");
+      throw new Error(data.error || "成片优化失败");
     }
     await new Promise((r) => setTimeout(r, 2500));
   }
@@ -174,11 +268,15 @@ export async function runSuperResolutionPipeline(
   baseUrl,
   buffer,
   filename,
-  { outputScale = "1080", onStatus, onProgress } = {}
+  { outputScale = "1080", srProfile = "real", onStatus, onProgress } = {}
 ) {
+  resetMacSrAbort();
   if (onStatus) onStatus("正在上传到 Mac…", 2);
   if (onProgress) onProgress(2, "正在上传到 Mac…");
-  const { job_id: jobId } = await startSuperResolution(baseUrl, buffer, filename, { outputScale });
+  const { job_id: jobId } = await startSuperResolution(baseUrl, buffer, filename, {
+    outputScale,
+    srProfile,
+  });
   if (!jobId) throw new Error("未获得任务 ID");
 
   await saveMacSrJob({
@@ -197,8 +295,8 @@ export async function runSuperResolutionPipeline(
     if (onStatus) onStatus(label, pct, etaSec);
   });
 
-  if (onStatus) onStatus("正在下载超分结果…", 98);
-  if (onProgress) onProgress(98, "正在下载超分结果…");
+  if (onStatus) onStatus("正在下载优化结果…", 98);
+  if (onProgress) onProgress(98, "正在下载优化结果…");
   const outBuffer = await downloadSuperResolutionResult(baseUrl, result.download_url);
   await clearMacSrJob();
   return { buffer: outBuffer, meta: result.region || {}, jobId };
@@ -206,6 +304,7 @@ export async function runSuperResolutionPipeline(
 
 /** 恢复被中断的 Mac 超分轮询（切后台后回到 App） */
 export async function resumeMacSuperResolutionJob(pending, { onStatus, onProgress } = {}) {
+  resetMacSrAbort();
   const { jobId, serverUrl, filename, outputScale = "1080" } = pending;
   const result = await pollSuperResolutionJob(serverUrl, jobId, ({ progress, progressPct, elapsedText, etaSec, etaText }) => {
     const pct = progressPct != null ? progressPct : null;
@@ -214,8 +313,8 @@ export async function resumeMacSuperResolutionJob(pending, { onStatus, onProgres
     if (onProgress && pct != null) onProgress(pct, progress, etaSec);
     if (onStatus) onStatus(label, pct, etaSec);
   });
-  if (onStatus) onStatus("正在下载超分结果…", 98);
-  if (onProgress) onProgress(98, "正在下载超分结果…");
+  if (onStatus) onStatus("正在下载优化结果…", 98);
+  if (onProgress) onProgress(98, "正在下载优化结果…");
   const outBuffer = await downloadSuperResolutionResult(serverUrl, result.download_url);
   await clearMacSrJob();
   return { buffer: outBuffer, meta: result.region || {}, jobId, filename, outputScale };

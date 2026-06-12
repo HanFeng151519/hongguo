@@ -77,28 +77,54 @@ export async function saveVideoBuffer(buffer, filename) {
   return { path, uri, webPath, filename: name };
 }
 
-export async function shareVideoFile(uri, title = "保存视频") {
+export async function resolveVideoFileUri(uri, { fsPath, directory = "DATA" } = {}) {
+  if (fsPath) {
+    const Filesystem = getPlugin("Filesystem");
+    const dir = directory === "CACHE" ? Directory.Cache : Directory.Data;
+    const { uri: resolved } = await Filesystem.getUri({ path: fsPath, directory: dir });
+    if (resolved) {
+      const stat = await Filesystem.stat({ path: fsPath, directory: dir }).catch(() => null);
+      if (!stat?.size) {
+        throw new Error("视频文件不存在或已损坏");
+      }
+      return resolved;
+    }
+  }
+  if (!uri) {
+    throw new Error("视频路径无效");
+  }
+  return uri;
+}
+
+/** @returns {"photos"|"share"} */
+export async function shareVideoFile(uri, title = "保存视频", { fsPath, directory = "DATA" } = {}) {
   if (!isNativePlatform()) {
     throw new Error("请在 iOS App 内使用保存功能");
   }
-  
-  // Try to use RealEsrgan plugin's saveToPhotos method first
+
+  const videoPath = await resolveVideoFileUri(uri, { fsPath, directory });
+
   const RealEsrgan = getPlugin("RealEsrgan");
-  if (RealEsrgan && RealEsrgan.saveToPhotos) {
+  if (RealEsrgan?.saveToPhotos) {
     try {
-      await RealEsrgan.saveToPhotos({ videoPath: uri });
-      return;
+      await RealEsrgan.saveToPhotos({ videoPath });
+      return "photos";
     } catch (e) {
-      console.warn('saveToPhotos failed, falling back to Share:', e);
+      const msg = String(e?.message || e || "");
+      if (/权限|permission|denied/i.test(msg)) {
+        throw new Error(msg);
+      }
+      console.warn("saveToPhotos failed, falling back to Share:", msg);
     }
   }
-  
-  // Fallback to Share plugin
+
   const Share = getPlugin("Share");
   await Share.share({
     title,
-    files: [uri],
+    files: [videoPath],
+    dialogTitle: title,
   });
+  return "share";
 }
 
 export async function deleteCachedPath(path) {

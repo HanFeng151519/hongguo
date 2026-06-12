@@ -1,70 +1,87 @@
-/** 超分成片库：Mac / 本机完成后入库，可保存到相册或删除 */
+/** 优化成片库：Mac / 本机真实感优化完成后入库 */
 import { Directory, getCapacitor, getPlugin } from "./crawl/capacitor-bridge.js";
 import { deleteCachedPath, shareVideoFile } from "./crawl/storage.js";
 
 const LIBRARY_KEY = "hongguo_sr_library";
 const MAX_ITEMS = 30;
 
+function videoWebSrc(uri) {
+  if (!uri) return "";
+  const Capacitor = getCapacitor();
+  if (
+    uri.startsWith("http://") ||
+    uri.startsWith("https://") ||
+    uri.startsWith("capacitor://") ||
+    uri.startsWith("/_capacitor_file_")
+  ) {
+    return uri;
+  }
+  return Capacitor.convertFileSrc(uri);
+}
+
 /**
  * 从视频生成缩略图（base64 data URL）
- * @param {string} videoUri - 视频URI
- * @param {number} [maxWidth=120] - 最大宽度
- * @returns {Promise<string>} base64 data URL
+ * iOS 必须用 convertFileSrc，不能直接喂 file://
  */
 function generateVideoThumbnail(videoUri, maxWidth = 120) {
-  return new Promise((resolve, reject) => {
-    console.log('Generating thumbnail for:', videoUri);
-    
-    const video = document.createElement('video');
-    video.crossOrigin = 'anonymous';
-    video.preload = 'metadata';
-    video.muted = true; // Required for autoplay
-    
-    const timeout = setTimeout(() => {
-      console.warn('Thumbnail generation timeout for:', videoUri);
-      video.src = '';
+  return new Promise((resolve) => {
+    const src = videoWebSrc(videoUri);
+    if (!src) {
+      resolve("");
+      return;
+    }
+
+    const video = document.createElement("video");
+    video.preload = "auto";
+    video.muted = true;
+    video.playsInline = true;
+    video.setAttribute("playsinline", "");
+    video.setAttribute("webkit-playsinline", "");
+
+    const cleanup = () => {
+      video.onloadeddata = null;
+      video.onseeked = null;
+      video.onerror = null;
+      video.removeAttribute("src");
       video.load();
-      resolve(''); // Return empty string on timeout
-    }, 5000);
-    
-    video.onloadeddata = () => {
-      console.log('Video loaded, seeking to first frame');
-      // Seek to first frame (currentTime = 0)
-      video.currentTime = 0;
     };
-    
+
+    const timeout = setTimeout(() => {
+      cleanup();
+      resolve("");
+    }, 8000);
+
+    video.onloadeddata = () => {
+      const t = Math.min(0.5, Math.max(0, (video.duration || 1) * 0.05));
+      video.currentTime = Number.isFinite(t) ? t : 0;
+    };
+
     video.onseeked = () => {
       clearTimeout(timeout);
       try {
-        const canvas = document.createElement('canvas');
-        const scale = maxWidth / video.videoWidth;
+        const vw = video.videoWidth || maxWidth;
+        const vh = video.videoHeight || Math.round(maxWidth * 16 / 9);
+        const scale = maxWidth / vw;
+        const canvas = document.createElement("canvas");
         canvas.width = maxWidth;
-        canvas.height = Math.round(video.videoHeight * scale);
-        
-        const ctx = canvas.getContext('2d');
+        canvas.height = Math.max(1, Math.round(vh * scale));
+        const ctx = canvas.getContext("2d");
         ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-        
-        // Convert to JPEG with quality 0.7
-        const dataUrl = canvas.toDataURL('image/jpeg', 0.7);
-        console.log('Thumbnail generated, length:', dataUrl.length);
-        resolve(dataUrl);
-      } catch (e) {
-        console.error('Failed to generate thumbnail:', e);
-        reject(e);
+        resolve(canvas.toDataURL("image/jpeg", 0.72));
+      } catch {
+        resolve("");
       }
-      
-      // Clean up
-      video.src = '';
-      video.load();
+      cleanup();
     };
-    
-    video.onerror = (e) => {
+
+    video.onerror = () => {
       clearTimeout(timeout);
-      console.error('Video load error:', e, videoUri);
-      reject(new Error('Failed to load video for thumbnail'));
+      cleanup();
+      resolve("");
     };
-    
-    video.src = videoUri;
+
+    video.src = src;
+    video.load();
   });
 }
 
@@ -74,16 +91,63 @@ function generateVideoThumbnail(videoUri, maxWidth = 120) {
  * @returns {string} 格式化后的大小字符串
  */
 export function formatFileSize(bytes) {
-  if (!bytes || bytes === 0) return '--';
+  if (!bytes || bytes <= 0) return "";
   const mb = bytes / (1024 * 1024);
-  if (mb >= 100) {
-    return `${Math.round(mb)} MB`;
-  } else if (mb >= 1) {
-    return `${mb.toFixed(1)} MB`;
-  } else {
-    const kb = bytes / 1024;
-    return `${kb.toFixed(0)} KB`;
+  if (mb >= 100) return `${Math.round(mb)} MB`;
+  if (mb >= 1) return `${mb.toFixed(1)} MB`;
+  return `${(bytes / 1024).toFixed(0)} KB`;
+}
+
+async function statLibraryFile(item) {
+  if (!item?.fsPath) return 0;
+  try {
+    const Filesystem = getPlugin("Filesystem");
+    const dir = item.directory === "CACHE" ? Directory.Cache : Directory.Data;
+    const stat = await Filesystem.stat({ path: item.fsPath, directory: dir });
+    return Number(stat.size) || 0;
+  } catch {
+    return 0;
   }
+}
+
+/** 补全缺失的缩略图与文件大小，并写回 Preferences */
+export async function hydrateSrLibraryItem(item) {
+  let fileSize = Number(item.fileSize) || 0;
+  let thumbnail = item.thumbnail || "";
+  let changed = false;
+
+  if (!fileSize) {
+    const size = await statLibraryFile(item);
+    if (size > 0) {
+      fileSize = size;
+      changed = true;
+    }
+  }
+
+  if ((!thumbnail || thumbnail.length < 100) && item.uri) {
+    const nextThumb = await generateVideoThumbnail(item.uri);
+    if (nextThumb && nextThumb.length > 100) {
+      thumbnail = nextThumb;
+      changed = true;
+    }
+  }
+
+  if (!changed) return item;
+
+  const list = await loadSrLibrary();
+  const next = list.map((x) =>
+    x.id === item.id ? { ...x, fileSize, thumbnail } : x
+  );
+  await saveSrLibrary(next);
+  return { ...item, fileSize, thumbnail };
+}
+
+export async function hydrateSrLibrary(items) {
+  const out = [];
+  for (const item of items) {
+    out.push(await hydrateSrLibraryItem(item));
+  }
+  return out;
 }
 
 function arrayBufferToBase64(buffer) {
@@ -202,14 +266,71 @@ export async function saveMacSrToLibrary(buffer, filename, meta = {}) {
   });
 }
 
+function parseDocumentsRelativePath(uri) {
+  const decoded = decodeURIComponent(String(uri || ""));
+  const match = decoded.match(/\/Documents\/(.+)$/);
+  return match ? match[1] : "";
+}
+
+async function readNativeOutputAsBase64(outputPath) {
+  const Filesystem = getPlugin("Filesystem");
+  const rel = parseDocumentsRelativePath(outputPath);
+  if (rel) {
+    try {
+      const { data } = await Filesystem.readFile({
+        path: rel,
+        directory: Directory.Documents,
+      });
+      if (data) return { data, sourcePath: rel };
+    } catch (e) {
+      console.warn("[sr-library] read Documents failed:", e?.message || e);
+    }
+  }
+
+  const Capacitor = getCapacitor();
+  const fetchUrl =
+    outputPath.startsWith("http://") ||
+    outputPath.startsWith("https://") ||
+    outputPath.startsWith("file://") ||
+    outputPath.startsWith("capacitor://")
+      ? outputPath
+      : Capacitor.convertFileSrc(outputPath);
+  const res = await fetch(fetchUrl);
+  if (!res.ok) {
+    throw new Error("无法读取本机优化视频（文件可能已被删除）");
+  }
+  const buffer = await res.arrayBuffer();
+  return { data: arrayBufferToBase64(buffer), sourcePath: rel };
+}
+
 export async function saveNativeSrToLibrary(job) {
   const outputPath = job.outputPath || job.outputUri;
   if (!outputPath) throw new Error("无输出文件");
-  const name = safeName(job.displayFilename || "video_sr.mp4");
+  const name = safeName(job.displayFilename || "video_sr.mp4").replace(/\.mp4$/i, "_sr.mp4");
+  const { data: base64, sourcePath } = await readNativeOutputAsBase64(outputPath);
+
+  const Filesystem = getPlugin("Filesystem");
+  const fsPath = `sr_library/${Date.now()}_${name}`;
+  await Filesystem.writeFile({
+    path: fsPath,
+    data: base64,
+    directory: Directory.Data,
+    recursive: true,
+  });
+  const { uri } = await Filesystem.getUri({ path: fsPath, directory: Directory.Data });
+
+  if (sourcePath) {
+    try {
+      await Filesystem.deleteFile({ path: sourcePath, directory: Directory.Documents });
+    } catch {
+      /* ignore */
+    }
+  }
+
   return addSrLibraryItem({
     filename: name,
-    uri: outputPath,
-    fsPath: "",
+    uri,
+    fsPath,
     directory: "DATA",
     backend: "native",
     width: job.outputWidth,
@@ -218,7 +339,13 @@ export async function saveNativeSrToLibrary(job) {
 }
 
 export async function shareSrLibraryItem(item) {
-  await shareVideoFile(item.uri, item.filename || "保存视频");
+  if (!item?.fsPath && !item?.uri) {
+    throw new Error("视频记录无效，请删除后重新优化");
+  }
+  return shareVideoFile(item.uri, item.filename || "保存视频", {
+    fsPath: item.fsPath,
+    directory: item.directory || "DATA",
+  });
 }
 
 export async function deleteSrLibraryItem(id) {

@@ -12,7 +12,7 @@ enum RealEsrganError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .modelMissing:
-            return "未找到 Real-ESRGAN v3 模型。请在 Mac 执行 npm run ensure:sr-model，或在 App 内首次超分时联网自动下载"
+            return "未找到 Core ML 超分模型（general-x4v3 / v3）。请在 Mac 执行：cd mobile && npm run cap:sync，然后 Xcode 重新 Run 安装"
         case .modelLoad(let msg):
             return "模型加载失败：\(msg)"
         case .invalidInput:
@@ -42,13 +42,26 @@ final class RealEsrganEngine {
     private var inputName = "input"
     private var outputName = "output"
 
+    private var loadedProfile: SrIosModelProfile?
+
     var isReady: Bool { model != nil }
+
+    func unloadModel() {
+        model = nil
+        cpuFallbackModel = nil
+        modelSourceURL = nil
+        loadedProfile = nil
+    }
 
     /// 送入模型前最长边上限（超出会先缩小，再超分并输出 1080×1920）
     let maxInputLongEdge = 512
 
-    func loadModel(at url: URL, onProgress: ((String) -> Void)? = nil) throws {
-        if model != nil { return }
+    func loadModel(at url: URL, profile: SrIosModelProfile? = nil, onProgress: ((String) -> Void)? = nil) throws {
+        if let profile, loadedProfile == profile, model != nil { return }
+        if profile == nil, model != nil { return }
+        if profile != nil, loadedProfile != profile {
+            unloadModel()
+        }
         let loadURL = try RealEsrganModelLoader.compiledModelURL(for: url, onProgress: onProgress)
         modelSourceURL = url
         #if os(iOS)
@@ -64,6 +77,9 @@ final class RealEsrganEngine {
                 let loaded = try MLModel(contentsOf: loadURL, configuration: config)
                 model = loaded
                 configureProfile(from: loaded)
+                if let profile {
+                    loadedProfile = profile
+                }
                 return
             } catch let err as RealEsrganError {
                 throw err
@@ -74,11 +90,16 @@ final class RealEsrganEngine {
         throw RealEsrganError.modelLoad(lastErr?.localizedDescription ?? "模型加载失败")
     }
 
-    func loadBundledModel(onProgress: ((String) -> Void)? = nil) throws {
-        guard let url = RealEsrganModelLoader.resolvedModelURL() else {
+    func loadBundledModel(
+        profile: SrIosModelProfile = .general,
+        onProgress: ((String) -> Void)? = nil
+    ) throws {
+        if loadedProfile == profile, model != nil { return }
+        unloadModel()
+        guard let url = RealEsrganModelLoader.resolvedModelURL(for: profile) else {
             throw RealEsrganError.modelMissing
         }
-        try loadModel(at: url, onProgress: onProgress)
+        try loadModel(at: url, profile: profile, onProgress: onProgress)
     }
 
     private func configureProfile(from model: MLModel) {

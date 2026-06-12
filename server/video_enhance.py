@@ -1,4 +1,4 @@
-"""Real-ESRGAN 视频超分（ncnn-vulkan：抽帧 → 超分 → 合成）。"""
+"""视频成片真实感优化（ffmpeg：轻降噪 · 调色 · 轻锐化 · Lanczos 缩放）。"""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import re
 import shutil
 import stat
 import subprocess
+import threading
 import zipfile
 import time
 from collections.abc import Callable
@@ -17,6 +18,40 @@ from pathlib import Path
 import httpx
 
 ProgressFn = Callable[[str, float, int | None], None]
+CancelFn = Callable[[], bool]
+
+_SR_CANCEL_EVENTS: dict[str, threading.Event] = {}
+_SR_CANCEL_LOCK = threading.Lock()
+
+
+class SrCancelledError(Exception):
+    """用户取消超分任务。"""
+
+
+def register_sr_cancel(job_id: str) -> threading.Event:
+    with _SR_CANCEL_LOCK:
+        ev = threading.Event()
+        _SR_CANCEL_EVENTS[job_id] = ev
+        return ev
+
+
+def request_sr_cancel(job_id: str) -> bool:
+    with _SR_CANCEL_LOCK:
+        ev = _SR_CANCEL_EVENTS.get(job_id)
+        if ev:
+            ev.set()
+            return True
+    return False
+
+
+def clear_sr_cancel(job_id: str) -> None:
+    with _SR_CANCEL_LOCK:
+        _SR_CANCEL_EVENTS.pop(job_id, None)
+
+
+def _raise_if_cancelled(should_cancel: CancelFn | None) -> None:
+    if should_cancel and should_cancel():
+        raise SrCancelledError("超分已取消")
 
 
 def _eta_from_frac(elapsed: float, frac: float) -> int | None:
@@ -34,8 +69,8 @@ from ffmpeg_util import resolve_ffmpeg_exe
 
 logger = logging.getLogger(__name__)
 
-# v2：抽帧目录超分（勿再向 ncnn 传 .mp4 路径）
-SR_PIPELINE_VERSION = 2
+# v3：真实感优化（ffmpeg 滤镜，不再使用 AI 超分）
+SR_PIPELINE_VERSION = 3
 
 TOOLS_DIR = Path(__file__).resolve().parent / "tools" / "realesrgan-ncnn-vulkan"
 
@@ -55,13 +90,45 @@ _NCNN_RELEASES = {
 }
 
 _MODEL_ALIASES = {
-    "realesr-general-x4v3": "realesrgan-x4plus",
-    "general": "realesrgan-x4plus",
+    "realesr-general-x4v3": "realesr-general-x4v3",
+    "general": "realesr-general-x4v3",
+    "real": "realesr-general-x4v3",
     "realesrgan-x4plus": "realesrgan-x4plus",
     "anime": "realesr-animevideov3",
     "realesr-animevideov3": "realesr-animevideov3",
     "realesrgan-x4plus-anime": "realesrgan-x4plus-anime",
 }
+
+# App / API 成片优化档位（兼容旧参数 real / anime，均走 natural）
+SR_PROFILES: dict[str, str] = {
+    "real": "natural",
+    "anime": "natural",
+}
+
+_GENERAL_NCNN_BASE = (
+    "https://github.com/TransparentLC/realesrgan-gui/releases/download/additional-models"
+)
+_GENERAL_NCNN_FILES = ("realesr-general-x4v3.param", "realesr-general-x4v3.bin")
+
+
+def normalize_sr_profile(value: str | None) -> str:
+    v = (value or os.getenv("HONGGUO_SR_PROFILE", "real")).strip().lower()
+    if v in ("anime", "animation", "动漫", "动画", "cartoon"):
+        return "anime"
+    if v in ("real", "general", "真人", "人脸", "face", "live", "photo"):
+        return "real"
+    return "real"
+
+
+def sr_profile_model(profile: str) -> str:
+    key = normalize_sr_profile(profile)
+    return SR_PROFILES.get(key, SR_PROFILES["real"])
+
+
+def list_sr_profiles() -> list[dict[str, str]]:
+    return [
+        {"id": "real", "label": "真实感优化", "model": "natural"},
+    ]
 
 
 def normalize_enhance(value: str | None) -> str:
@@ -159,11 +226,57 @@ def ensure_ncnn_bundle() -> Path:
     return exe
 
 
+def ensure_general_ncnn_models(models_dir: Path | None = None) -> None:
+    """官方 ncnn zip 不含 general-x4v3，首次使用时从社区镜像拉取 param/bin。"""
+    if models_dir is None:
+        exe = find_ncnn_exe()
+        if exe is None:
+            return
+        models_dir = exe.parent / "models"
+    models_dir.mkdir(parents=True, exist_ok=True)
+    param = models_dir / "realesr-general-x4v3.param"
+    bin_path = models_dir / "realesr-general-x4v3.bin"
+    if param.is_file() and bin_path.is_file() and bin_path.stat().st_size > 100_000:
+        return
+    logger.info("正在下载 realesr-general-x4v3 ncnn 权重（约 4.7MB，仅首次）…")
+    with httpx.Client(timeout=600.0, follow_redirects=True) as client:
+        for fname in _GENERAL_NCNN_FILES:
+            dest = models_dir / fname
+            url = f"{_GENERAL_NCNN_BASE}/{fname}"
+            with client.stream("GET", url) as resp:
+                resp.raise_for_status()
+                with dest.open("wb") as fh:
+                    for chunk in resp.iter_bytes(1024 * 256):
+                        fh.write(chunk)
+
+
 def sr_available() -> bool:
     try:
-        return find_ncnn_exe() is not None or _platform_key() in _NCNN_RELEASES
-    except OSError:
+        resolve_ffmpeg_exe()
+        return True
+    except (OSError, RuntimeError):
         return False
+
+
+def build_natural_vf(
+    *,
+    src_w: int,
+    src_h: int,
+    out_w: int,
+    out_h: int,
+    fps: int,
+) -> str:
+    """轻降噪 + 微调色 + 轻 unsharp，避免 AI 超分的塑料感。"""
+    parts = [
+        "hqdn3d=2:1:2:3",
+        "eq=contrast=1.03:brightness=0.01:saturation=1.04",
+        "unsharp=3:3:0.28:3:3:0.0",
+    ]
+    if out_w > 0 and out_h > 0 and (src_w != out_w or src_h != out_h):
+        parts.append(f"scale={out_w}:{out_h}:flags=lanczos")
+    if fps > 0:
+        parts.append(f"fps={fps}")
+    return ",".join(parts)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -261,9 +374,19 @@ def _probe_video_fps(path: Path) -> float:
 
 
 def _resolve_model_name(model: str, models_dir: Path) -> str:
-    raw = (model or os.getenv("HONGGUO_REALESRGAN_MODEL", "realesr-animevideov3")).strip()
+    raw = (
+        model
+        or os.getenv("HONGGUO_REALESRGAN_MODEL")
+        or SR_PROFILES["real"]
+    ).strip()
     name = _MODEL_ALIASES.get(raw, raw)
-    candidates = [name, "realesr-animevideov3", "realesrgan-x4plus", "realesrgan-x4plus-anime"]
+    candidates = [
+        name,
+        "realesr-general-x4v3",
+        "realesr-animevideov3",
+        "realesrgan-x4plus",
+        "realesrgan-x4plus-anime",
+    ]
     seen: set[str] = set()
     for cand in candidates:
         if cand in seen:
@@ -273,7 +396,7 @@ def _resolve_model_name(model: str, models_dir: Path) -> str:
             return cand
         if list(models_dir.glob(f"{cand}*.param")):
             return cand
-    return "realesrgan-x4plus"
+    return "realesr-general-x4v3"
 
 
 def calc_sr_scale(
@@ -292,11 +415,62 @@ def calc_sr_scale(
 
 
 def _ncnn_scale(model_name: str, desired: int) -> int:
-    """x4plus 仅有 4x 权重；动漫 v3 支持 2/3/4。"""
+    """general / x4plus 仅有 4x 权重；动漫 v3 支持 2/3/4。"""
     desired = max(2, min(4, int(desired)))
-    if model_name in ("realesrgan-x4plus", "realesrgan-x4plus-anime"):
+    if model_name in (
+        "realesr-general-x4v3",
+        "realesr-general-wdn-x4v3",
+        "realesrgan-x4plus",
+        "realesrgan-x4plus-anime",
+    ):
         return 4
     return desired
+
+
+def _extract_vf_chain(vf: str | None) -> str:
+    """重排 PTS，避免抖音等源视频 duplicate DTS 导致 image2 抽帧失败。"""
+    pts = "setpts=N/FRAME_RATE/TB"
+    if vf:
+        return f"{vf},{pts}"
+    return pts
+
+
+def _run_ffmpeg_extract(
+    ffmpeg: str,
+    src: Path,
+    pattern: Path,
+    *,
+    vf: str,
+    jpeg_q: int,
+    extra_input: list[str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    args = [
+        ffmpeg,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        *(extra_input or ["-fflags", "+genpts+discardcorrupt"]),
+        "-i",
+        str(src),
+        "-vf",
+        vf,
+        "-qscale:v",
+        str(jpeg_q),
+        "-start_number",
+        "0",
+        "-fps_mode",
+        "vfr",
+        str(pattern),
+    ]
+    return subprocess.run(
+        args,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=1800,
+    )
 
 
 def _extract_frames(
@@ -307,37 +481,37 @@ def _extract_frames(
     vf: str | None = None,
 ) -> float:
     frames_dir.mkdir(parents=True, exist_ok=True)
+    for old in frames_dir.glob(f"frame*.{fmt}"):
+        old.unlink(missing_ok=True)
+
     ffmpeg = resolve_ffmpeg_exe()
     pattern = frames_dir / f"frame%08d.{fmt}"
     jpeg_q = max(2, min(5, _env_int("HONGGUO_REALESRGAN_JPEG_QUALITY", 2)))
-    args = [
-        ffmpeg,
-        "-y",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-i",
-        str(src),
-    ]
-    if vf:
-        args.extend(["-vf", vf])
-    args.extend(
-        [
-            "-qscale:v",
-            str(jpeg_q),
-            "-vsync",
-            "0",
-            str(pattern),
-        ]
+    vf_chain = _extract_vf_chain(vf)
+
+    proc = _run_ffmpeg_extract(
+        ffmpeg, src, pattern, vf=vf_chain, jpeg_q=jpeg_q
     )
-    proc = subprocess.run(
-        args,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=1800,
-    )
+    if proc.returncode != 0:
+        # 部分旧版 ffmpeg 无 -fps_mode；或极端坏流需更激进地重建时间轴
+        fallback_vf = vf_chain
+        if "fps=" not in vf_chain:
+            fps = max(1.0, _probe_video_fps(src))
+            fps_s = f"{fps:.3f}".rstrip("0").rstrip(".")
+            base = vf or ""
+            fallback_vf = (
+                f"{base},fps={fps_s},setpts=N/FRAME_RATE/TB"
+                if base
+                else f"fps={fps_s},setpts=N/FRAME_RATE/TB"
+            )
+        proc = _run_ffmpeg_extract(
+            ffmpeg,
+            src,
+            pattern,
+            vf=fallback_vf,
+            jpeg_q=jpeg_q,
+            extra_input=["-fflags", "+genpts+discardcorrupt+igndts"],
+        )
     if proc.returncode != 0:
         tail = (proc.stderr or proc.stdout or "")[-600:]
         raise RuntimeError(f"抽帧失败: {tail}")
@@ -398,6 +572,7 @@ def run_ncnn_video_sr(
     src_w: int = 0,
     src_h: int = 0,
     on_progress: ProgressFn | None = None,
+    should_cancel: CancelFn | None = None,
 ) -> None:
     """
     ncnn-vulkan 仅支持图片/目录：抽帧 → 目录超分 → 再合成 mp4。
@@ -411,6 +586,7 @@ def run_ncnn_video_sr(
     exe = ensure_ncnn_bundle()
     exe_parent = exe.parent
     models_dir = exe_parent / "models"
+    ensure_general_ncnn_models(models_dir)
     model_name = _resolve_model_name(model or "", models_dir)
     scale = _ncnn_scale(model_name, scale)
 
@@ -451,6 +627,7 @@ def run_ncnn_video_sr(
     out_rel = f"jobs/{work.name}/out"
 
     try:
+        _raise_if_cancelled(should_cancel)
         max_long = _sr_max_input_long_edge()
         prep_vf = None
         prep_dims = None
@@ -464,6 +641,7 @@ def run_ncnn_video_sr(
                 )
         else:
             report("正在抽帧…", 0.02)
+        _raise_if_cancelled(should_cancel)
         src_fps = _extract_frames(src, in_frames, fmt=fmt, vf=prep_vf)
         in_count = len(list(in_frames.glob(f"*.{fmt}")))
         if in_count < 1:
@@ -517,6 +695,10 @@ def run_ncnn_video_sr(
         started = time.monotonic()
         last_report = 0.0
         while proc.poll() is None:
+            if should_cancel and should_cancel():
+                proc.kill()
+                proc.wait(timeout=10)
+                raise SrCancelledError("超分已取消")
             if time.monotonic() - started > timeout:
                 proc.kill()
                 raise RuntimeError(f"Real-ESRGAN 超分超时（>{timeout}s）")
@@ -567,6 +749,7 @@ def run_ncnn_video_sr(
         if out_count < 1:
             raise RuntimeError("Real-ESRGAN 未输出任何超分帧")
 
+        _raise_if_cancelled(should_cancel)
         report("正在合成超分视频…", 0.9)
         _merge_frames(out_frames, dest, fmt=fmt, fps=src_fps)
         report("超分视频合成完成", 0.95)
@@ -668,41 +851,22 @@ def apply_sr_output(
     out_w: int,
     out_h: int,
     fps: int,
+    sr_profile: str = "real",
     on_progress: ProgressFn | None = None,
+    should_cancel: CancelFn | None = None,
 ) -> str:
-    """
-    Real-ESRGAN 超分 → 精确缩放到目标分辨率 → 插帧 → 混音。
-    返回使用的后端名称。
-    """
-    scale = calc_sr_scale(src_w, src_h, out_w, out_h)
-    sr_out = dest.with_suffix(".sr.mp4")
-    try:
-        run_ncnn_video_sr(
-            video,
-            sr_out,
-            scale=scale,
-            src_w=src_w,
-            src_h=src_h,
-            on_progress=on_progress,
-        )
-        sr_w, sr_h = _probe_size(sr_out)
-        if sr_w < 2 or sr_h < 2:
-            sr_w, sr_h = src_w * scale, src_h * scale
-
-        vf_parts: list[str] = []
-        if sr_w != out_w or sr_h != out_h:
-            vf_parts.append(f"scale={out_w}:{out_h}:flags=lanczos")
-        if fps > 0:
-            vf_parts.append(f"fps={fps}")
-        vf = ",".join(vf_parts) if vf_parts else None
-        if on_progress:
-            on_progress("正在缩放并合并音轨…", 0.97, None)
-        mux_video(sr_out, audio_src, dest, vf=vf, fps=None)
-        if on_progress:
-            on_progress("超分处理完成", 1.0, None)
-        return f"realesrgan-x{scale}"
-    finally:
-        sr_out.unlink(missing_ok=True)
+    """真实感优化 → 缩放到目标分辨率 → 混音。返回后端名称。"""
+    _ = sr_profile
+    _raise_if_cancelled(should_cancel)
+    resolve_ffmpeg_exe()
+    vf = build_natural_vf(src_w=src_w, src_h=src_h, out_w=out_w, out_h=out_h, fps=fps)
+    if on_progress:
+        on_progress("正在真实感优化（降噪·调色·轻锐化）…", 0.35, None)
+    _raise_if_cancelled(should_cancel)
+    mux_video(video, audio_src, dest, vf=vf, fps=None)
+    if on_progress:
+        on_progress("成片优化完成", 1.0, None)
+    return "natural-ffmpeg"
 
 
 def super_resolve_video(
@@ -711,18 +875,19 @@ def super_resolve_video(
     *,
     output_scale: str = "1080",
     output_fps_choice: str | int | None = None,
+    sr_profile: str = "real",
     on_progress: ProgressFn | None = None,
+    should_cancel: CancelFn | None = None,
 ) -> dict[str, int | str]:
-    """仅 AI 超分（不去水印）：Real-ESRGAN → 缩放到目标分辨率 → 保留原声。"""
+    """成片真实感优化（不去水印）：ffmpeg 滤镜 → 缩放到目标分辨率 → 保留原声。"""
+    _raise_if_cancelled(should_cancel)
     if not src.is_file():
         raise RuntimeError("源视频不存在")
     if src.stat().st_size < 10_000:
         raise RuntimeError("视频文件过小或已损坏")
     if not sr_available():
-        raise RuntimeError(
-            "Real-ESRGAN 未就绪，请先在 Mac 上运行 ./start.sh（首次会自动下载工具）"
-        )
-    ensure_ncnn_bundle()
+        raise RuntimeError("ffmpeg 未就绪，请先在 Mac 上运行 ./start.sh")
+    resolve_ffmpeg_exe()
 
     from watermark_remove import (
         normalize_output_fps_choice,
@@ -754,8 +919,9 @@ def super_resolve_video(
             eta_sec = _eta_from_frac(time.monotonic() - job_start, frac)
         on_progress(msg, frac, eta_sec)
 
-    relay_progress("正在准备超分…", 0.01, None)
+    relay_progress("正在准备真实感优化…", 0.01, None)
 
+    profile = normalize_sr_profile(sr_profile)
     backend = apply_sr_output(
         src,
         src,
@@ -765,14 +931,18 @@ def super_resolve_video(
         out_w=out_spec.width,
         out_h=out_spec.height,
         fps=fps,
+        sr_profile=profile,
         on_progress=relay_progress,
+        should_cancel=should_cancel,
     )
     return {
         "output_width": out_spec.width,
         "output_height": out_spec.height,
         "output_fps": fps,
         "enhance_backend": backend,
+        "sr_profile": profile,
+        "sr_model": sr_profile_model(profile),
         "source_width": src_w,
         "source_height": src_h,
-        "enhance": "sr",
+        "enhance": "natural",
     }

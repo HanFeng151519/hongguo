@@ -1,4 +1,10 @@
-import { deleteSrLibraryItem, formatFileSize, loadSrLibrary, shareSrLibraryItem } from "./sr-library.js";
+import {
+  deleteSrLibraryItem,
+  formatFileSize,
+  hydrateSrLibrary,
+  loadSrLibrary,
+  shareSrLibraryItem,
+} from "./sr-library.js";
 
 function formatTime(ts) {
   const d = new Date(ts || Date.now());
@@ -19,13 +25,14 @@ export function bindSrLibraryUI({
   if (!listEl) return async () => {};
 
   async function render() {
-    const items = await loadSrLibrary();
+    const raw = await loadSrLibrary();
+    const items = raw.length ? await hydrateSrLibrary(raw) : raw;
     if (countEl) countEl.textContent = String(items.length);
     listEl.innerHTML = "";
     if (!items.length) {
       const empty = document.createElement("li");
       empty.className = "sr-library-empty";
-      empty.textContent = "暂无超分成片";
+      empty.textContent = "暂无优化成片";
       listEl.appendChild(empty);
       if (onChange) onChange(items);
       return items;
@@ -35,16 +42,11 @@ export function bindSrLibraryUI({
       li.className = "sr-library-item";
       const sizeHint =
         item.width && item.height ? `${item.width}×${item.height}` : "1080×1920";
-      const fileSizeStr = formatFileSize(item.fileSize);
-      
-      // Debug: log thumbnail status
-      console.log('Item thumbnail:', item.id, item.thumbnail ? 'exists' : 'missing', item.thumbnail?.substring(0, 50));
-      
-      // Build thumbnail HTML
-      const thumbnailHtml = item.thumbnail && item.thumbnail.length > 100
-        ? `<img src="${item.thumbnail}" alt="" class="sr-library-thumb" loading="lazy" />`
-        : `<div class="sr-library-thumb-placeholder">🎬</div>`;
-      
+      const fileSizeStr = formatFileSize(item.fileSize) || "大小未知";
+      const thumbnailHtml =
+        item.thumbnail && item.thumbnail.length > 100
+          ? `<img src="${item.thumbnail}" alt="" class="sr-library-thumb" loading="lazy" />`
+          : `<div class="sr-library-thumb-placeholder" aria-hidden="true">🎬</div>`;
       li.innerHTML = `
         <div class="sr-library-content">
           ${thumbnailHtml}
@@ -87,12 +89,9 @@ export function bindSrLibraryUI({
       saveBtn.textContent = '保存中…';
       
       try {
-        console.log('Sharing video:', item.uri);
-        await shareSrLibraryItem(item);
-        console.log('Share succeeded');
-        // Show success feedback
+        const via = await shareSrLibraryItem(item);
         const originalText = saveBtn.textContent;
-        saveBtn.textContent = '✓ 已保存';
+        saveBtn.textContent = via === "photos" ? "✓ 已存相册" : "✓ 请选储存";
         saveBtn.style.background = '#4CAF50';
         saveBtn.style.color = '#fff';
         setTimeout(() => {
@@ -114,7 +113,7 @@ export function bindSrLibraryUI({
     if (delBtn) {
       const id = delBtn.dataset.id;
       if (!id) return;
-      if (!confirm("确定删除这条超分成片？")) return;
+      if (!confirm("确定删除这条优化成片？")) return;
       await deleteSrLibraryItem(id);
       await render();
     }

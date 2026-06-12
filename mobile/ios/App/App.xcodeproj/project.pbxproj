@@ -21,6 +21,7 @@
 		A1SR00052058000100000001 /* RealEsrganPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1SR00062058000100000001 /* RealEsrganPlugin.swift */; };
 		A1SR000A2058000100000001 /* RealEsrganModelLoader.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1SR00092058000100000001 /* RealEsrganModelLoader.swift */; };
 		A1SR000F2058000100000001 /* RealESRGAN_v3.mlpackage in Resources */ = {isa = PBXBuildFile; fileRef = A1SR000E2058000100000001 /* RealESRGAN_v3.mlpackage */; };
+		A1SR00132058000100000001 /* RealESRGAN_general.mlpackage in Resources */ = {isa = PBXBuildFile; fileRef = A1SR00122058000100000001 /* RealESRGAN_general.mlpackage */; };
 		A1SR00102058000100000001 /* SrBackgroundJobManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1SR00112058000100000001 /* SrBackgroundJobManager.swift */; };
 /* End PBXBuildFile section */
 
@@ -40,6 +41,7 @@
 		A1SR00062058000100000001 /* RealEsrganPlugin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealEsrganPlugin.swift; sourceTree = "<group>"; };
 		A1SR00092058000100000001 /* RealEsrganModelLoader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealEsrganModelLoader.swift; sourceTree = "<group>"; };
 		A1SR000E2058000100000001 /* RealESRGAN_v3.mlpackage */ = {isa = PBXFileReference; lastKnownFileType = wrapper.mlpackage; path = RealESRGAN_v3.mlpackage; sourceTree = "<group>"; };
+		A1SR00122058000100000001 /* RealESRGAN_general.mlpackage */ = {isa = PBXFileReference; lastKnownFileType = wrapper.mlpackage; path = RealESRGAN_general.mlpackage; sourceTree = "<group>"; };
 		A1SR00112058000100000001 /* SrBackgroundJobManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SrBackgroundJobManager.swift; sourceTree = "<group>"; };
 		AF277DCFFFF123FFC6DF26C7 /* Pods_App.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = Pods_App.framework; sourceTree = BUILT_PRODUCTS_DIR; };
 		AF51FD2D460BCFE21FA515B2 /* Pods-App.release.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-App.release.xcconfig"; path = "Pods/Target Support Files/Pods-App/Pods-App.release.xcconfig"; sourceTree = "<group>"; };
@@ -95,6 +97,7 @@
 				A1SR00092058000100000001 /* RealEsrganModelLoader.swift */,
 				A1SR00112058000100000001 /* SrBackgroundJobManager.swift */,
 				A1SR000E2058000100000001 /* RealESRGAN_v3.mlpackage */,
+				A1SR00122058000100000001 /* RealESRGAN_general.mlpackage */,
 				A1SR000D2058000100000001 /* Models */,
 				504EC30B1FED79650016851F /* Main.storyboard */,
 				504EC30E1FED79650016851F /* Assets.xcassets */,
@@ -193,6 +196,7 @@
 				504EC30D1FED79650016851F /* Main.storyboard in Resources */,
 				2FAD9763203C412B000D30F8 /* config.xml in Resources */,
 				A1SR000F2058000100000001 /* RealESRGAN_v3.mlpackage in Resources */,
+				A1SR00132058000100000001 /* RealESRGAN_general.mlpackage in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

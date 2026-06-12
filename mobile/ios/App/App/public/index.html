@@ -28,7 +28,7 @@
         <span class="brand-icon">📥</span>
         <div>
           <h1>视频爬取</h1>
-          <p>抖音 · 快手 · 头条 · 小红书 · 百度 · 纯本地解析，无需电脑后端</p>
+          <p>抖音 · 快手 · 头条 · 小红书 · 百度 · 小云雀 · 纯本地解析，无需电脑后端</p>
         </div>
       </div>
     </header>
@@ -53,8 +53,8 @@
         </label>
 
         <details class="cookie-details">
-          <summary>Mac 后端超分（可选，长视频 / 4K）</summary>
-          <p class="sr-setup-hint">爬取完成后点下方对应按钮：本机超分（较慢）或 Mac 超分（需同一 Wi‑Fi 运行 <code>./start.sh</code>）</p>
+          <summary>Mac 后端成片优化（可选，长视频）</summary>
+          <p class="sr-setup-hint">爬取完成后点下方按钮：本机或 Mac「真实感优化」（降噪·轻锐化·调色，不用 AI 超分）。Mac 需同一 Wi‑Fi 运行 <code>./start.sh</code></p>
           <div class="wm-field wm-field-full sr-server-field">
             <span class="wm-field-label">Mac 后端地址</span>
             <select id="sr-server-preset" class="wm-share-input" aria-label="Mac 后端地址">
@@ -77,12 +77,13 @@
             />
           </div>
           <label class="wm-field">
-            <span>超分输出</span>
+            <span>输出分辨率</span>
             <select id="sr-scale" class="wm-share-input">
-              <option value="1080">1080p</option>
-              <option value="4k" selected>4K（更慢）</option>
+              <option value="1080" selected>1080p（推荐，更自然）</option>
+              <option value="4k">4K（更慢，仅当原片够清晰）</option>
             </select>
           </label>
+          <p class="sr-setup-hint">不做 AI 超分，只做真实感增强；预览区「清晰 / 影院」可先看效果再导出。</p>
           <button type="button" id="sr-test" class="btn-adjust-reset">测试连接</button>
           <p id="sr-mac-status" class="sr-mac-status hidden"></p>
         </details>
@@ -101,7 +102,7 @@
 
         <div class="wm-actions">
           <button type="submit" id="submit-btn" class="btn-primary">爬取视频</button>
-          <button type="button" id="upload-video-btn" class="btn-secondary">📁 上传本地视频超分</button>
+          <button type="button" id="upload-video-btn" class="btn-secondary">📁 上传本地视频优化</button>
         </div>
 
         <!-- Hidden file input for video upload -->
@@ -113,6 +114,7 @@
             <div id="sr-progress-bar" class="sr-progress-bar"></div>
           </div>
           <p id="sr-progress-label" class="sr-progress-label"></p>
+          <button type="button" id="sr-mac-cancel-btn" class="btn-adjust-reset btn-danger-text hidden">取消 Mac 优化</button>
         </div>
 
         <div id="sr-native-task" class="sr-native-task hidden">
@@ -121,8 +123,8 @@
         </div>
 
         <details id="sr-library-panel" class="cookie-details sr-library-panel">
-          <summary>超分成片库 (<span id="sr-library-count">0</span>)</summary>
-          <p class="sr-setup-hint">Mac / 本机超分完成后会出现在这里，可点「存相册」或「删除」。</p>
+          <summary>优化成片库 (<span id="sr-library-count">0</span>)</summary>
+          <p class="sr-setup-hint">Mac / 本机优化完成后会出现在这里，可点「存相册」或「删除」。</p>
           <ul id="sr-library-list" class="sr-library-list"></ul>
         </details>
 
@@ -172,11 +174,11 @@
           <div class="wm-result-actions">
             <button type="button" id="save-btn" class="btn-primary">保存到相册</button>
             <div id="sr-buttons" class="sr-action-row hidden">
-              <button type="button" id="sr-native-btn" class="btn-secondary">本机超分并保存</button>
-              <button type="button" id="sr-mac-btn" class="btn-secondary btn-mac-sr hidden">Mac 超分并保存</button>
+              <button type="button" id="sr-native-btn" class="btn-secondary">本机真实感优化</button>
+              <button type="button" id="sr-mac-btn" class="btn-secondary btn-mac-sr hidden">Mac 真实感优化</button>
             </div>
           </div>
-          <p class="wm-hint">超分完成后在「超分成片库」存相册。本机任务卡住可点「取消并删除本机任务」。</p>
+          <p class="wm-hint">优化完成后在「优化成片库」存相册。本机任务卡住可点「取消并删除本机任务」。</p>
         </div>
       </form>
     </section>

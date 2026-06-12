@@ -4,6 +4,7 @@ import logging
 import os
 import sys
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 
 # Windows：uvicorn 下 Playwright 需 Proactor 事件循环；macOS/Linux 不改动默认策略
 if sys.platform == "win32":
@@ -147,6 +148,22 @@ WM_JOBS: dict[str, dict[str, Any]] = {}
 WM_JOBS_LOCK = asyncio.Lock()
 
 
+@dataclass
+class _SrQueuedJob:
+    job_id: str
+    src: Path
+    out: Path
+    output_scale: str
+    output_fps_choice: str
+    sr_profile: str
+
+
+_SR_JOB_QUEUE: asyncio.Queue[_SrQueuedJob] = asyncio.Queue()
+_SR_QUEUE_WAITING: list[str] = []
+_SR_QUEUE_META_LOCK = asyncio.Lock()
+_SR_WORKER_TASK: asyncio.Task | None = None
+
+
 def _wm_job_file(job_id: str) -> Path:
     safe = re.sub(r"[^\w\-]", "", job_id) or "job"
     return WM_JOBS_DIR / f"{safe}.json"
@@ -176,6 +193,111 @@ DOWNLOAD_TTL_SEC = 3600
 GENERATE_JOBS: dict[str, dict[str, Any]] = {}
 GENERATE_JOBS_LOCK = asyncio.Lock()
 
+async def _update_sr_queue_positions() -> None:
+    async with _SR_QUEUE_META_LOCK:
+        waiting = list(_SR_QUEUE_WAITING)
+    for i, jid in enumerate(waiting):
+        ahead = i
+        msg = (
+            "排队中，即将开始…"
+            if ahead == 0
+            else f"排队中（前方还有 {ahead} 个任务）…"
+        )
+        async with WM_JOBS_LOCK:
+            job = WM_JOBS.get(jid)
+        if not job:
+            job = _load_wm_job(jid)
+        if not job or job.get("status") == "cancelled":
+            continue
+        if job.get("status") == "queued":
+            await _set_wm_job(
+                jid,
+                status="queued",
+                progress=msg,
+                queue_position=i + 1,
+            )
+
+
+async def _sr_queue_worker() -> None:
+    while True:
+        job = await _SR_JOB_QUEUE.get()
+        try:
+            async with _SR_QUEUE_META_LOCK:
+                if job.job_id in _SR_QUEUE_WAITING:
+                    _SR_QUEUE_WAITING.remove(job.job_id)
+            await _update_sr_queue_positions()
+
+            async with WM_JOBS_LOCK:
+                st = WM_JOBS.get(job.job_id, {}).get("status")
+            if st is None:
+                loaded = _load_wm_job(job.job_id)
+                st = loaded.get("status") if loaded else None
+            if st == "cancelled":
+                job.src.unlink(missing_ok=True)
+                continue
+
+            await _run_sr_job(
+                job.job_id,
+                job.src,
+                job.out,
+                output_scale=job.output_scale,
+                output_fps_choice=job.output_fps_choice,
+                sr_profile=job.sr_profile,
+            )
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "sr queue worker failed for %s", job.job_id
+            )
+        finally:
+            _SR_JOB_QUEUE.task_done()
+
+
+async def _ensure_sr_worker() -> None:
+    global _SR_WORKER_TASK
+    if _SR_WORKER_TASK is None or _SR_WORKER_TASK.done():
+        _SR_WORKER_TASK = asyncio.create_task(_sr_queue_worker())
+
+
+async def _enqueue_sr_job(
+    job_id: str,
+    src: Path,
+    out: Path,
+    *,
+    output_scale: str,
+    output_fps_choice: str,
+    sr_profile: str,
+) -> None:
+    async with _SR_QUEUE_META_LOCK:
+        _SR_QUEUE_WAITING.append(job_id)
+        pos = len(_SR_QUEUE_WAITING)
+    if pos > 1:
+        await _set_wm_job(
+            job_id,
+            status="queued",
+            progress=f"排队中（第 {pos} 个，前方还有 {pos - 1} 个任务）…",
+            queue_position=pos,
+        )
+    await _SR_JOB_QUEUE.put(
+        _SrQueuedJob(
+            job_id=job_id,
+            src=src,
+            out=out,
+            output_scale=output_scale,
+            output_fps_choice=output_fps_choice,
+            sr_profile=sr_profile,
+        )
+    )
+    await _ensure_sr_worker()
+    await _update_sr_queue_positions()
+
+
+async def _dequeue_sr_waiting(job_id: str) -> None:
+    async with _SR_QUEUE_META_LOCK:
+        if job_id in _SR_QUEUE_WAITING:
+            _SR_QUEUE_WAITING.remove(job_id)
+    await _update_sr_queue_positions()
+
+
 @asynccontextmanager
 async def _app_lifespan(app: FastAPI):
     if sys.platform == "win32":
@@ -187,6 +309,7 @@ async def _app_lifespan(app: FastAPI):
                 lan,
                 port,
             )
+    await _ensure_sr_worker()
     yield
     if browser_sync_available():
         await close_koc_browser()
@@ -1499,15 +1622,30 @@ async def cache_douyin_from_share(body: DouyinCacheRequest):
 
 @app.get("/api/tools/sr-status")
 async def sr_status():
-    from video_enhance import SR_PIPELINE_VERSION, find_ncnn_exe, sr_available
+    from video_enhance import (
+        SR_PIPELINE_VERSION,
+        find_ncnn_exe,
+        list_sr_profiles,
+        normalize_sr_profile,
+        sr_available,
+        sr_profile_model,
+    )
 
     exe = find_ncnn_exe()
+    profile = normalize_sr_profile(None)
+    async with _SR_QUEUE_META_LOCK:
+        queue_waiting = len(_SR_QUEUE_WAITING)
     return {
         "ok": True,
         "pipeline_version": SR_PIPELINE_VERSION,
         "available": sr_available(),
         "exe": str(exe) if exe else None,
-        "mode": "frames",
+        "mode": "natural",
+        "sequential": True,
+        "queue_waiting": queue_waiting,
+        "default_profile": profile,
+        "default_model": sr_profile_model(profile),
+        "profiles": list_sr_profiles(),
     }
 
 
@@ -1720,45 +1858,65 @@ async def _run_sr_job(
     *,
     output_scale: str = "1080",
     output_fps_choice: str = "",
+    sr_profile: str = "real",
 ) -> None:
-    from video_enhance import super_resolve_video
-
-    await _set_wm_job(
-        job_id,
-        status="running",
-        progress="正在准备 Real-ESRGAN 超分…",
-        progress_pct=0,
+    from video_enhance import (
+        SrCancelledError,
+        clear_sr_cancel,
+        register_sr_cancel,
+        super_resolve_video,
     )
-    loop = asyncio.get_running_loop()
 
-    def on_progress(msg: str, frac: float, eta_sec: int | None = None) -> None:
-        fields: dict[str, Any] = {
-            "status": "running",
-            "progress": msg,
-            "progress_pct": round(max(0.0, min(1.0, frac)) * 100, 1),
-        }
-        if eta_sec is not None and eta_sec > 0:
-            fields["eta_sec"] = int(eta_sec)
-        asyncio.run_coroutine_threadsafe(_set_wm_job(job_id, **fields), loop)
-
+    cancel_ev = register_sr_cancel(job_id)
     try:
+        if cancel_ev.is_set():
+            raise SrCancelledError("超分已取消")
+
+        await _set_wm_job(
+            job_id,
+            status="running",
+            progress="正在准备真实感优化…",
+            progress_pct=0,
+        )
+        loop = asyncio.get_running_loop()
+
+        def on_progress(msg: str, frac: float, eta_sec: int | None = None) -> None:
+            fields: dict[str, Any] = {
+                "status": "running",
+                "progress": msg,
+                "progress_pct": round(max(0.0, min(1.0, frac)) * 100, 1),
+            }
+            if eta_sec is not None and eta_sec > 0:
+                fields["eta_sec"] = int(eta_sec)
+            asyncio.run_coroutine_threadsafe(_set_wm_job(job_id, **fields), loop)
+
         meta = await asyncio.to_thread(
             super_resolve_video,
             src,
             out,
             output_scale=output_scale or "1080",
             output_fps_choice=output_fps_choice or None,
+            sr_profile=sr_profile,
             on_progress=on_progress,
+            should_cancel=cancel_ev.is_set,
         )
         await _set_wm_job(
             job_id,
             status="completed",
-            progress="超分完成",
+            progress="成片优化完成",
             download_url=f"/downloads/sr_{job_id}.mp4",
             preview_url=f"/preview/sr_{job_id}.mp4",
             size=out.stat().st_size,
             region=meta,
             regions=[],
+        )
+    except SrCancelledError:
+        out.unlink(missing_ok=True)
+        await _set_wm_job(
+            job_id,
+            status="cancelled",
+            progress="已取消",
+            error="用户取消",
         )
     except Exception as exc:
         logging.getLogger(__name__).exception("sr job %s failed", job_id)
@@ -1769,10 +1927,11 @@ async def _run_sr_job(
         await _set_wm_job(
             job_id,
             status="failed",
-            progress="超分失败",
+            progress="成片优化失败",
             error=err,
         )
     finally:
+        clear_sr_cancel(job_id)
         src.unlink(missing_ok=True)
 
 
@@ -1787,6 +1946,10 @@ async def super_resolution_video(
     output_fps: str = Form(
         "",
         description="输出帧率：native/60/120",
+    ),
+    sr_profile: str = Form(
+        "real",
+        description="超分档位：real（真人推荐）/ anime（动漫）",
     ),
 ):
     """上传视频，后台 Real-ESRGAN 超分（App / 网页均可调用）。"""
@@ -1847,13 +2010,13 @@ async def super_resolution_video(
         size_mb=round(total / (1024 * 1024), 1),
     )
 
-    background_tasks.add_task(
-        _run_sr_job,
+    await _enqueue_sr_job(
         job_id,
         src,
         out,
         output_scale=output_scale,
-        output_fps_choice=output_fps,
+        output_fps_choice=output_fps_choice,
+        sr_profile=sr_profile,
     )
 
     return {"ok": True, "job_id": job_id, "estimated_sec": est_sec}
@@ -1871,6 +2034,36 @@ async def get_super_resolution_job(job_id: str):
     if not job:
         raise HTTPException(status_code=404, detail="任务不存在或已过期，请重新上传")
     return {"ok": True, "job_id": job_id, **job}
+
+
+@app.post("/api/tools/super-resolution/job/{job_id}/cancel")
+async def cancel_super_resolution_job(job_id: str):
+    """取消 Mac 后端超分任务（排队中或 AI 处理中均可）。"""
+    from video_enhance import request_sr_cancel
+
+    async with WM_JOBS_LOCK:
+        job = WM_JOBS.get(job_id)
+    if not job:
+        job = _load_wm_job(job_id)
+        if job:
+            async with WM_JOBS_LOCK:
+                WM_JOBS[job_id] = job
+    if not job:
+        raise HTTPException(status_code=404, detail="任务不存在或已过期")
+
+    status = str(job.get("status") or "")
+    if status in ("completed", "failed", "cancelled"):
+        return {"ok": True, "job_id": job_id, "status": status, "already_done": True}
+
+    request_sr_cancel(job_id)
+    await _dequeue_sr_waiting(job_id)
+    await _set_wm_job(
+        job_id,
+        status="cancelled",
+        progress="正在取消…",
+        error="用户取消",
+    )
+    return {"ok": True, "job_id": job_id, "status": "cancelled"}
 
 
 @app.get("/api/tools/remove-watermark/job/{job_id}")

@@ -1,4 +1,4 @@
-/** iOS 本机 Core ML Real-ESRGAN（输出统一 1080×1920，支持后台处理） */
+/** iOS 本机真实感优化（Core Image：降噪 · 调色 · 轻锐化，无 AI 模型） */
 import { getPlugin, isNativePlatform } from "./crawl/capacitor-bridge.js";
 
 function getSrPlugin() {
@@ -6,23 +6,11 @@ function getSrPlugin() {
 }
 
 export async function isNativeSrAvailable() {
-  if (!isNativePlatform()) return false;
-  try {
-    const res = await getSrPlugin().isAvailable();
-    return !!(res?.available || res?.downloadable);
-  } catch {
-    return false;
-  }
+  return isNativePlatform();
 }
 
 export async function isNativeSrModelReady() {
-  if (!isNativePlatform()) return false;
-  try {
-    const res = await getSrPlugin().isAvailable();
-    return !!res?.available;
-  } catch {
-    return false;
-  }
+  return isNativePlatform();
 }
 
 export async function requestSrNotifications() {
@@ -68,15 +56,15 @@ export async function cancelNativeSrJob() {
 }
 
 /**
- * 后台超分：立即返回，完成后系统通知；进度/完成通过回调或 getNativeSrJobStatus 查询。
+ * 后台真实感优化：立即返回，完成后系统通知。
  */
 export async function startNativeSuperResolutionBackground(
   inputUri,
   displayFilename,
-  { onStatus, onProgress, onComplete, outputScale = "4k" } = {}
+  { onStatus, onProgress, onComplete, outputScale = "1080" } = {}
 ) {
   if (!isNativePlatform()) {
-    throw new Error("本机 AI 超分仅支持 iOS App");
+    throw new Error("本机优化仅支持 iOS App");
   }
   const plugin = getSrPlugin();
   const listeners = [];
@@ -85,7 +73,7 @@ export async function startNativeSuperResolutionBackground(
     listeners.push(
       await plugin.addListener("progress", (ev) => {
         const pct = Math.round((Number(ev?.progress) || 0) * 100);
-        const msg = ev?.message || "Real-ESRGAN 处理中…";
+        const msg = ev?.message || "真实感优化中…";
         if (onProgress) onProgress(pct, msg);
         if (onStatus) onStatus(`${msg}${pct > 0 ? ` ${pct}%` : ""}`);
       })
@@ -100,34 +88,33 @@ export async function startNativeSuperResolutionBackground(
   }
 
   try {
-    await plugin.prepareModel();
     const result = await plugin.startSuperResolveInBackground({
       inputPath: inputUri,
       displayFilename,
-      outputScale, // Pass output resolution ("4k" or "1080")
+      outputScale,
+      srProfile: "real",
     });
     return result;
   } finally {
-    // 后台任务继续；仅在前台时保留进度监听，完成回调仍有效
+    /* 后台任务继续 */
   }
 }
 
 export async function runNativeSuperResolution(inputUri, { onStatus } = {}) {
   if (!isNativePlatform()) {
-    throw new Error("本机 AI 超分仅支持 iOS App");
+    throw new Error("本机优化仅支持 iOS App");
   }
   const plugin = getSrPlugin();
   let listener = null;
   if (onStatus) {
     listener = await plugin.addListener("progress", (ev) => {
       const pct = Math.round((Number(ev?.progress) || 0) * 100);
-      const msg = ev?.message || "Real-ESRGAN 处理中…";
+      const msg = ev?.message || "真实感优化中…";
       onStatus(`${msg}${pct > 0 ? ` ${pct}%` : ""}`);
     });
   }
   try {
-    await plugin.prepareModel();
-    if (onStatus) onStatus("Real-ESRGAN 本机超分启动…");
+    if (onStatus) onStatus("本机真实感优化启动…");
     const result = await plugin.superResolveVideo({ inputPath: inputUri });
     return result;
   } finally {

@@ -28,6 +28,29 @@ final class RealEsrganVideoProcessor {
         self.outputResolution = outputResolution
     }
 
+    private func h264WriterOutputSettings(width: Int, height: Int) -> [String: Any] {
+        [
+            AVVideoCodecKey: AVVideoCodecType.h264,
+            AVVideoWidthKey: width,
+            AVVideoHeightKey: height,
+            AVVideoCompressionPropertiesKey: [
+                AVVideoAverageBitRateKey: 8_000_000,
+                AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
+                AVVideoMaxKeyFrameIntervalKey: 30,
+                AVVideoPixelAspectRatioKey: [
+                    AVVideoPixelAspectRatioHorizontalSpacingKey: 1,
+                    AVVideoPixelAspectRatioVerticalSpacingKey: 1,
+                ],
+                AVVideoCleanApertureKey: [
+                    AVVideoCleanApertureWidthKey: width,
+                    AVVideoCleanApertureHeightKey: height,
+                    AVVideoCleanApertureHorizontalOffsetKey: 0,
+                    AVVideoCleanApertureVerticalOffsetKey: 0,
+                ],
+            ],
+        ]
+    }
+
     private static let ciContext = CIContext(options: [.useSoftwareRenderer: false])
 
     struct Result {
@@ -43,21 +66,17 @@ final class RealEsrganVideoProcessor {
         shouldCancel: (() -> Bool)? = nil
     ) throws -> Result {
         if shouldCancel?() == true { throw RealEsrganError.cancelled }
-        if !RealEsrganEngine.shared.isReady {
-            try RealEsrganEngine.shared.loadBundledModel()
-        }
-
         let asset = AVAsset(url: inputURL)
         guard let videoTrack = asset.tracks(withMediaType: .video).first else {
             throw RealEsrganError.invalidInput
         }
 
         let duration = asset.duration.seconds
-        if duration > 120 {
+        if duration > 300 {
             throw NSError(
                 domain: "RealEsrgan",
                 code: 413,
-                userInfo: [NSLocalizedDescriptionKey: "本地超分暂限 2 分钟以内视频，更长请用 Mac 后端"]
+                userInfo: [NSLocalizedDescriptionKey: "本机优化暂限 5 分钟以内视频，更长请用 Mac 后端"]
             )
         }
 
@@ -97,7 +116,7 @@ final class RealEsrganVideoProcessor {
         progress(0.92, "正在合并原声音轨…")
         try muxAudio(from: asset, videoURL: tempVideo, to: finalURL)
 
-        progress(1.0, "超分完成")
+        progress(1.0, "真实感优化完成")
         return Result(outputURL: finalURL, outputWidth: outW, outputHeight: outH, frameCount: estimatedFrames)
     }
 
@@ -123,21 +142,10 @@ final class RealEsrganVideoProcessor {
 
         try? FileManager.default.removeItem(at: outputURL)
         let writer = try AVAssetWriter(outputURL: outputURL, fileType: .mp4)
-        let writerInput = AVAssetWriterInput(mediaType: .video, outputSettings: [
-            AVVideoCodecKey: AVVideoCodecType.h264,
-            AVVideoWidthKey: outW,
-            AVVideoHeightKey: outH,
-            AVVideoCompressionPropertiesKey: [
-                AVVideoAverageBitRateKey: 8_000_000,
-                AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
-                AVVideoMaxKeyFrameIntervalKey: 30,
-                AVVideoPixelAspectRatioKey: 1,
-                AVVideoCleanApertureWidthKey: outW,
-                AVVideoCleanApertureHeightKey: outH,
-                AVVideoCleanApertureHorizontalOffsetKey: 0,
-                AVVideoCleanApertureVerticalOffsetKey: 0,
-            ],
-        ])
+        let writerInput = AVAssetWriterInput(
+            mediaType: .video,
+            outputSettings: h264WriterOutputSettings(width: outW, height: outH)
+        )
         writer.shouldOptimizeForNetworkUse = true  // Equivalent to ffmpeg -movflags +faststart, required for Camera Roll
         writerInput.expectsMediaDataInRealTime = false
         writerInput.transform = track.preferredTransform
@@ -165,13 +173,10 @@ final class RealEsrganVideoProcessor {
                   let pixelBuffer = CMSampleBufferGetImageBuffer(sample) else { break }
             pts = CMSampleBufferGetPresentationTimeStamp(sample)
 
-            let modelInput = try prepareModelInput(
+            let outputFrame = try renderNaturalFrame(
                 from: pixelBuffer,
-                transform: track.preferredTransform,
-                maxLongEdge: RealEsrganEngine.shared.maxInputLongEdge
+                transform: track.preferredTransform
             )
-            let upscaled = try RealEsrganEngine.shared.upscale(pixelBuffer: modelInput)
-            let outputFrame = try resizeToTarget(upscaled)
 
             while !writerInput.isReadyForMoreMediaData {
                 Thread.sleep(forTimeInterval: 0.005)
@@ -182,7 +187,7 @@ final class RealEsrganVideoProcessor {
             
             frameIndex += 1
             let frac = min(0.9, Double(frameIndex) / Double(max(estimatedFrames, frameIndex)) * 0.9)
-            progress(frac, "Real-ESRGAN 超分 \(frameIndex)/\(estimatedFrames) 帧…")
+            progress(frac, "真实感优化 \(frameIndex)/\(estimatedFrames) 帧…")
             
             // Every 10 frames, use autoreleasepool to reclaim memory
             if frameIndex % 10 == 0 {
@@ -243,6 +248,67 @@ final class RealEsrganVideoProcessor {
         if exporter.status != .completed {
             throw RealEsrganError.predictionFailed(exporter.error?.localizedDescription ?? "音频合并失败")
         }
+    }
+
+    private func applyNaturalFilters(to image: CIImage) -> CIImage {
+        var result = image
+        if let denoise = CIFilter(name: "CINoiseReduction") {
+            denoise.setValue(result, forKey: kCIInputImageKey)
+            denoise.setValue(0.02, forKey: "inputNoiseLevel")
+            denoise.setValue(0.35, forKey: "inputSharpness")
+            if let out = denoise.outputImage { result = out }
+        }
+        if let color = CIFilter(name: "CIColorControls") {
+            color.setValue(result, forKey: kCIInputImageKey)
+            color.setValue(1.03, forKey: kCIInputContrastKey)
+            color.setValue(1.04, forKey: kCIInputSaturationKey)
+            color.setValue(0.02, forKey: kCIInputBrightnessKey)
+            if let out = color.outputImage { result = out }
+        }
+        if let sharp = CIFilter(name: "CISharpenLuminance") {
+            sharp.setValue(result, forKey: kCIInputImageKey)
+            sharp.setValue(0.2, forKey: kCIInputSharpnessKey)
+            if let out = sharp.outputImage { result = out }
+        }
+        return result
+    }
+
+    private func renderNaturalFrame(
+        from pixelBuffer: CVPixelBuffer,
+        transform: CGAffineTransform
+    ) throws -> CVPixelBuffer {
+        var image = CIImage(cvPixelBuffer: pixelBuffer)
+        let orientation = exifOrientation(from: transform)
+        if orientation != 1 {
+            image = image.oriented(forExifOrientation: orientation)
+        }
+        image = applyNaturalFilters(to: image)
+        return try renderImageToTarget(image)
+    }
+
+    private func renderImageToTarget(_ image: CIImage) throws -> CVPixelBuffer {
+        let targetW = CGFloat(outputResolution.width)
+        let targetH = CGFloat(outputResolution.height)
+        let srcW = image.extent.width
+        let srcH = image.extent.height
+        guard srcW > 0, srcH > 0 else {
+            throw RealEsrganError.invalidInput
+        }
+        let scale = max(targetW / srcW, targetH / srcH)
+        var scaled = image.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        let extent = scaled.extent
+        let cropRect = CGRect(
+            x: extent.midX - targetW / 2,
+            y: extent.midY - targetH / 2,
+            width: targetW,
+            height: targetH
+        )
+        scaled = scaled.cropped(to: cropRect)
+        guard let output = makePixelBuffer(width: outputResolution.width, height: outputResolution.height) else {
+            throw RealEsrganError.invalidInput
+        }
+        Self.ciContext.render(scaled, to: output)
+        return output
     }
 
     /// 方向校正 + 缩小，合并为一次 Core Image 渲染
@@ -358,21 +424,10 @@ final class RealEsrganVideoProcessor {
     
         try? FileManager.default.removeItem(at: outputURL)
         let writer = try AVAssetWriter(outputURL: outputURL, fileType: .mp4)
-        let writerInput = AVAssetWriterInput(mediaType: .video, outputSettings: [
-            AVVideoCodecKey: AVVideoCodecType.h264,
-            AVVideoWidthKey: outW,
-            AVVideoHeightKey: outH,
-            AVVideoCompressionPropertiesKey: [
-                AVVideoAverageBitRateKey: 8_000_000,
-                AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
-                AVVideoMaxKeyFrameIntervalKey: 30,
-                AVVideoPixelAspectRatioKey: 1,
-                AVVideoCleanApertureWidthKey: outW,
-                AVVideoCleanApertureHeightKey: outH,
-                AVVideoCleanApertureHorizontalOffsetKey: 0,
-                AVVideoCleanApertureVerticalOffsetKey: 0,
-            ],
-        ])
+        let writerInput = AVAssetWriterInput(
+            mediaType: .video,
+            outputSettings: h264WriterOutputSettings(width: outW, height: outH)
+        )
         writer.shouldOptimizeForNetworkUse = true  // Equivalent to ffmpeg -movflags +faststart, required for Camera Roll
         writerInput.expectsMediaDataInRealTime = false
         writerInput.transform = track.preferredTransform
@@ -406,13 +461,10 @@ final class RealEsrganVideoProcessor {
                 }
                 pts = CMSampleBufferGetPresentationTimeStamp(sample)
     
-                let modelInput = try prepareModelInput(
+                let outputFrame = try renderNaturalFrame(
                     from: pixelBuffer,
-                    transform: track.preferredTransform,
-                    maxLongEdge: RealEsrganEngine.shared.maxInputLongEdge
+                    transform: track.preferredTransform
                 )
-                let upscaled = try RealEsrganEngine.shared.upscale(pixelBuffer: modelInput)
-                let outputFrame = try resizeToTarget(upscaled)
     
                 while !writerInput.isReadyForMoreMediaData {
                     Thread.sleep(forTimeInterval: 0.005)
@@ -430,7 +482,7 @@ final class RealEsrganVideoProcessor {
                 
             frameIndex += 1
             let frac = min(0.9, Double(frameIndex) / Double(max(estimatedFrames, frameIndex)) * 0.9)
-            progress(frac, "Real-ESRGAN 超分 \(frameIndex)/\(estimatedFrames) 帧…")
+            progress(frac, "真实感优化 \(frameIndex)/\(estimatedFrames) 帧…")
                 
             // Every 40 frames, force a short pause to let system reclaim memory
             if frameIndex % 40 == 0 {

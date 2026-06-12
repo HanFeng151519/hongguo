@@ -6,7 +6,7 @@
   "scripts": {
     "build:web": "node scripts/copy-web.js",
     "ensure:sr-model": "bash scripts/ensure-sr-model.sh",
-    "cap:sync": "npm run build:web && (npm run ensure:sr-model || true) && npx cap sync ios && node scripts/patch-ios-plugins.js",
+    "cap:sync": "npm run build:web && npx cap sync ios && node scripts/patch-ios-plugins.js",
     "cap:ios": "npx cap open ios",
     "cap:run:ios": "npx cap run ios",
     "install:device": "bash scripts/install-ios-device.sh"

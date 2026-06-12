@@ -9,10 +9,11 @@ enum SrNotificationHelper {
         }
     }
 
-    static func notifySuccess(filename: String) {
+    static func notifySuccess(filename: String, width: Int = 0, height: Int = 0) {
         let content = UNMutableNotificationContent()
-        content.title = "视频超分完成"
-        content.body = "「\(filename)」已处理为 1080×1920，打开 App 在成片库中保存"
+        content.title = "真实感优化完成"
+        let sizeHint = width > 0 && height > 0 ? "\(width)×\(height)" : "目标分辨率"
+        content.body = "「\(filename)」已处理为 \(sizeHint)，打开 App 在成片库中保存"
         content.sound = .default
         let req = UNNotificationRequest(
             identifier: "sr_done_\(UUID().uuidString)",
@@ -24,7 +25,7 @@ enum SrNotificationHelper {
 
     static func notifyFailure(_ message: String) {
         let content = UNMutableNotificationContent()
-        content.title = "视频超分失败"
+        content.title = "真实感优化失败"
         content.body = message
         content.sound = .default
         let req = UNNotificationRequest(
@@ -88,18 +89,28 @@ final class SrBackgroundJobManager {
         cleanupOutputFiles(for: snapshot)
     }
 
-    func clearJob() {
-        cancelJob()
+    /// 仅清除任务记录，保留已生成的视频文件（入库后调用）
+    func clearJobMetadata() {
+        lock.lock()
+        cancelRequested = false
+        job = nil
+        lock.unlock()
+        UserDefaults.standard.removeObject(forKey: storageKey)
     }
 
-    func start(inputURL: URL, displayFilename: String, outputResolution: RealEsrganVideoProcessor.OutputResolution = .hd1080p) throws -> String {
+    func start(
+        inputURL: URL,
+        displayFilename: String,
+        outputResolution: RealEsrganVideoProcessor.OutputResolution = .hd1080p,
+        srProfile: SrIosModelProfile = .general
+    ) throws -> String {
         lock.lock()
         if let existing = job, existing.status == "running" {
             lock.unlock()
             throw NSError(
                 domain: "RealEsrgan",
                 code: 409,
-                userInfo: [NSLocalizedDescriptionKey: "已有超分任务在进行中，请先取消或等待完成"]
+                userInfo: [NSLocalizedDescriptionKey: "已有优化任务在进行中，请先取消或等待完成"]
             )
         }
         cancelRequested = false
@@ -120,12 +131,24 @@ final class SrBackgroundJobManager {
 
         beginBackgroundTask()
         workQueue.async { [weak self] in
-            self?.runJob(inputURL: inputURL, jobId: jobId, displayFilename: displayFilename, outputResolution: outputResolution)
+            self?.runJob(
+                inputURL: inputURL,
+                jobId: jobId,
+                displayFilename: displayFilename,
+                outputResolution: outputResolution,
+                srProfile: srProfile
+            )
         }
         return jobId
     }
 
-    private func runJob(inputURL: URL, jobId: String, displayFilename: String, outputResolution: RealEsrganVideoProcessor.OutputResolution) {
+    private func runJob(
+        inputURL: URL,
+        jobId: String,
+        displayFilename: String,
+        outputResolution: RealEsrganVideoProcessor.OutputResolution,
+        srProfile: SrIosModelProfile
+    ) {
         defer {
             lock.lock()
             cancelRequested = false
@@ -135,27 +158,8 @@ final class SrBackgroundJobManager {
         do {
             try throwIfCancelled()
             update(jobId: jobId) { j in
-                j.message = "加载模型…"
+                j.message = "准备真实感优化…"
                 j.progress = 0.05
-            }
-            let modelUrl = try RealEsrganModelLoader.ensureModelDownloaded { [weak self] msg in
-                guard let self else { return }
-                if self.isCancelRequested() { return }
-                self.update(jobId: jobId) { j in
-                    j.message = msg
-                    j.progress = 0.08
-                }
-                self.emitProgress(message: msg, progress: 0.08)
-            }
-            try throwIfCancelled()
-            try RealEsrganEngine.shared.loadModel(at: modelUrl) { [weak self] msg in
-                guard let self else { return }
-                if self.isCancelRequested() { return }
-                self.update(jobId: jobId) { j in
-                    j.message = msg
-                    j.progress = 0.1
-                }
-                self.emitProgress(message: msg, progress: 0.1)
             }
 
             let processor = RealEsrganVideoProcessor(outputResolution: outputResolution)
@@ -178,12 +182,16 @@ final class SrBackgroundJobManager {
             update(jobId: jobId) { j in
                 j.status = "done"
                 j.progress = 1
-                j.message = "超分完成"
+                j.message = "真实感优化完成"
                 j.outputPath = outputUri
                 j.outputWidth = result.outputWidth
                 j.outputHeight = result.outputHeight
             }
-            SrNotificationHelper.notifySuccess(filename: displayFilename)
+            SrNotificationHelper.notifySuccess(
+                filename: displayFilename,
+                width: result.outputWidth,
+                height: result.outputHeight
+            )
             emitComplete(jobId: jobId)
         } catch let err as RealEsrganError {
             if err == .cancelled {

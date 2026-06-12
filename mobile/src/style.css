@@ -322,6 +322,11 @@ body {
   width: 100%;
 }
 
+.sr-progress-wrap #sr-mac-cancel-btn {
+  margin-top: 10px;
+  width: 100%;
+}
+
 .sr-progress-track {
   height: 8px;
   border-radius: 999px;
@@ -404,12 +409,13 @@ body {
 
 .sr-library-thumb,
 .sr-library-thumb-placeholder {
-  width: 80px;
-  height: 120px;
+  width: 54px;
+  height: 96px;
   object-fit: cover;
   border-radius: 6px;
   background: rgba(0, 0, 0, 0.08);
   flex-shrink: 0;
+  display: block;
 }
 
 .sr-library-thumb-placeholder {

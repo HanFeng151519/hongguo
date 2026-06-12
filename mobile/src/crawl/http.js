@@ -49,6 +49,9 @@ async function nativeRequest(url, options = {}) {
     connectTimeout: options.connectTimeout ?? 60000,
     readTimeout: options.readTimeout ?? 120000,
   };
+  if (method !== "GET" && options.body != null) {
+    req.data = options.body;
+  }
   const res =
     method === "GET"
       ? await CapacitorHttp.get(req)
@@ -75,9 +78,11 @@ async function nativeRequest(url, options = {}) {
 async function fetchRequest(url, options = {}) {
   const headers = normalizeHeaders(options.headers);
   const responseType = options.responseType || "text";
+  const method = (options.method || "GET").toUpperCase();
   const resp = await fetch(url, {
-    method: options.method || "GET",
+    method,
     headers,
+    body: method === "POST" ? options.body : undefined,
     redirect: "follow",
   });
   let data;
@@ -99,19 +104,27 @@ async function fetchRequest(url, options = {}) {
   };
 }
 
-export async function httpGet(url, options = {}) {
+async function httpRequest(url, options = {}) {
   if (isNativePlatform()) {
     try {
       return await nativeRequest(url, options);
     } catch (err) {
       const msg = String(err?.message || err);
-      console.warn("[http] native GET failed, fallback fetch:", msg);
+      console.warn(`[http] native ${(options.method || "GET").toUpperCase()} failed, fallback fetch:`, msg);
       if (/Plugin|not implemented|UNIMPLEMENTED/i.test(msg)) {
         throw err;
       }
     }
   }
   return fetchRequest(url, options);
+}
+
+export async function httpGet(url, options = {}) {
+  return httpRequest(url, options);
+}
+
+export async function httpPost(url, options = {}) {
+  return httpRequest(url, { ...options, method: "POST" });
 }
 
 export async function httpHeadRange(url, headers = {}) {
