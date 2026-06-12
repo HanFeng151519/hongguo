@@ -608,11 +608,13 @@ form?.addEventListener("submit", async (e) => {
 
   try {
     await saveCookies({ douyinCookie: douyinCookieVal, xhsCookie: xhsCookieVal });
-    const platformHint = /mr\.baidu|mbd\.baidu|haokan\.baidu/i.test(text)
+    const platformHint = /klingai/i.test(text)
+      ? "可灵AI"
+      : /mr\.baidu|mbd\.baidu|haokan\.baidu/i.test(text)
       ? "百度"
       : /douyin|iesdouyin/i.test(text)
       ? "抖音"
-      : /kuaishou|chenzhongtech/i.test(text)
+      : /kuaishou|chenzhongtech/i.test(text) && !/klingai/i.test(text)
         ? "快手"
         : /toutiao/i.test(text)
           ? "头条"

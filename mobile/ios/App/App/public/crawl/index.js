@@ -4,6 +4,7 @@ import { tryCrawlToutiao, isToutiaoShare } from "./toutiao.js";
 import { tryCrawlXhs, isXhsShare } from "./xhs.js";
 import { tryCrawlBaidu, isBaiduShare } from "./baidu.js";
 import { tryCrawlXiaoyunque, isXiaoyunqueShare } from "./xiaoyunque.js";
+import { tryCrawlKling, isKlingShare } from "./kling.js";
 import { extractAllHttpUrls } from "./utils.js";
 
 const PLATFORM_LABEL = {
@@ -13,9 +14,11 @@ const PLATFORM_LABEL = {
   xhs: "小红书",
   baidu: "百度",
   xiaoyunque: "小云雀",
+  kling: "可灵AI",
 };
 
 function detectPlatform(text) {
+  if (isKlingShare(text)) return "kling";
   if (isXiaoyunqueShare(text)) return "xiaoyunque";
   if (isBaiduShare(text)) return "baidu";
   if (isDouyinShare(text)) return "douyin";
@@ -37,6 +40,7 @@ export async function crawlAndDownload(shareText, options = {}) {
   }
 
   const runners = {
+    kling: () => tryCrawlKling(text, onProgress),
     xiaoyunque: () => tryCrawlXiaoyunque(text, onProgress),
     baidu: () => tryCrawlBaidu(text, onProgress),
     kuaishou: () => tryCrawlKuaishou(text, onProgress),
